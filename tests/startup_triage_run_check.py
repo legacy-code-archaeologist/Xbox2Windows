@@ -286,6 +286,45 @@ def check_cli_invocation(failures: list[str]) -> None:
             failures.append(f"CLI output missing expected row: {proc.stdout!r}")
 
 
+def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
+    # Each table entry is a distinct report token. A pattern that can never match, or a label whose
+    # text changed, folds a known cause into "other" without failing anything else. The samples are
+    # matched back to the table so a new entry without a sample fails here.
+    samples = (
+        ("image_load_mip tfe", "image_load_mip tfe"),
+        ("image_load_mip a16", "image_load_mip a16"),
+        ("buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL", "buffer_* instruction"),
+        ("SDWA UNUSED_SEXT", "SDWA UNUSED_SEXT"),
+        ("SDWA dst_unused:UNUSED_PRESERVE needs a tracked destination", "SDWA dst_unused"),
+        ("undecodable word at +0x10", "undecodable word"),
+        ("numeric use of s0 holding a descriptor", "numeric use of scalar register"),
+        ("operand v[0:3] is not a single register", "unsupported operand"),
+        ("modifier r128 is not lowered", "unsupported modifier"),
+        ("descriptor operand s[0:7]", "descriptor operand"),
+        ("sampler operand s[8:11]", "sampler operand"),
+        ("mask from descriptor data", "mask from descriptor data"),
+        ("s_load of 4 dwords from an unaligned address", "s_load form"),
+        ("v_mov_b32 SDWA sel_enc", "v_* SDWA form"),
+        ("v_mov_b32 with clamp", "v_* with modifier"),
+        ("v_mov_b32", "v_* instruction"),
+    )
+    covered: set[int] = set()
+    for line, expected in samples:
+        got = triage_run.classify_shader_reason(line)
+        if got != expected:
+            failures.append(f"classify_shader_reason({line!r}) -> {got!r}, expected {expected!r}")
+        for index, (pattern, _) in enumerate(triage_run.SHADER_REASONS):
+            if pattern.match(line):
+                covered.add(index)
+                break
+    missing = [index for index in range(len(triage_run.SHADER_REASONS)) if index not in covered]
+    for index in missing:
+        failures.append(
+            f"SHADER_REASONS[{index}] ({triage_run.SHADER_REASONS[index][0].pattern!r}) has no sample line"
+        )
+    if triage_run.classify_shader_reason("a reason nobody modelled") != triage_run.OTHER:
+        failures.append("an unmodelled reason did not fall back to the other token")
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
@@ -295,6 +334,7 @@ def main() -> int:
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
     check_slot133_outcomes(failures)
+    check_every_shader_reason_entry_is_reachable(failures)
     for item in failures:
         print("FAIL", item)
     print(f"startup triage_run checks: {len(failures)} failed")

@@ -122,7 +122,7 @@ public:
     // Index of the update slot, or -1 (container not open, or no free update slot).
     long begin_update(std::size_t container)
     {
-        if (container >= capacity || names_[container].empty()) return -1;
+        if (container >= capacity || refs_[container] == 0) return -1;
         for (std::size_t i = 0; i < capacity; ++i)
             if (!updates_[i]) {
                 updates_[i] = static_cast<int>(container) + 1;

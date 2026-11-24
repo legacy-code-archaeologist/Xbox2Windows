@@ -67,7 +67,8 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // 4x4 with that many mip levels, and the default view spans all of them. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional)
+                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
+                            bool two_dimensional)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array))
         throw std::runtime_error("Unsupported image mip level count");
@@ -97,10 +98,12 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
 
     D3D12_RESOURCE_DESC td{};
-    td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                 : (array || two_dimensional) ? D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                 : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = base;
     td.Height = one_dimensional ? 1 : base;
-    td.DepthOrArraySize = one_dimensional ? 1 : side;
+    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : side;
     td.MipLevels = levels;
     td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
@@ -197,5 +200,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(readback->Map(0, &read, &mapped), "Map image 3D readback");
     std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
     readback->Unmap(0, &none);
-    std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n", array ? "2d_array" : "3d", z, color[0], color[1], color[2], color[3]);
+    std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
+                one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
+                z, color[0], color[1], color[2], color[3]);
 }

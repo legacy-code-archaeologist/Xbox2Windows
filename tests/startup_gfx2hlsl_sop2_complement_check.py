@@ -1,4 +1,4 @@
-"""32-bit scalar complement logic operations in tools/startup/gfx2hlsl.py: s_nand_b32, s_nor_b32, s_xnor_b32 (#1919).
+"""Scalar SOP2 complement logic (#1919) and high-halfword packing (#1996) in tools/startup/gfx2hlsl.py.
 
   (no arguments)        translation controls, pure Python
   binary <llvm-mc>      assemble the decoded text of every form with llvm-mc and compare with the words built here
@@ -21,6 +21,10 @@ is; the translator's per-lane projection cannot show that, so no mask lowering i
 
 Mutations: the table entry with the complement dropped, and the entry with the SCC write dropped, must each read a
 wrong result or SCC. Refused: every SOP2 operation the decoder names that still has no lowering.
+
+The `s_pack_hh_b32_b16` forms use the same encoder and evaluator. The reference places the high half of src0
+in the low result half and the high half of src1 in the high result half, preserving SCC. Swapping the inputs
+must fail the value check.
 """
 import re
 import struct
@@ -39,6 +43,7 @@ from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
 
 MASK = 0xffffffff
 OPCODE = {name: op for op, (name, _) in D.SOP2_OPS.items()}
+PACK_HH = 's_pack_hh_b32_b16'
 # operation -> (non-complement sibling, reference)
 OPS = {
     's_nand_b32': ('s_and_b32', lambda a, b: ~(a & b) & MASK),
@@ -150,9 +155,10 @@ def check(label, ok, detail=''):
             print('  ' + detail)
 
 
-def first_mismatch(name):
+def first_mismatch(name, reference=None, updates_scc=True):
     """The first (form, a, b, got, want) whose result or SCC differs from the reference, or None."""
-    reference = OPS[name][1]
+    if reference is None:
+        reference = OPS[name][1]
     for form in VALUE_FORMS:
         sdst, ssrc0, ssrc1, literal = form
         asm, stage = attempt(code(name, form))
@@ -164,9 +170,59 @@ def first_mismatch(name):
             want = reference(source_value(ssrc0, literal, env), source_value(ssrc1, literal, env))
             out = run_lines(stage.lines, env)
             got = (out.get(destination), out['scc'])
-            if got != (want, int(want != 0)):
-                return asm, hex(a), hex(b), got, (want, int(want != 0))
+            expected = (want, int(want != 0) if updates_scc else SCC_UNSET)
+            if got != expected:
+                return asm, hex(a), hex(b), got, expected
     return None
+
+
+def pack_controls():
+    def reference(a, b):
+        return (b // 65536) * 65536 + a // 65536
+
+    check('pack_hh matches the LLVM 15 SOP2 encoding', sop2(PACK_HH, 0, 1, 2).hex() == '0102009a')
+    mismatch = first_mismatch(PACK_HH, reference, updates_scc=False)
+    check('pack_hh result and untouched SCC across %d forms and %d input pairs' % (len(VALUE_FORMS), len(PAIRS)),
+          mismatch is None, str(mismatch))
+    if mismatch is not None:
+        return
+
+    # The shader's per-lane masks cannot stand in for the wave's full 32-bit words.
+    mask_forms = MASK_FORMS + [(3, 107, 2, None), (127, 1, 2, None)]
+    masked = [(form, attempt(code(PACK_HH, form))[1].lines) for form in mask_forms]
+    check('pack_hh refuses whole-wave mask sources and destinations',
+          all(lines == ['refused: %s on a lane mask' % PACK_HH] for _, lines in masked), str(masked))
+    _, reserved = attempt(sop2(PACK_HH, 3, 209, 2))
+    check('pack_hh refuses a reserved scalar source encoding',
+          reserved.lines == ['refused: %s source s209' % PACK_HH], str(reserved.lines))
+
+    for symbolic in ('mask', 'descriptor'):
+        stage = Probe()
+        if symbolic == 'mask':
+            stage.masks.add(1)
+        else:
+            stage.sym[1] = ('ptr', 0, 0)
+        try:
+            stage.one(PACK_HH, decode_one(sop2(PACK_HH, 3, 1, 2))[1])
+        except G.Unsupported as error:
+            reason = 'a lane mask' if symbolic == 'mask' else 'descriptor data'
+            check('pack_hh refuses a symbolic %s' % symbolic,
+                  str(error) == '%s on %s' % (PACK_HH, reason) and not stage.lines, str(error))
+        else:
+            check('pack_hh refuses a symbolic %s' % symbolic, False, str(stage.lines))
+
+    saved = G.SCA[PACK_HH]
+    try:
+        del G.SCA[PACK_HH]
+        disabled = first_mismatch(PACK_HH, reference, updates_scc=False)
+        check('pack_hh negative control catches a disabled lowering',
+              disabled is not None and disabled[-1] == 'refused: %s' % PACK_HH, str(disabled))
+        text, scc = saved
+        G.SCA[PACK_HH] = (text.format('{1}', '{0}'), scc)
+        check('pack_hh negative control catches reversed source halves',
+              first_mismatch(PACK_HH, reference, updates_scc=False) is not None)
+    finally:
+        G.SCA[PACK_HH] = saved
 
 
 def controls():
@@ -273,10 +329,12 @@ def controls():
                 wrong.append((asm, str(error)))
     check('%d SOP2 operations without a lowering are refused by name (%s)' % (len(missing), ', '.join(missing)),
           missing and not wrong and not set(OPS) & set(missing), str(wrong))
+    pack_controls()
 
 
 def all_codes():
-    return [code(name, form) for name in list(OPS) + [s for s, _ in OPS.values()] for form in VALUE_FORMS + MASK_FORMS]
+    logic = [code(name, form) for name in list(OPS) + [s for s, _ in OPS.values()] for form in VALUE_FORMS + MASK_FORMS]
+    return logic + [code(PACK_HH, form) for form in VALUE_FORMS]
 
 
 def check_binary(llvm_mc):

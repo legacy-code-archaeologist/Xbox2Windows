@@ -22,11 +22,13 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools'))
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 import gfx2hlsl as G  # noqa: E402
+from triage_run import classify_shader_reason  # noqa: E402
 
 SENTINEL = 0xc5c5c5c5
 # offscreen_check --compute-store-case fills the raw t0 buffer with this 320-dword pattern.
@@ -177,7 +179,56 @@ def old_buffer_address(stage, ops, mods):
     return buf, address
 
 
+def formatted_mubuf_request_controls():
+    # One SRV descriptor table at s[8:9]. The shader loads its second 16-byte entry.
+    rts0 = b''.join((
+        struct.pack('<6I', 2, 1, 24, 0, 0, 0),  # Root signature header
+        struct.pack('<3I', 0, 0, 36),            # Descriptor-table parameter
+        struct.pack('<2I', 1, 44),               # Descriptor table
+        struct.pack('<6I', 0, 2, 0, 0, 0, 0),    # SRV range with two entries
+    ))
+    part = b'RTS0' + struct.pack('<I', len(rts0)) + rts0
+    root = b'DXBC' + bytes(16) + struct.pack('<4I', 1, 36 + len(part), 1, 36) + part
+    load_descriptor = struct.pack('<3I', 0xf4080804, 0xfa000010, 0xbf8cc07f)  # s_load_dwordx4; lgkmcnt(0)
+    export_position = struct.pack('<4I', 0xbf8c3f70, 0xf80008cf, 0x06060606, 0xbf810000)  # vmcnt(0); exp; end
+    ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
+
+    with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'X2W_FXC': ''}):
+        folder = Path(temp)
+
+        def request(load):
+            vs = load_descriptor + load + export_position
+            key = G.pipeline_key(vs, ps, root)
+            for suffix, data in (('a', vs), ('b', ps), ('root', root)):
+                (folder / f'req_{key:016x}.{suffix}').write_bytes(data)
+            return G.translate_request(temp, key), folder / f'{key:016x}'
+
+        # With the same descriptor and address, adjacent raw and MTBUF loads can publish a translation.
+        for load, hlsl in (
+            (encode_mubuf(0x0f, vdata=6, srsrc=32), 'v8 = r0.Load(a + 8);'),
+            (encode_mtbuf(0x02, vdata=6, srsrc=32), 'v8 = U(((w >> 16) & 255) / 255.0);'),
+        ):
+            result, name = request(load)
+            assert result == 'ok', result
+            assert 'srv 0 buf table 0 16\n' in name.with_suffix('.txt').read_text()
+            assert hlsl in name.with_suffix('.vs.hlsl').read_text(), hlsl
+
+        formats = (('x', 'v6'), ('xy', 'v[6:7]'), ('xyz', 'v[6:8]'), ('xyzw', 'v[6:9]'))
+        for op, (suffix, dest) in enumerate(formats):
+            load = encode_mubuf(op, vdata=6, srsrc=32)
+            mnemonic = 'buffer_load_format_' + suffix
+            assert G.decode(load) == [(0, 8, mnemonic, f'{mnemonic} {dest}, off, s[32:35], 0')]
+            result, name = request(load)
+            reason = name.with_suffix('.fail').read_text().strip()
+            assert reason == f'{mnemonic} requires descriptor FORMAT and DST_SEL', reason
+            assert result == f'unsupported: {reason}', result
+            assert classify_shader_reason(reason) == 'buffer_* instruction', reason
+            assert set(folder.glob(name.name + '.*')) == {name.with_suffix('.fail')}
+
+
 def controls():
+    formatted_mubuf_request_controls()
+
     # 1. Existing single-mode forms keep their exact HLSL output.
     asm, st = translate_bytes(encode_mubuf(imm=12, soffset=128 + 16))
     assert asm == ['buffer_load_dword v4, off, s[16:19], 16 offset:12'], asm

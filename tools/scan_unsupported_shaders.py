@@ -751,7 +751,7 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
 def parse_assembly_file(path: Path) -> list[str]:
     """Read assembly instructions from a text file (.s, .asm, .txt)."""
     lines = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             stripped = line.strip()
             if not stripped or stripped.startswith(("//", ";", "#", "@")):
@@ -759,7 +759,8 @@ def parse_assembly_file(path: Path) -> list[str]:
             # Symbol metadata emits no instruction. Keep data and alignment directives visible.
             if stripped == ".text" or stripped.split(None, 1)[0] in (".globl", ".global", ".type", ".size"):
                 continue
-            if stripped.endswith(":") and " " not in stripped:
+            code = re.split(r"//|[;#]", stripped)[0].strip()  # same comment rule as extract_opcode
+            if code.endswith(":") and " " not in code:
                 continue
             lines.append(stripped)
     return lines

@@ -22,9 +22,9 @@ namespace {
 using u64 = std::uint64_t;
 constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);  // E_POINTER
-constexpr long hr_fail = static_cast<long>(0x80004005);     // E_FAIL
 constexpr long hr_handle = static_cast<long>(0x80070006);   // E_HANDLE
 constexpr long hr_out_of_memory = static_cast<long>(0x8007000E); // E_OUTOFMEMORY
+constexpr long hr_pending_results = static_cast<long>(0x8AC81001); // XAPU_E_PENDING_RESULTS
 constexpr std::size_t result_size = 0x58;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
@@ -124,7 +124,7 @@ extern "C" __declspec(noinline) long XApuDequeueResult(u64 rcx, u64 rdx, u64 r8,
             --conn->pending_results;
             hr = hr_ok;
         } else {
-            hr = hr_fail;
+            hr = hr_pending_results;
         }
     }
     ReleaseSRWLockExclusive(&connection_lock);

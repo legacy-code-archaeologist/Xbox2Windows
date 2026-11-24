@@ -567,7 +567,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const bool memory_source = (options & memory_source_option) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
     static LONG logged;
-    if (InterlockedIncrement(&logged) <= 12) {
+    if (x2w_local::first_calls(logged, 12)) {
         char bytes[3 * 0x40 + 1] = "";
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
@@ -707,7 +707,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 failure = StorageFailure::zlib;
                 data = nullptr;
                 static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
+                if (x2w_local::first_calls(diagnosed, 12)) {
                     unsigned h[4] = {};
                     for (unsigned i = 0; i < 4 && i < source_size; ++i) h[i] = input[i];
                     log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
@@ -813,7 +813,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (!empty) count_page_request(request, failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
-    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
+    if (x2w_local::first_calls(summaries, 12) || (failed && x2w_local::first_calls(failures, 12)))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
 }
@@ -837,7 +837,7 @@ void run_entry(Object* self, Entry& entry)
                 count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
-                if (InterlockedIncrement(&unreadable) <= 12)
+                if (x2w_local::first_calls(unreadable, 12))
                     log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
                         static_cast<const void*>(title), entry.token_count);
                 return;
@@ -881,7 +881,7 @@ void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
     if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
-    if (InterlockedIncrement(&reported) <= 12)
+    if (x2w_local::first_calls(reported, 12))
         log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
 }
@@ -1285,7 +1285,7 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || InterlockedIncrement(&calls) <= 8)
+    if (!valid || x2w_local::first_calls(calls, 8))
         log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
             static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
     if (!valid) return;
@@ -1317,19 +1317,19 @@ void signal_fence(void* fence, u64 value)
         hr = reinterpret_cast<Signal>((*static_cast<void***>(fence))[10])(fence, value);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4)
+    if (x2w_local::first_calls(calls, 4))
         log("x2w-dstorage Queue::EnqueueSignal fence=%p value=0x%llx -> 0x%08lx", fence, value, static_cast<unsigned long>(hr));
 }
 void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
     submit(self);
 }
 void __stdcall queue_cancel(Object*, u64 mask, u64 value)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
 // Slots 9 and 10 follow Microsoft's Xbox-GDK-Samples dstorage_win32.h. GetErrorEvent's
@@ -1347,7 +1347,7 @@ HANDLE __stdcall queue_error_event(Object* self)
                             0, FALSE, DUPLICATE_SAME_ACCESS);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
     return event;
 }
 void __stdcall queue_retrieve_error_record(Object* self, StorageErrorRecord* out)
@@ -1367,14 +1367,14 @@ bool __stdcall status_is_complete(Object* self, unsigned index)
 {
     const bool complete = index < self->capacity && self->results[index] != static_cast<LONG>(0x8000000A);
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
     return complete;
 }
 long __stdcall status_hresult(Object* self, unsigned index)
 {
     const long hr = index < self->capacity ? self->results[index] : E_INVALIDARG;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
     return hr;
 }
 

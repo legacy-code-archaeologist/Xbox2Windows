@@ -864,6 +864,10 @@ def check_parsing():
            "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    # Anonymous labels, conditional-assembly directives and assembly-time assignments are not instructions.
+    pseudo_ops_asm = ("@@:\n    mov eax, ecx\n    jmp @b\nword_index = 0\n"
+                      "REPT 2\n    nop\nENDM\nIFIDNI <a>, <b>\n    ret\nENDIF\n")
+    assert fc.masm_mnemonics(pseudo_ops_asm) == {"mov", "jmp", "nop", "ret"}, fc.masm_mnemonics(pseudo_ops_asm)
     with tempfile.TemporaryDirectory() as tmp:
         isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
         assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
@@ -873,6 +877,7 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+    assert unmatched == [], unmatched
 
 
 def check_junit_errors():

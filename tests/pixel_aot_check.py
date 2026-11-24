@@ -720,9 +720,9 @@ ELSE_SKIPS = ("none", "then", "else", "both")
 
 
 def else_region(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none", *, then_body=ELSE_THEN_BODY,
-                else_body=ELSE_ELSE_BODY, transition=ELSE_TRANSITION):
+                else_body=ELSE_ELSE_BODY, transition=ELSE_TRANSITION, before=(), after=()):
     """The if/else region as (offset, text) pairs; each requested skip lands on its arm's end."""
-    program = uncompressed_export([*ELSE_OPENERS[opener], *then_body, transition, *else_body, restore])
+    program = uncompressed_export([*before, *ELSE_OPENERS[opener], *then_body, transition, *else_body, restore, *after])
     arms = []
     if skips in ("then", "both"):
         arms.append((program.index(ELSE_OPENERS[opener][1]), transition))
@@ -740,9 +740,9 @@ def else_region(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none", *, 
     return pairs
 
 
-def else_region_asm(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none"):
+def else_region_asm(opener="saveexec", restore=MASKED_MOV_RESTORE, skips="none", **kwargs):
     """else_region as assembler text: each skip names a label on its target."""
-    program = [line for _, line in else_region(opener, restore, skips)]
+    program = [line for _, line in else_region(opener, restore, skips, **kwargs)]
     labels = {ELSE_TRANSITION: ".Lelse_transition", restore: ".Lelse_close"}
     for k, line in enumerate(program):
         if line.startswith("s_cbranch_execz"):
@@ -1922,6 +1922,38 @@ def check_region_scalar_load_controls():
                 "Constant read exceeds binding or is unaligned")
 
 
+def else_wait_bodies(skips, *, after_wait=True):
+    """Issue a load on every wave and wait for it in the else arm before reading its result."""
+    wait = ("s_waitcnt lgkmcnt(0)",)
+    then_skip = skips in ("then", "both")
+    return {
+        "before": (*REGION_LOAD_PREFIX, *(REGION_LOAD_RESOLVE if then_skip else ())),
+        "then_body": (*(REGION_LOAD_RESOLVE if not then_skip else ()), "v_mov_b32_e32 v13, s45"),
+        "else_body": (*wait, "v_mov_b32_e32 v13, s76"),
+        "after": (*(wait if after_wait else ()), "v_mov_b32_e32 v14, s76"),
+    }
+
+
+def check_region_else_wait_controls():
+    """Only an else arm that can skip its wait leaves the load outstanding at the restore."""
+    for opener in ELSE_OPENERS:
+        for restore in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE):
+            for skips in ELSE_SKIPS:
+                bodies = else_wait_bodies(skips, after_wait=False)
+                program = else_region(opener, restore, skips, **bodies)
+                if skips in ("else", "both"):
+                    expect_value_error(translate, program, "Constant read before load completion")
+                else:
+                    translate(program)
+                bodies = else_wait_bodies(skips)
+                translate(else_region(opener, restore, skips, **bodies))
+                wait, read = bodies["else_body"]
+                for bad_wait in ((read,), (read, wait)):
+                    bodies["else_body"] = bad_wait
+                    expect_value_error(translate, else_region(opener, restore, skips, **bodies),
+                                       "Constant read before load completion")
+
+
 def region_load_pixels(threshold):
     """The reference computed here, from the constants the draw writes: where the sample is below the threshold
     v13 = word 8 and v14 = word 10, elsewhere the sample's own green and blue."""
@@ -1929,6 +1961,36 @@ def region_load_pixels(threshold):
 
 
 REGION_LOAD_WORDS = (0.25, 0.5, 0.75)
+
+
+def else_wait_pixels(threshold):
+    """Green comes from either arm, and blue reads constant word 11 on every lane after the restore."""
+    red = [single(r / 255) for r in MASKED_RAMP]
+    return [(x, 0.25 if x < threshold else 0.875, 0.875, 1.0)
+            for _ in MASKED_RAMP for x in red]
+
+
+def check_region_else_wait_draw(directory, compiler, renderer, backend):
+    source = directory / "region-else-wait.hlsl"
+    shader = directory / "region-else-wait.cso"
+    constants = bytearray(256)
+    struct.pack_into("<f", constants, 44, 0.875)
+    for opener in ELSE_OPENERS:
+        for skips in ("then", "else"):
+            bodies = else_wait_bodies(skips, after_wait=skips == "else")
+            source.write_text(translate(else_region(opener, skips=skips, **bodies)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+            for threshold in (0.5, 10.0, -1.0):
+                struct.pack_into("<2f", constants, 12, threshold, 0.25)
+                case = directory / f"region-else-wait-{opener}-{skips}-{len(cases)}.case"
+                write_case(case, constants, else_wait_pixels(threshold))
+                cases.append((case, "pass"))
+            struct.pack_into("<f", constants, 12, 0.5)
+            case = directory / f"region-else-wait-{opener}-{skips}-unmasked.case"
+            write_case(case, constants, else_wait_pixels(-1.0))
+            cases.append((case, "mismatch"))
+            run_pixel_batch(renderer, backend, shader, cases)
 
 
 def check_region_scalar_load_draw(directory, compiler, renderer, backend):
@@ -1963,6 +2025,7 @@ def check_region_scalar_load_draw(directory, compiler, renderer, backend):
             except AssertionError as error:
                 error.add_note(f"Region scalar load draw on {backend}: {label}")
                 raise
+    check_region_else_wait_draw(directory, compiler, renderer, backend)
     return 0
 
 
@@ -16920,6 +16983,7 @@ def _check_controls_inline(directory):
     # SDWA v_movrel* (#1917): the selections apply to the indexed words; the refusals of v_mov_b32_sdwa hold.
     sdwa_hlsl = translate_int(uncompressed_export(SDWA_MOVREL_BODY))
     assert "dpp_soff" in sdwa_hlsl and "dpp_doff" in sdwa_hlsl and "QuadRead" not in sdwa_hlsl
+    check_sdwa_movrel_pins(sdwa_hlsl)
     sdwa_bank = ["v_mov_b32_e32 v24, 0x44332211", "v_mov_b32_e32 v25, 0x88776655"]
     for bad_seq, message in (
         (sdwa_bank + ["s_mov_b32 m0, 1",
@@ -17681,6 +17745,7 @@ _CONTROL_SUBCHECKS = (
     "check_region_wait_controls",
     "check_region_scalar_alu_controls",
     "check_region_scalar_load_controls",
+    "check_region_else_wait_controls",
     "check_pk_fmac_controls",
     "check_title_load_controls",
     "check_ds_swizzle_controls",
@@ -18376,6 +18441,10 @@ def check_binary(directory, assembler, objcopy, library):
                     fixtures.append(([line for _, line in pairs], translate))
                 else:
                     fixtures.append((else_region_asm(opener, restore, skips), translate, "gfx1013", "", pairs))
+        for skips in ("then", "else"):
+            bodies = else_wait_bodies(skips, after_wait=skips == "else")
+            fixtures.append((else_region_asm(opener, skips=skips, **bodies), translate, "gfx1013", "",
+                             else_region(opener, skips=skips, **bodies)))
     for compare, branch in SCC_SKIP_FORMS.values():
         fixtures.append((scc_skip_asm(compare, branch), translate, "gfx1013", "", scc_skip(compare, branch)))
         fixtures.append((scc_diamond_asm(compare, branch), translate, "gfx1013", "", scc_diamond(compare, branch)))
@@ -21883,6 +21952,38 @@ def check_sdwa_movrel_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, [(good, "mismatch")])
         print(f"control {label}: pixel mismatch, as required")
     return 0
+
+
+# Device-free pins of the SDWA selections in SDWA_MOVREL_BODY (#1917): each pattern is the exact expression one source
+# or destination selection produces, with temporaries as \d+, and the count is how often it must appear (once per
+# static move, once per reachable destination of a dynamic one). Dropping, swapping or changing a selection fails.
+SDWA_MOVREL_PINS = (
+    # R: dynamic v_movrels, src0_sel:BYTE_3 into dst_sel:WORD_1 with UNUSED_PRESERVE.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffu\) \| \(\(\(\(asuint\(dpp_src\d+\) >> 24u\) & 0xffu\) & 0xffffu\) << 16u\)\)\)", 1),
+    # R: static v_movrels, sext(BYTE_1) into BYTE_0 with UNUSED_PRESERVE.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffff00u\) \| \(\(asuint\(asint\(asuint\(alu\d+\) << 16u\) >> 24u\) & 0xffu\) << 0u\)\)\)", 1),
+    # G: dynamic v_movreld, sext(BYTE_2) of the source, then WORD_0 with UNUSED_PRESERVE in each of four destinations.
+    (r"uint dpp_val\d+ = asuint\(asint\(asuint\(alu\d+\) << 8u\) >> 24u\);", 1),
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffff0000u\) \| \(\(dpp_val\d+ & 0xffffu\) << 0u\)\)\)", 4),
+    # G: static v_movreld, WORD_1 into BYTE_3 with UNUSED_PAD.
+    (r"asfloat\(\(\(\(\(asuint\(alu\d+\) >> 16u\) & 0xffffu\) & 0xffu\) << 24u\)\)", 1),
+    # B and A: dynamic moves read WORD_0 of the indexed source.
+    (r"uint dpp_val\d+ = \(\(asuint\(dpp_src\d+\) >> 0u\) & 0xffffu\);", 2),
+    # B: dynamic v_movrelsd, BYTE_2 with UNUSED_PRESERVE in each of four destinations.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xff00ffffu\) \| \(\(dpp_val\d+ & 0xffu\) << 16u\)\)\)", 4),
+    # B: static v_movrelsd, sext(BYTE_0) into DWORD with UNUSED_PAD.
+    (r"asfloat\(asuint\(asint\(asuint\(alu\d+\) << 24u\) >> 24u\)\)", 1),
+    # A: dynamic v_movrelsd_2, WORD_1 with UNUSED_PRESERVE in each of four destinations.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffu\) \| \(\(dpp_val\d+ & 0xffffu\) << 16u\)\)\)", 4),
+    # A: static v_movrelsd_2, BYTE_3 into BYTE_0 with UNUSED_PAD.
+    (r"asfloat\(\(\(\(\(asuint\(alu\d+\) >> 24u\) & 0xffu\) & 0xffu\) << 0u\)\)", 1),
+)
+
+
+def check_sdwa_movrel_pins(hlsl):
+    for pattern, count in SDWA_MOVREL_PINS:
+        found = len(re.findall(pattern, hlsl))
+        assert found == count, f"SDWA movrel selection {pattern!r}: {found} occurrences, expected {count}"
 
 
 def check_swaprel_draw(directory, compiler, renderer, backend):

@@ -102,7 +102,10 @@ using x2w_api_trace::no_argument;
 template <int N>
 __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6, u64 s7)
 {
-    const bool log_it = N >= 3 && InterlockedIncrement(&call_counts[self->provider][N]) <= 6;
+    // call_counts also feeds the periodic call-rate summary, so it keeps counting; a count that has
+    // passed 2^31 is negative and must not log again.
+    const LONG call = N >= 3 ? InterlockedIncrement(&call_counts[self->provider][N]) : 0;
+    const bool log_it = call > 0 && call <= 6;
     u64 args[11] = {a, b, c, s0, s1, s2, s3, s4, s5, s6, s7};
     // Declared outputs are snapshotted so the write is seen rather than assumed; nothing else is read. The
     // snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a caller-sized buffer
@@ -196,7 +199,7 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
         x2w_local::logf("x2w-api %08lx::slot%d -> 0x%08x %s out=%s", provider_ids[self->provider].Data1, N,
                         static_cast<unsigned>(result & 0xffffffffu), handled ? "local" : "real", out);
     }
-    if (log_it || (about_tracked && InterlockedIncrement(&tracked_logged) <= 120))
+    if (log_it || (about_tracked && x2w_local::first_calls(tracked_logged, 120)))
         x2w_local::logf("x2w-runtime %08lx::slot%d(0x%llx, 0x%llx, 0x%llx | 0x%llx, 0x%llx) -> 0x%llx%s%s from +0x%llx", provider_ids[self->provider].Data1, N,
                         a, b, c, s0, s1, result, handled ? " (local user)" : "",
                         about_tracked ? (raw_result != result ? " (tracked async, failure hidden)" : " (tracked async)") : "",

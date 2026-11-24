@@ -23,8 +23,8 @@ using DisconnectFn = long(__cdecl*)(void* handle);
 
 constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);
-constexpr long hr_fail = static_cast<long>(0x80004005);
 constexpr long hr_handle = static_cast<long>(0x80070006);
+constexpr long hr_pending_results = static_cast<long>(0x8AC81001);
 constexpr DWORD trap_connect_exit = 0xE2570300u;
 constexpr std::size_t result_bytes = 0x58;
 
@@ -118,11 +118,15 @@ int main(int argc, char** argv)
     check(disconnect(nullptr) == hr_handle, "XApuDisconnect(null) -> E_HANDLE");
     check(disconnect(bogus) == hr_handle, "XApuDisconnect(bogus) -> E_HANDLE");
 
-    // Positive lifecycle: connect, enqueue, count, dequeue (zeroed 0x58 bytes), empty E_FAIL.
+    // Positive lifecycle: connect, enqueue, count, and dequeue, including empty queues.
+    std::array<unsigned char, result_bytes> sentinel;
+    sentinel.fill(0xA5);
     void* h1 = nullptr;
     check(connect(input.data(), output.data(), &h1) == hr_ok && h1 != nullptr, "XApuConnect h1 succeeds");
     check(get_count(h1, 0) == 0, "initial XApuGetResultCount == 0");
-    check(dequeue(h1, result.data()) == hr_fail, "empty queue XApuDequeueResult -> E_FAIL");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_pending_results, "empty queue XApuDequeueResult -> XAPU_E_PENDING_RESULTS");
+    check(result == sentinel, "empty dequeue preserves the result buffer");
 
     check(enqueue(h1, cmd.data(), 0x11, 0x22) == hr_ok, "enqueue #1 on h1");
     check(enqueue(h1, cmd.data(), 0x33, 0x44) == hr_ok, "enqueue #2 on h1");
@@ -140,7 +144,9 @@ int main(int argc, char** argv)
     check(dequeue(h1, result.data()) == hr_ok, "dequeue #2 on h1 succeeds");
     check(all_zero(result), "dequeue #2 zeroes 0x58-byte result buffer");
     check(get_count(h1, 0) == 0, "XApuGetResultCount == 0 after draining queue");
-    check(dequeue(h1, result.data()) == hr_fail, "drained queue XApuDequeueResult -> E_FAIL");
+    result = sentinel;
+    check(dequeue(h1, result.data()) == hr_pending_results, "drained queue XApuDequeueResult -> XAPU_E_PENDING_RESULTS");
+    check(result == sentinel, "dequeue after draining preserves the result buffer");
 
     // Second independent handle + disconnect invalidation.
     void* h2 = nullptr;
@@ -158,7 +164,7 @@ int main(int argc, char** argv)
     check(get_count(h2, 0) == 2, "disconnect(h1) preserves h2 queue");
     check(dequeue(h2, result.data()) == hr_ok, "h2 dequeue #1 succeeds");
     check(dequeue(h2, result.data()) == hr_ok, "h2 dequeue #2 succeeds");
-    check(dequeue(h2, result.data()) == hr_fail, "h2 drained -> E_FAIL");
+    check(dequeue(h2, result.data()) == hr_pending_results, "h2 drained -> XAPU_E_PENDING_RESULTS");
     check(disconnect(h2) == hr_ok, "XApuDisconnect(h2) succeeds");
 
     FreeLibrary(module);

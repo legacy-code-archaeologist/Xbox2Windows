@@ -3234,10 +3234,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
             join_f64_word(vector[dst], inner, outer)
-        if region["skipped"]:
-            # A wave that skipped the region (or one arm) never ran its waits, so what was outstanding at the opener
-            # still is.
-            before_pending, before_samples = region["outstanding"]
+        if region["skip"] is not None:
+            # A wave that skipped the final arm never ran its waits. An earlier skip already joined at the transition.
+            before_pending, before_samples = region["arm_outstanding"]
             pending.update(before_pending)
             sample_dest.update(before_samples)
         vector.masked = False
@@ -3306,8 +3305,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
                 # A wait is a scalar instruction: it runs whatever the execution mask, so the main wait handler
                 # below resolves outstanding vm/lgkm work exactly as it does outside a region. A region that the
-                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so
-                # close_region puts the pre-region outstanding state back after such a region. No export can be
+                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so the
+                # end of each arm joins that arm's incoming outstanding state if it has a skip. No export can be
                 # outstanding (only s_endpgm may follow one). Scratch stores are not tracked on the store
                 # counter, so vscnt is unknown once any store has been lowered.
                 if "vs" in counters and scratch_written:
@@ -3597,7 +3596,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "saveexec",
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
             scc = None
@@ -3668,7 +3667,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "cmpx",
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
         elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
@@ -3701,8 +3700,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
                       "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
-                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join,
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join}
             vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
@@ -3747,11 +3745,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 # A wave that skipped the then arm did not run its scalar writes or its waits before the else arm:
                 # what was outstanding at the opener may still be outstanding here.
                 scalar.conditional.update(region["scalar_written"])
-                before_pending, before_samples = region["outstanding"]
+                before_pending, before_samples = region["arm_outstanding"]
                 pending.update(before_pending)
                 sample_dest.update(before_samples)
             region["skip"] = None
             region["else"] = region["arm_start"] = i
+            region["arm_outstanding"] = (set(pending), dict(sample_dest))
             scc = None
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
             close_region(i, sgpr_pair(m[1]))

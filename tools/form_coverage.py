@@ -110,8 +110,9 @@ CPU_FIXTURES = {
 # their passing differential test, rather than guessing the macro expansion.
 CPU_RECORD_FIXTURES = {"flag_conditions"}
 
-MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
-                   "externdef", "include", "includelib", "option", "align", "even", "org", "assume", "local"}
+MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "elseifdef", "endif",
+                   "ifidni", "rept", "end", "public", "extern", "externdef", "include", "includelib",
+                   "option", "align", "even", "org", "assume", "local"}
 MASM_DEFINERS = {"proc", "endp", "label", "equ", "db", "dw", "dd", "dq", "byte", "word", "dword",
                  "qword", "segment", "ends", "struct", "macro", "endm", "textequ"}
 MASM_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz"}
@@ -125,8 +126,11 @@ def masm_mnemonics(text):
     found = set()
     macros = set()
     for line in text.splitlines():
-        line = re.sub(r"^\s*\w+::?", "", line.split(";", 1)[0]).strip()  # local or global label
+        # Local (`@@:`) or global label, then a MASM assembly-time assignment.
+        line = re.sub(r"^\s*(?:@@|[@$?A-Za-z_][\w@$?]*)::?", "", line.split(";", 1)[0]).strip()
         words = line.lower().split()
+        if len(words) > 1 and words[1] == "=":
+            continue
         if len(words) > 1 and words[1] == "macro":
             macros.add(words[0])
             continue

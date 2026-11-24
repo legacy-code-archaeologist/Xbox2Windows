@@ -37,7 +37,18 @@ inline void logf(const char* format, ...) noexcept
     SetLastError(error);
 }
 
-inline bool first_calls(LONG& counter, LONG limit) noexcept { return InterlockedIncrement(&counter) <= limit; }
+// True for the first `limit` calls on `counter`. The counter stops at the limit instead of counting
+// every call: a gate on a hot path would otherwise pass 2^31 calls, turn negative and pass again.
+inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
+{
+    LONG seen = counter;
+    while (seen < limit) {
+        const LONG previous = InterlockedCompareExchange(&counter, seen + 1, seen);
+        if (previous == seen) return true;
+        seen = previous;
+    }
+    return false;
+}
 
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a

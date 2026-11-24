@@ -234,6 +234,9 @@ int main(int argc, char** argv)
         const long u = table.begin_update(0);
         table.close(0);
         expect(u >= 0 && table.update_container(static_cast<std::size_t>(u)) == "held-0", "an open update keeps its container entry after close");
+        const long after_close = table.begin_update(0);
+        expect(after_close == -1, "a closed container cannot start an update while another update keeps its entry");
+        if (after_close >= 0) table.end_update(static_cast<std::size_t>(after_close));
         table.end_update(static_cast<std::size_t>(u));
         expect(table.open("now-free") >= 0, "the entry is reclaimed once the update ends");
     }

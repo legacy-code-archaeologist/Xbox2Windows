@@ -21,10 +21,11 @@ bytes and words differ from the whole dword and carry the sign bit. The referenc
 arithmetic from the ISA meaning: the selected field, zero- or sign-extended to 32 bits, compared as the type says.
 The value set is checked to separate a lowering that ignores the select or sext() from the reference.
 
-Float compares are refused in their SDWA form: their predicates are shared with the non-SDWA forms, whose lg/nlg do
-not yet follow the ordered RDNA 2 definition for NaN (#1920), so no f32 SDWA lowering is claimed here.
+Binary32 class compares read a DWORD float in SRC0 and a selected, optionally sign-extended integer mask in SRC1.
+The emitted predicate is checked against the selected mask for each of the ten classes. Ordinary float predicates
+remain refused in their SDWA form pending the NaN predicate work (#1920).
 
-Refused: class compares, a float source with a sub-dword select, an SDWA modifier the decoder does not print for
+Refused: a float source with a sub-dword select, an SDWA modifier the decoder does not print for
 compares, a missing or repeated select, and a destination that is not vcc_lo, EXEC or an SGPR.
 
 The draw: a source-built pixel program multiplies the packed screen position by a constant and keeps a pixel when
@@ -32,6 +33,7 @@ v_cmpx_le_i32_sdwa -16, sext(v1) src0_sel:DWORD src1_sel:BYTE_1 holds. Survivors
 discarded pixel keeps the clear value -1.0. Two mutated translations, one that reads the whole dword (no select) and
 one that zero-extends the byte (no sext()), must each fail the draw against the reference and match their own
 plain-integer image.
+The binary32 class draw selects the negative-normal mask bit from BYTE_1. Reading the whole dword must fail.
 """
 import struct
 import subprocess
@@ -167,6 +169,15 @@ def integer_code(op, destination, sel0, sext0, sel1, sext1):
                      SGPR_DST if destination == 'sgpr' else None, sel0, sel1)
 
 
+def class_forms():
+    for op, destination in ((0x88, 'vcc'), (0x88, 's6'), (0x98, 'exec')):
+        for selection in SELS:
+            for sext in (False, True):
+                encoded = vopc_sdwa(op, source('v', 1), source('v', 2, sext=sext),
+                                    SGPR_DST if destination == 's6' else None, 'DWORD', selection)
+                yield destination, selection, sext, encoded
+
+
 def controls():
     # 1. The encoder writes what the decoder reads, checked on LLVM 15 encodings from tests/rdna2_tools_check.py.
     known = [
@@ -279,11 +290,42 @@ def controls():
         got = refusal(name, asm)
         check('refused: %s (%s)' % (label, got), got == message)
 
-    for op, name in ((0x88, 'v_cmp_class_f32_sdwa'), (0x98, 'v_cmpx_class_f32_sdwa')):
-        for sel in ('DWORD', 'BYTE_1', 'WORD_1'):
-            code = vopc_sdwa(op, source('v', 1), source('v', 2), None, 'DWORD', sel)
-            check('class decodes: %s' % decode_one(code)[1], decode_one(code)[0] == name)
-            expect('%s src1_sel:%s' % (name, sel), *decode_one(code), name)
+    class_count, class_errors = 0, []
+    for destination, selection, sext, encoded in class_forms():
+        name, asm = decode_one(encoded)
+        try:
+            _, class_stage = translate(encoded, exec_known=False)
+        except G.Unsupported as error:
+            class_errors.append((asm, str(error)))
+            continue
+        class_count += 1
+        cmpx = destination == 'exec'
+        if (name != ('v_cmpx_class_f32_sdwa' if cmpx else 'v_cmp_class_f32_sdwa')
+                or len(class_stage.lines) != 1 or not class_stage.lines[0].startswith(destination + ' = ')
+                or 'class32(F(v1))' not in class_stage.lines[0]
+                or (SGPR_DST in class_stage.masks) != (destination == 's6')
+                or class_stage.exec_known):
+            class_errors.append((asm, class_stage.lines, class_stage.masks))
+            continue
+        expression = class_stage.lines[0].split(' = ', 1)[1][:-1].replace('class32(F(v1))', 'class_bit')
+        emitted = Expr(expression)
+        for raw in VALUES + [0x200, 0x20000]:
+            for index in range(10):
+                class_bit = 1 << index
+                for lane in (0, 1):
+                    actual = emitted.run({'class_bit': class_bit, 'v2': raw, 'exec': lane})[0]
+                    expected = lane & int(bool(class_bit & field(raw, selection, sext)))
+                    if actual != expected:
+                        class_errors.append((asm, raw, index, lane, actual, expected))
+    check('42 binary32 class SDWA forms use the selected mask and destination',
+          class_count == 42 and not class_errors, str(class_errors[:3]))
+    op = 0x88
+    name, asm = decode_one(vopc_sdwa(op, source('v', 1), source('v', 2), None, 'WORD_0', 'BYTE_1'))
+    expect('class float src0 sub-dword', name, asm, 'v_cmp_class_f32_sdwa requires a DWORD float source')
+    _, class_stage = translate(vopc_sdwa(op, source('v', 1, neg=True, absolute=True), source('v', 2),
+                                        None, 'DWORD', 'BYTE_1'))
+    check('class float source preserves abs and neg', 'class32((-abs(F(v1))))' in class_stage.lines[0],
+          str(class_stage.lines))
     for index in (0, 1):
         for sel in SELS[:-1]:
             sels = ('DWORD', sel) if index else (sel, 'DWORD')
@@ -330,11 +372,16 @@ v_cmpx_le_i32_sdwa -16, sext(v1) src0_sel:DWORD src1_sel:BYTE_1
 exp mrt0 v0, v0, v0, v0 done vm
 s_endpgm
 """
-PS_WORDS = (struct.pack('<II', (0x0b << 25) | (1 << 17) | 255, MULTIPLIER)
-            + vopc_sdwa(0x93, source('s', 208), source('v', 1, sext=True), None, 'DWORD', 'BYTE_1')
-            + struct.pack('<III', 0xf800180f, 0, 0xbf810000))
+MUL_WORDS = struct.pack('<II', (0x0b << 25) | (1 << 17) | 255, MULTIPLIER)
+EXPORT_WORDS = struct.pack('<III', 0xf800180f, 0, 0xbf810000)
+PS_WORDS = (MUL_WORDS + vopc_sdwa(0x93, source('s', 208), source('v', 1, sext=True), None, 'DWORD', 'BYTE_1')
+            + EXPORT_WORDS)
+CLASS_PS_SOURCE = PS_SOURCE.replace('v_cmpx_le_i32_sdwa -16, sext(v1)', 'v_cmpx_class_f32_sdwa -1.0, v1')
+CLASS_PS_WORDS = (MUL_WORDS + vopc_sdwa(0x98, source('s', 243), source('v', 1), None, 'DWORD', 'BYTE_1')
+                  + EXPORT_WORDS)
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 SELECTED = 'asuint(asint(v1 << 16u) >> 24u)'
+CLASS_SELECTED = '((v1 >> 8u) & 0xffu)'
 MUTATIONS = {
     'no select': (SELECTED, 'v1'),                     # reads the whole dword
     'no sext': (SELECTED, '((v1 >> 8u) & 0xffu)'),      # zero-extends the byte
@@ -366,6 +413,26 @@ def pixel_hlsl(how='reference'):
     return text
 
 
+def class_image(select=True):
+    words = []
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            position = x | (y << 16)
+            mask = (position * MULTIPLIER) & MASK
+            if select:
+                mask = field(mask, 'BYTE_1', False)
+            words += [position if mask & 0x8 else CLEAR] * 4  # -1.0 is negative normal
+    return words
+
+
+def class_pixel_hlsl(select=True):
+    text = G.Pipeline(VS_WORDS, CLASS_PS_WORDS, root_blob(), ps_hw_inputs=PACKED).hlsl_ps()
+    if not select:
+        assert text.count(CLASS_SELECTED) == 1
+        text = text.replace(CLASS_SELECTED, 'v1')
+    return text
+
+
 def check_fixture():
     decoded = [asm for _o, _s, _n, asm in G.decode(PS_WORDS)]
     check('pixel fixture decodes to its source', decoded == PS_SOURCE.splitlines(), str(decoded))
@@ -388,6 +455,12 @@ def check_fixture():
         check('%s: evaluated compare equals the image' % how, all(
             expr.run({'v1': product(x | y << 16)})[0] == survives(x | y << 16, how)
             for y in range(HEIGHT) for x in range(WIDTH)))
+    decoded_class = [asm for _o, _s, _n, asm in G.decode(CLASS_PS_WORDS)]
+    check('class pixel fixture decodes to its source', decoded_class == CLASS_PS_SOURCE.splitlines(), str(decoded_class))
+    class_reference = class_image()
+    kept = sum(class_reference[i] != CLEAR for i in range(0, len(class_reference), 4))
+    check('class reference keeps %d of %d pixels' % (kept, WIDTH * HEIGHT), 0 < kept < WIDTH * HEIGHT)
+    check('ignoring the class mask select changes the image', class_reference != class_image(select=False))
 
 
 def all_codes():
@@ -398,6 +471,7 @@ def all_codes():
             for (neg0, abs0), (neg1, abs1) in ((m, n) for m in modifiers for n in modifiers):
                 codes.append(vopc_sdwa(op, source('v', 1, neg=neg0, absolute=abs0),
                                        source('v', 2, neg=neg1, absolute=abs1), None if cmpx else SGPR_DST))
+    codes.extend(encoded for _, _, _, encoded in class_forms())
     codes.append(vopc_sdwa(0x85, source('s', 3, sext=True), source('v', 2), SGPR_DST, 'BYTE_3', 'WORD_1'))
     return codes
 
@@ -408,6 +482,8 @@ def check_binary(llvm_mc):
     built = assemble(llvm_mc, source_text)
     check('llvm-mc assembles %d decoded VOPC SDWA forms to the same words' % len(codes), built == b''.join(codes))
     check('llvm-mc assembles the pixel fixture to the same words', assemble(llvm_mc, PS_SOURCE) == PS_WORDS)
+    check('llvm-mc assembles the class pixel fixture to the same words',
+          assemble(llvm_mc, CLASS_PS_SOURCE) == CLASS_PS_WORDS)
 
 
 def check_decode(library):
@@ -420,6 +496,9 @@ def check_decode(library):
           len(texts) == len(codes) and not wrong, str(wrong[:3]))
     check('LLVM disassembles the pixel fixture as its source', disassemble(PS_WORDS, library) == PS_SOURCE.splitlines(),
           str(disassemble(PS_WORDS, library)))
+    class_text = disassemble(CLASS_PS_WORDS, library)
+    check('LLVM disassembles the class pixel fixture as its source', class_text == CLASS_PS_SOURCE.splitlines(),
+          str(class_text))
 
 
 def words_file(directory, name, words):
@@ -442,6 +521,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         reference = words_file(directory, 'reference', image('reference'))
+        class_reference = words_file(directory, 'class_reference', class_image())
+        class_unselected = words_file(directory, 'class_unselected', class_image(select=False))
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'vs_%s' % kind, vs_profile, directory)
             ps = compile_hlsl(compiler, kind, pixel_hlsl(), 'ps_%s' % kind, ps_profile, directory)
@@ -462,6 +543,19 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 run = draw(renderer, adapter, vs, bad, own)
                 check('%s %s %s mutation matches its own plain-integer image' % (kind, adapter, how),
                       run.returncode == 0, run.stdout + run.stderr)
+            class_ps = compile_hlsl(compiler, kind, class_pixel_hlsl(), 'ps_class_%s' % kind, ps_profile, directory)
+            run = draw(renderer, adapter, vs, class_ps, class_reference)
+            check('%s %s: class compare matches all %d pixels' % (kind, adapter, WIDTH * HEIGHT),
+                  run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                  run.stdout + run.stderr)
+            bad_class = compile_hlsl(compiler, kind, class_pixel_hlsl(select=False), 'ps_class_bad_%s' % kind,
+                                     ps_profile, directory)
+            run = draw(renderer, adapter, vs, bad_class, class_reference)
+            check('%s %s: class compare without the select fails' % (kind, adapter),
+                  run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+            run = draw(renderer, adapter, vs, bad_class, class_unselected)
+            check('%s %s: class mutation matches the whole-dword image' % (kind, adapter),
+                  run.returncode == 0, run.stdout + run.stderr)
 
 
 def main():

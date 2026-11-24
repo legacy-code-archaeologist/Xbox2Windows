@@ -354,7 +354,7 @@ template <int N>
 __declspec(noinline) u64 computer_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 1) {
+    if (x2w_local::first_calls(calls, 1)) {
         char name[48];
         std::snprintf(name, sizeof(name), "TextureComputer::slot%d(no-op)", N);
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N, rcx, rdx, r8, r9, _ReturnAddress());
@@ -404,7 +404,7 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
     auto* computer = new Computer{bc64::supports(desc) ? bc_table.data() : table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 3)
+    if (x2w_local::first_calls(calls, 3))
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGCreateTextureComputer(stand-in)", 0, rcx, rdx, r8,
                          r9, _ReturnAddress());
     return 0;
@@ -418,7 +418,7 @@ extern "C" __declspec(noinline) long XGSuggestSwizzleMode(u64 rcx, u64 rdx, u64 
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGSuggestSwizzleMode", 1, rcx, rdx, r8, r9, _ReturnAddress());
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 3)
+    if (x2w_local::first_calls(calls, 3))
         x2w_trap::record("x2w-xg", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGSuggestSwizzleMode(keep default, S_OK)", 1, rcx,
                          rdx, r8, r9, _ReturnAddress());
     return 0;

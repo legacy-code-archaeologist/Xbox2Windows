@@ -65,6 +65,8 @@ RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
 SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
+    (re.compile(r"buffer_load_format_(?:x|xy|xyz|xyzw) requires descriptor FORMAT and DST_SEL\Z"),
+     "buffer_* instruction"),
     (re.compile(r"SDWA UNUSED_SEXT\Z"), "SDWA UNUSED_SEXT"),
     (re.compile(r"SDWA dst_unused\b"), "SDWA dst_unused"),
     (re.compile(r"undecodable word\b"), "undecodable word"),

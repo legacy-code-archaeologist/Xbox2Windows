@@ -328,6 +328,11 @@ class TestRdna2Disasm(unittest.TestCase):
             # SMEM: register widths per op and soffset vs immediate offset
             ("01050cf4000000fa", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], 0x0"),
             ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
+            # SMEM OFFSET[20:0] is a signed 21-bit byte offset
+            ("000000f4ffff1ffa", "s_load_dword", "s_load_dword s0, s[0:1], -0x1"),
+            ("000000f4000010fa", "s_load_dword", "s_load_dword s0, s[0:1], -0x100000"),
+            ("000000f4ffff0ffa", "s_load_dword", "s_load_dword s0, s[0:1], 0xfffff"),
+            ("000000f4ffff1f00", "s_load_dword", "s_load_dword s0, s[0:1], s0 offset:-0x1"),
             ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
             ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
             ("420160f400000000", "s_buffer_store_dword", "s_buffer_store_dword s5, s[4:7], s0"),
@@ -1197,6 +1202,20 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["length"], 8)
         self.assertEqual(insns[0]["assembly"], "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD")
         self.assertEqual(disasm_rdna2(sdwa[:4])[0]["opcode"], "vopc_truncated")
+
+        # VOPC DPP16, DPP8 and DPP8 FI extension dwords are consumed with the instruction, so the
+        # following s_endpgm stays at offset 8 (the operands are not decoded).
+        for raw_hex, opcode, form in (
+            ("fa02087c00010000", "vopc_dpp16", "DPP16"),
+            ("e902087c00010000", "vopc_dpp8", "DPP8"),
+            ("ea02087c00010000", "vopc_dpp8", "DPP8"),
+        ):
+            insns = disasm_rdna2(bytes.fromhex(raw_hex + "000081bf"))
+            self.assertEqual([i["opcode"] for i in insns], [opcode, "s_endpgm"], raw_hex)
+            self.assertEqual([i["offset"] for i in insns], [0, 8], raw_hex)
+            self.assertEqual(insns[0]["length"], 8, raw_hex)
+            self.assertEqual(insns[0]["assembly"], f"v_cmp_gt_f32_dpp <unsupported {form}>", raw_hex)
+        self.assertEqual(disasm_rdna2(bytes.fromhex("fa02087c"))[0]["opcode"], "vopc_truncated")
 
         # Truncated VOPC literal
         w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255
@@ -3519,6 +3538,36 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertIn("s_nop 0", res.stdout)
         self.assertIn("s_endpgm", res.stdout)
 
+    def test_cli_hex_output_and_input_errors(self):
+        script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listing.txt"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "000080bf", "--output", str(out)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("s_nop 0", out.read_text(encoding="utf-8"))
+
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "0000810"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertIn("--hex", res.stderr)
+
+            missing = Path(tmp) / "nonexist.bin"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(missing)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not found", res.stderr)
+
     def test_llvm_comparison(self):
         llvm_lib_env = os.environ.get("LLVM_LIB")
         if not llvm_lib_env:
@@ -5022,6 +5071,19 @@ class TestRdna2Scanner(unittest.TestCase):
                 stream.write(".long 0\n")
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
+
+    def test_parse_assembly_file_skips_bom_and_commented_labels(self):
+        """A UTF-8 BOM and llc-style commented labels are not instructions; a ':' in a comment keeps the line."""
+        from scan_unsupported_shaders import parse_assembly_file
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = Path(tmp) / "bom.s"
+            bom.write_bytes(b"\xef\xbb\xbfs_endpgm\n")
+            self.assertEqual(parse_assembly_file(bom), ["s_endpgm"])
+            labels = Path(tmp) / "labels.s"
+            labels.write_text("pixel:                                  ; @pixel\n"
+                              ".LBB0_1:                                ; %bb.1\n"
+                              "s_endpgm ; done:\n", encoding="utf-8")
+            self.assertEqual(parse_assembly_file(labels), ["s_endpgm ; done:"])
 
     def test_binary_scan_recognizes_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
         """The scan report names the four VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""

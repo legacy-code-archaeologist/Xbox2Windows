@@ -247,7 +247,32 @@ def case(expected):
     return bytes(data)
 
 
+def debug_status(output):
+    """The debug-layer result of one renderer run, or None if it is not clean.
+
+    With the layer enabled the renderer prints its error and warning counts, and both must be
+    zero. Without it (no Graphics Tools on the host) it prints debug_layer=unavailable and no
+    counts, so there is nothing to check beyond the draw itself.
+    """
+    if "debug_layer=enabled" in output:
+        return "debug_errors=0 debug_warnings=0" if "debug_errors=0 debug_warnings=0\n" in output else None
+    if "debug_layer=unavailable" in output and "debug_errors=" not in output:
+        return "debug_layer=unavailable"
+    return None
+
+
 def draw(dxc, renderer, adapter, tmp):
+    # Counts from an enabled layer must be zero; a missing layer is accepted only without counts.
+    for output, expected in (
+        ("backend=warp debug_layer=enabled\ndebug_errors=0 debug_warnings=0\n", "debug_errors=0 debug_warnings=0"),
+        ("backend=warp debug_layer=unavailable\n", "debug_layer=unavailable"),
+        ("backend=warp debug_layer=enabled\ndebug_errors=1 debug_warnings=0\n", None),
+        ("backend=warp debug_layer=enabled\ndebug_errors=0 debug_warnings=2\n", None),
+        ("backend=warp debug_layer=enabled\n", None),
+        ("backend=warp\n", None),
+    ):
+        if debug_status(output) != expected:
+            raise AssertionError(f"debug_status({output!r}) is not {expected!r}")
     texts = source()
     # The --check-pixel-gather case format binds one RGBA32F level through the point-sampling root
     # signature and compares one reference color per pixel of the 8x8 target.
@@ -263,10 +288,11 @@ def draw(dxc, renderer, adapter, tmp):
         if result.returncode == 77:
             print(output, end="")
             raise SystemExit(77)
-        if result.returncode != code or needle not in output or "debug_errors=0 debug_warnings=0" not in output:
+        status = debug_status(output)
+        if result.returncode != code or needle not in output or status is None:
             sys.stderr.write(output)
             raise AssertionError(f"{label}: unexpected result (exit {result.returncode})")
-        print(f"{label}: exit={code} {needle.strip()} debug_errors=0 debug_warnings=0")
+        print(f"{label}: exit={code} {needle.strip()} {status}")
 
     x, y = predicted_mismatch()
     for name, text in texts.items():
