@@ -3020,6 +3020,9 @@ class Stage:
                 raise Unsupported('fma_mix modifier %s' % m)
 
         def operand(tok, is_half, is_hi):
+            if tok == '-0':
+                # neg on inline 0 is -0.0 in either format; f() would print +0.0, which changes a -0 product.
+                return '(-0.0)'
             if not is_half:
                 if is_hi:
                     raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)

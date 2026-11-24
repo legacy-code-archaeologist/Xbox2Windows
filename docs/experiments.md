@@ -13213,11 +13213,10 @@ The shared handler now also:
 - reads the high half of a binary16 source with `op_sel` (previously refused on all three forms);
 - accepts `-` and `|...|` on binary16 register sources;
 - refuses `op_sel` on a binary32 source and any modifier it does not model (previously ignored);
-- refuses an inline float or literal on a binary16 source. Before, `mixlo`/`mixhi` passed the binary32 bits of an inline float such as `1.0` through `f16tof32`, which reads 0.
+- refuses an inline float or literal on a binary16 source. Before, `mixlo`/`mixhi` passed the binary32 bits of an inline float such as `1.0` through `f16tof32`, which reads 0;
+- reads a negated inline zero (`-0`) as `-0.0` on any source, so a `-0` product stays `-0`.
 
-`pixel_aot.py` reads the two selector fields the other way round (`op_sel` as the format, `op_sel_hi` as the half). Its WARP fixture checks against a reference that uses the same reading, so it does not catch the swap. This change leaves `pixel_aot` alone.
-
-`tests/startup_gfx2hlsl_fma_mix_check.py` (`startup_gfx2hlsl_fma_mix`) builds VOP3P words from the decoder layout, checks the decoded text, and pins the translation of nine forms. Two controls check that flipping `op_sel` and `op_sel_hi` changes the output, and four forms must be refused. On the translator before this change the check fails at the first form. This is translation only; FXC 10.0.26100 compiles the emitted expressions, but no draw or dispatch was run.
+`tests/startup_gfx2hlsl_fma_mix_check.py` (`startup_gfx2hlsl_fma_mix`) builds VOP3P words from the decoder layout. It first checks that its encoder reproduces two `llvm-mc`-assembled words already pinned in `tests/rdna2_tools_check.py`. It then checks the decoded text and pins the translation of ten forms. Two controls check that flipping `op_sel` and `op_sel_hi` changes the output, and four forms must be refused. On the translator before this change the check fails at the first form. This is translation only; no draw or dispatch was run, and the refusal census was not re-measured.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fma_mix$' -V

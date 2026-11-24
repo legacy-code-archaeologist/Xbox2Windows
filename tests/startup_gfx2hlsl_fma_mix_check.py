@@ -101,6 +101,14 @@ def expect_refused(label, code, asm):
 
 v2, v3, v4 = V + 2, V + 3, V + 4
 
+# The encoder must reproduce the LLVM-assembled words pinned in tests/rdna2_tools_check.py, so it does
+# not only mirror the decoder it feeds.
+check('encoder matches llvm-mc: v_fma_mix_f32 v12, s44, v19, v20',
+      encode(MIX_F32, 12, (44, V + 19, V + 20)).hex() == '0c0020cc2c265204')
+check('encoder matches llvm-mc: v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]',
+      encode(MIX_F32, 12, (44, V + 19, V + 20), op_sel=(1, 1, 0), op_sel_hi=(1, 0, 0),
+             abs_bits=(1, 0, 0), neg=(0, 1, 0)).hex() == '0c1920cc2c26524c')
+
 # --- v_fma_mix_f32: binary32 result, sources selected per operand -----------------------------------
 plain = expect('f32 sources',
                encode(MIX_F32, 1, (v2, v3, v4)),
@@ -125,6 +133,10 @@ expect('inline 0 as a binary16 addend',
        encode(MIX_F32, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1)),
        'v_fma_mix_f32 v1, v2, v3, 0 op_sel_hi:[1,1,1]',
        'v1 = U(f16tof32(v2) * f16tof32(v3) + 0.0);')
+expect('negated inline 0 addend keeps a -0 product',
+       encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 1, 0), op_sel_hi=(0, 1, 0), neg=(0, 0, 1)),
+       'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,1,0] op_sel_hi:[0,1,0]',
+       'v1 = U(F(v2) * f16tof32(v3 >> 16) + (-0.0));')
 expect('inline float on a binary32 source',
        encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel_hi=(1, 0, 0)),
        'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel_hi:[1,0,0]',
@@ -135,6 +147,10 @@ expect('mixlo writes the low half',
        encode(MIXLO_F16, 1, (v2, v3, v4), op_sel_hi=(1, 1, 0)),
        'v_fma_mixlo_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]',
        'v1 = (v1 & 0xffff0000u) | f32tof16(f16tof32(v2) * f16tof32(v3) + F(v4));')
+expect('mixlo with a negated inline 0 on a binary16 source',
+       encode(MIXLO_F16, 1, (v2, v3, ZERO), op_sel_hi=(1, 1, 1), neg=(0, 0, 1)),
+       'v_fma_mixlo_f16 v1, v2, v3, -0 op_sel_hi:[1,1,1]',
+       'v1 = (v1 & 0xffff0000u) | f32tof16(f16tof32(v2) * f16tof32(v3) + (-0.0));')
 expect('mixhi writes the high half from a high-half source',
        encode(MIXHI_F16, 1, (v2, v3, v4), op_sel=(0, 0, 1), op_sel_hi=(0, 0, 1)),
        'v_fma_mixhi_f16 v1, v2, v3, v4 op_sel:[0,0,1] op_sel_hi:[0,0,1]',
