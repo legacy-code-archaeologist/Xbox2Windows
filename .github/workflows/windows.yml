@@ -83,6 +83,7 @@ jobs:
               (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/shader_signed_zero_minmax_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "decode", "libLLVM-15.so.1"], {}),
@@ -204,6 +205,7 @@ jobs:
             tests/startup_flat_param_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
+            tests/shader_signed_zero_minmax_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \

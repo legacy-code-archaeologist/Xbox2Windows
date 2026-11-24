@@ -2236,6 +2236,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     add_test(NAME startup_gfx2hlsl_mad_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py")
+    add_test(NAME shader_signed_zero_minmax_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/shader_signed_zero_minmax_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME shader_signed_zero_minmax_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/shader_signed_zero_minmax_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(shader_signed_zero_minmax_${adapter} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
+    endforeach()
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_mad_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py" dispatch "${DXC_EXECUTABLE}"

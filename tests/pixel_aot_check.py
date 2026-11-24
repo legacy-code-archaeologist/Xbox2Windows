@@ -8240,7 +8240,8 @@ def check_literal_fma_draw(directory, compiler, renderer, backend):
 def check_scalar_pair_reads() -> None:
     program = with_scalar_pair_reads()
     source = translate(program)
-    for field in ("(params[0].w * sample", "max(params[15].z, ", "(params[1].x + sample", "(params[1].y - sample",
+    for field in ("(params[0].w * sample", "minmax_zero32(params[15].z, alu22, true)",
+                  "(params[1].x + sample", "(params[1].y - sample",
                   "= params[1].z;", "(params[15].w * alu"):
         assert field in source, field
 
@@ -9175,9 +9176,11 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
 def check_three_way_templates():
     """The HLSL forms must pick the expected operand for every operand order, NaN operands included."""
     names = {"min": min_num, "max": max_num, "asuint": lambda x: struct.unpack("<I", struct.pack("<f", x))[0]}
+    names.update(minmax_zero32=lambda a, b, maximum: (max_num if maximum else min_num)(a, b),
+                 true=True, false=False)
     # Evaluate the med3_32 helper of the preamble: its NaN test on the encoding, then the selected form.
     helper = (r"^float med3_32\(float a, float b, float c\) \{\n    uint top = (.+);\n"
-              r"    return top > (0x[0-9a-f]+)u \? (.+) : (.+);\n\}")
+              r"    return top > (0x[0-9a-f]+)u\n        \? (.+)\n        : (.+);\n\}")
     for top, limit, nan_form, finite_form in re.findall(helper, pixel_aot.PREAMBLE, re.M):
         top = re.sub(r"(0x[0-9a-f]+)u\b", r"\1", top)
         names["med3_32"] = lambda a, b, c: eval(
@@ -16383,9 +16386,9 @@ def _check_controls_inline(directory):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
     source = translate(three_way())
     for expected in ("med3_32(params[1].z, sample16.y, sample16.x)",
-                     "max(max(sample16.x, sample16.z), sample16.y)",
+                     "minmax_zero32(minmax_zero32(sample16.x, sample16.z, true), sample16.y, true)",
                      "med3_32(sample16.x, params[0].w, params[1].x)",
-                     "min(min(abs(params[1].y), sample16.y), alu"):
+                     "minmax_zero32(minmax_zero32(abs(params[1].y), sample16.y, false), alu22, false)"):
         assert expected in source, expected
     for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
                      ("v_med3_f32 v15, s47", "v_med3_i32 v15, |s47|"),
@@ -21122,7 +21125,7 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     run_pixel_batch(renderer, backend, shader, cases)
     # Desktop min and max alone skip a NaN operand instead of taking V_MIN3_F32 of the rest.
     text = source.read_text(encoding="ascii")
-    nan_ignored = text.replace("? min(min(a, b), c) :", "? max(min(a, b), min(max(a, b), c)) :")
+    nan_ignored = text.replace("return top > 0x7f800000u", "return false")
     assert nan_ignored != text
     source.write_text(nan_ignored, encoding="ascii")
     compile_shader(compiler, source, shader)

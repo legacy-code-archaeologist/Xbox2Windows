@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
+from shader_minmax import FLOAT_MINMAX  # noqa: E402
 
 
 class Unsupported(Exception):
@@ -1589,7 +1590,7 @@ class Stage:
 VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
     'v_mul_f32': (2, '{0} * {1}'), 'v_mul_legacy_f32': (2, 'mul_legacy({0}, {1})'),
-    'v_min_f32': (2, 'min({0}, {1})'), 'v_max_f32': (2, 'max({0}, {1})'),
+    'v_min_f32': (2, 'minmax_zero32({0}, {1}, false)'), 'v_max_f32': (2, 'minmax_zero32({0}, {1}, true)'),
     'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, 'mad32({0}, {1}, {2}, false)'),
     'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_mad_legacy_f32': (3, 'mad32({0}, {1}, {2}, true)'),
@@ -1599,7 +1600,9 @@ VEC_F = {
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
-    'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
+    'v_med3_f32': (3, 'med3({0}, {1}, {2})'),
+    'v_min3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, false), false)'),
+    'v_max3_f32': (3, 'minmax_zero32({0}, minmax_zero32({1}, {2}, true), true)'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
@@ -1772,7 +1775,7 @@ class Pipeline:
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def common(self):
-        out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
+        out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)', FLOAT_MINMAX,
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                # Match pixel_aot: round the product before adding and flush denormals to signed zero.
                'float ftz32(float value) {',
@@ -1788,7 +1791,10 @@ class Pipeline:
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
                '}',
-               'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               'float med3(float a, float b, float c) {',
+               '    float lo = minmax_zero32(a, b, false), hi = minmax_zero32(a, b, true);',
+               '    return minmax_zero32(lo, minmax_zero32(hi, c, false), true);',
+               '}',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
@@ -1915,7 +1921,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-6'))))
     return fnv(layout, key) if layout else key
 
 
