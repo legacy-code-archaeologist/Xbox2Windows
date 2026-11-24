@@ -13204,6 +13204,25 @@ The binary32 table (`VEC_F`) applies the same operand-count rule. Before this ch
 
 `tests/startup_gfx2hlsl_swap_check.py` (`startup_gfx2hlsl_swap`) decodes the documented VOP1 words, evaluates the translated text of seven programs on the CPU against a plain exchange of two list entries, and checks the refusals. Two mutations (write before read, only one destination written) are loaded from the translator source and must fail the fixtures. `python -B tests/startup_gfx2hlsl_swap_check.py binary llvm-mc-15` also reassembles the source lines. This is translation only; no draw was run.
 
+## Startup translator: v_fma_mix_f32
+
+`tools/startup/gfx2hlsl.py` now lowers `v_fma_mix_f32` (VOP3P, opcode 0x20), which it used to refuse. It shares one handler with `v_fma_mixlo_f16` and `v_fma_mixhi_f16`. Each source is read as LLVM 15 selects it (`SelectVOP3PMadMixModsImpl`): `op_sel_hi` set means a binary16 source, and `op_sel` then picks its high half. abs and then neg apply after widening. The binary32 result is written to the whole VGPR, with optional `clamp`.
+
+The shared handler now also:
+
+- reads the high half of a binary16 source with `op_sel` (previously refused on all three forms);
+- accepts `-` and `|...|` on binary16 register sources;
+- refuses `op_sel` on a binary32 source and any modifier it does not model (previously ignored);
+- refuses an inline float or literal on a binary16 source. Before, `mixlo`/`mixhi` passed the binary32 bits of an inline float such as `1.0` through `f16tof32`, which reads 0.
+
+`pixel_aot.py` reads the two selector fields the other way round (`op_sel` as the format, `op_sel_hi` as the half). Its WARP fixture checks against a reference that uses the same reading, so it does not catch the swap. This change leaves `pixel_aot` alone.
+
+`tests/startup_gfx2hlsl_fma_mix_check.py` (`startup_gfx2hlsl_fma_mix`) builds VOP3P words from the decoder layout, checks the decoded text, and pins the translation of nine forms. Two controls check that flipping `op_sel` and `op_sel_hi` changes the output, and four forms must be refused. On the translator before this change the check fails at the first form. This is translation only; FXC 10.0.26100 compiles the emitted expressions, but no draw or dispatch was run.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fma_mix$' -V
+```
+
 ## Non-fused multiply-add in the startup translator
 
 The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32` and
