@@ -4508,8 +4508,9 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
-    def i64_words(self, tok):
-        """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""
+    def i64_words(self, tok, signed=False):
+        """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
+        32-bit hex literal (zero-extended, sign-extended when the operation is signed)."""
         pair = reg_range(tok)
         if pair and pair[2] == pair[1] + 1:
             if pair[0] == 'v' and pair[2] <= 255:
@@ -4520,6 +4521,9 @@ class Stage:
         if re.fullmatch(r'0|-?[1-9]\d*', tok) and -16 <= int(tok) <= 64:
             value = int(tok) & 0xffffffffffffffff
             return '%du' % (value & 0xffffffff), '%du' % (value >> 32)
+        if re.fullmatch(r'0x[0-9a-f]{1,8}', tok):
+            word = int(tok, 16)
+            return '%du' % word, ('4294967295u' if signed and word >> 31 else '0u')
         raise Unsupported('64-bit source %s' % tok)
 
     def shift64(self, ops, mods, helper):
@@ -4535,7 +4539,7 @@ class Stage:
                 or ops[1] in ('vcc', 'exec') or ops[1] in FLOATS):
             raise Unsupported('64-bit shift amount %s' % ops[1])
         amount = self.u(ops[1])
-        low, high = self.i64_words(ops[2])
+        low, high = self.i64_words(ops[2], helper == 'shr64i')
         body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
             helper, low, high, amount, dst[1], dst[2])
         if hasattr(self, 'uniform_v'):

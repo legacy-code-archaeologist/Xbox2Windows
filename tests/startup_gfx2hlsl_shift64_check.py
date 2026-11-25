@@ -313,7 +313,6 @@ def controls():
         'v_lshrrev_b64 v[0:1], v2, v[255:256]',
         'v_lshrrev_b64 v[0:1], v2, vcc',
         'v_lshrrev_b64 v[0:1], v2, exec',
-        'v_lshrrev_b64 v[0:1], v2, 0x41',
         'v_lshrrev_b64 v[0:1], v2, 65',
         'v_lshrrev_b64 v[0:1], v2, -17',
         'v_lshrrev_b64 v[0:1], v2, 1.0',
