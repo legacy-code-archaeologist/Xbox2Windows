@@ -7143,6 +7143,38 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_to_pixel_(warp|hardware)$' -V
 ```
 
+## Signed zero in floating-point min and max
+
+The RDNA 2 ISA defines `-0 < +0` for `V_MIN_F32`, `V_MAX_F32`, `V_MIN_F16`
+and `V_MAX_F16` (§12.7, pp. 132–133 and 136). Its three-input min and max
+compose these operations (§12.12, p. 170), and its packed instructions apply
+min or max to each half (§12.10, p. 164). The median description specifies a
+median without a separate mixed-zero rule. The fixture uses the same signed-zero
+ordering for the median. DXIL FMin and FMax permit either operand when their
+values compare equal. [AMD RDNA 2 ISA](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content), [DXIL operation reference](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#fmax)
+
+Both translators now resolve a pair of zeros from the sign bits. Maximum ANDs
+the signs and minimum ORs them. The startup shader cache revision advances to
+`x2w-startup-shader-15`, so translations cached before the change are not reused. The pixel translator applies the same rule to
+each widened half for packed binary16 min and max. It retains the packed NaN
+selection and the existing output modifiers. The startup translator retains
+its own median NaN behavior. Scalar binary16 min/max, three-input binary16
+forms and startup SDWA min/max remain outside the supported instruction set.
+
+On Windows 10 (10.0.19045.6456), the in-box WARP baseline (10.0.19041.5794)
+returned `00000000` for `(-0, +0)` and `80000000` for `(+0, -0)` for both
+two-input operations. Three-input and packed results also varied with operand
+order. WARP differed from the reference on 50 of 252 result words. The GTX 1060
+(32.0.15.6094) already matched all 252. With the helper, both adapters matched
+all words, including single quiet NaN inputs and binary16 packed results.
+The draws use DXC for the offline pixel path and DXC and FXC for the startup
+path. These comparisons cover desktop results. Median and packed tie behavior
+on console hardware, signaling NaNs and NaN payload propagation were unmeasured.
+
+Run `ctest --preset dev --no-tests=error -R '^shader_signed_zero_minmax_' -V`.
+The Python test pins each emitted lowering and the LLVM 15 check reassembles
+the source-built instructions.
+
 ## Offline pixel shader recompilation
 
 The 64-bit scalar set and clear forms are s_bitset0_b64 and s_bitset1_b64.

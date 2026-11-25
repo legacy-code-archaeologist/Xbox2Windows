@@ -149,7 +149,7 @@ def main():
 
         # 8. The cache revision moved, so a translation from before the store lowering is never loaded.
         check('cache key uses revision 14', G.pipeline_key(b'a', b'b', ROOT) ==
-              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-14')))))
+              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-15')))))
 
     if failures:
         print('FAILED: ' + ', '.join(failures))

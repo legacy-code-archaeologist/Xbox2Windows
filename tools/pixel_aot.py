@@ -13,6 +13,7 @@ import tempfile
 import zlib
 
 from resource_inventory import parts
+from shader_minmax import FLOAT_MINMAX
 
 
 MESH_WAVE64 = b"+wavefrontsize64,-wavefrontsize32"
@@ -417,7 +418,9 @@ bool num16(uint bits) {
 // The NaN test is on the encoding, because some desktop compilers fold float NaN tests.
 float med3_32(float a, float b, float c) {
     uint top = max(max(asuint(a) & 0x7fffffffu, asuint(b) & 0x7fffffffu), asuint(c) & 0x7fffffffu);
-    return top > 0x7f800000u ? min(min(a, b), c) : max(min(a, b), min(max(a, b), c));
+    return top > 0x7f800000u
+        ? minmax_zero32(minmax_zero32(a, b, false), c, false)
+        : minmax_zero32(minmax_zero32(a, b, false), minmax_zero32(minmax_zero32(a, b, true), c, false), true);
 }
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
@@ -711,7 +714,7 @@ ALU = {
     "rndne": (1, "round({0})"),  # HLSL round is DXIL Round_ne: ties to even
     "sin": (1, "sin32({0})"), "cos": (1, "cos32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
-    "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
+    "max": (2, "minmax_zero32({0}, {1}, true)"), "min": (2, "minmax_zero32({0}, {1}, false)"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     # Legacy multiply, then an unfused add: 0 * x is 0 even for an infinite or NaN x.
@@ -721,7 +724,8 @@ ALU = {
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
     # Each result is one of the operands, so finite inputs need no rounding.
-    "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
+    "min3": (3, "minmax_zero32(minmax_zero32({0}, {1}, false), {2}, false)"),
+    "max3": (3, "minmax_zero32(minmax_zero32({0}, {1}, true), {2}, true)"),
     "med3": (3, "med3_32({0}, {1}, {2})"),
 }
 # LLVM 15 sets HasExtDPP = 0 for v_mac_legacy_f32, and fma, mad, mad_legacy, min3, max3 and med3 are VOP3-only, so
@@ -1156,14 +1160,9 @@ uint class64(uint lo, uint hi) {
         "    return (res_sign << 15u) | sig;\n"
         "}"
     ),
-    "min16_num": (
-        "float min16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
-        "}"
-    ),
-    "max16_num": (
-        "float max16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : max(a, b));\n"
+    "minmax16_num": (
+        "float minmax16_num(float a, float b, bool maximum) {\n"
+        "    return isnan(a) ? b : (isnan(b) ? a : minmax_zero32(a, b, maximum));\n"
         "}"
     ),
     "dot_u64_add": (
@@ -1386,8 +1385,8 @@ DPP_INT32 = {
 VOP3P_F16 = {
     "add": (2, "({0} + {1})"),
     "mul": (2, "({0} * {1})"),
-    "min": (2, "min16_num({0}, {1})"),
-    "max": (2, "max16_num({0}, {1})"),
+    "min": (2, "minmax16_num({0}, {1}, false)"),
+    "max": (2, "minmax16_num({0}, {1}, true)"),
     "fma": (3, "mad({0}, {1}, {2})"),
 }
 INLINE_F16 = {
@@ -6251,7 +6250,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 packed_lanes.append(f"pack16_rne({lvar})")
             helpers.add("pack16_rne")
             if op in ("min", "max"):
-                helpers.add(f"{op}16_num")
+                helpers.add("minmax16_num")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({packed_lanes[0]} | ({packed_lanes[1]} << 16));")
         elif m := match(r"v_cvt_u32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
@@ -6855,7 +6854,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         lookup = (Path(__file__).resolve().parents[1] / "src/title_va_lookup.hlsli").read_text()
         memory = TITLE_MEMORY + (TITLE_MEMORY_X2 if title_loads_x2 else "")
         lines[:0] = [lookup, memory.format(slots=TITLE_ALIAS_SLOTS, count=title_ranges, miss=TITLE_MISS)]
-    source = "\n".join([*lines, "}", ""])
+    source = "\n".join([FLOAT_MINMAX, *lines, "}", ""])
     return (source, channel_mask) if return_write_mask else source
 
 
