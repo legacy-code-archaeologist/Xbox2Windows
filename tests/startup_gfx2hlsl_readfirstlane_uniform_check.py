@@ -28,7 +28,7 @@ COMPARE = 'v_cmp_lt_f32_e64 s2, v0, v1'
 ALIAS_LOAD = 's_buffer_load_dwordx2 s[2:3], s[4:7], s2'
 
 
-def run(*instructions, exec_known=True):
+def run(*instructions, exec_known=True, kind=None):
     """Translate disassembly text using the same dispatch and branch scan as a real stage."""
     s = G.Stage.__new__(G.Stage)
     s.pipe, s.lines = Pipe(), []
@@ -37,6 +37,8 @@ def run(*instructions, exec_known=True):
     s.sym[3] = ('fixed_buffer_word',)
     s.used_s, s.used_v, s.masks = set(), set(), set()
     s.exec_known = exec_known
+    if kind:
+        s.kind = kind
     s.ins = [(4 * i, 4, asm.split()[0], asm) for i, asm in enumerate(instructions)]
     try:
         s.translate()
@@ -210,6 +212,34 @@ for name in ('s_addc_u32', 's_subb_u32'):
     check(f'uniform {name} chain accepted', got != REFUSAL, repr(got))
 got = run('v_mov_b32_e32 v7, s2', READ, exec_known=False)
 check('unknown exec refused', got == REFUSAL, repr(got))
+
+# A compute load through a read-only descriptor with a uniform address is uniform; the value has no recomputable
+# expression, so only the entry block reads it.
+LOAD_OFF = 'buffer_load_dword v7, off, s[4:7], s2'
+LOAD_OFFEN = 'buffer_load_dword v8, v7, s[4:7], 0 offen'
+got = run(LOAD_OFF, READ, kind='cs')
+check('uniform scalar offset load accepted', got[-2:] == ['v7 = r0.Load(a + 0);', 's9 = v7;'], repr(got))
+got = run(MOVE, LOAD_OFFEN, 'v_readfirstlane_b32 s9, v8', kind='cs')
+check('uniform vgpr offset load accepted', got[-1] == 's9 = v8;' and len(got) == 4, repr(got))
+got = run(MOVE, 'buffer_load_dword v7, v7, s[4:7], 0 offen', READ, kind='cs')
+check('load overwriting its uniform address accepted', got[-1] == 's9 = v7;', repr(got))
+for label, instructions, kind, known in (
+        ('load with a varying vgpr offset', ('buffer_load_dword v8, v0, s[4:7], 0 offen', 'v_readfirstlane_b32 s9, v8'), 'cs', True),
+        ('load with a varying scalar offset', (COMPARE, 'buffer_load_dword v7, off, s[4:7], s2', READ), 'cs', True),
+        ('load in a graphics stage', (LOAD_OFF, READ), 'ps', True),
+        ('load without a stage kind', (LOAD_OFF, READ), None, True),
+        ('load with unknown exec', (LOAD_OFF, READ), 'cs', False),
+        ('load after the entry block', (LOAD_OFF, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm'), 'cs', True),
+        ('load then a varying overwrite', (LOAD_OFF, 'v_mov_b32_e32 v7, v0', READ), 'cs', True)):
+    got = run(*instructions, kind=kind, exec_known=known)
+    check(f'{label} refused', got == REFUSAL, repr(got))
+original = G.UNIFORM_LOADS
+G.UNIFORM_LOADS = frozenset()
+try:
+    got = run(LOAD_OFF, READ, kind='cs')
+    check('control: load refused without tracking', got == REFUSAL, repr(got))
+finally:
+    G.UNIFORM_LOADS = original
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):
