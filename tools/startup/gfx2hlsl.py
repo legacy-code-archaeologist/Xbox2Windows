@@ -3057,6 +3057,8 @@ class Stage:
                 text = 'abs(%s)' % text
             return '(-%s)' % text if neg else text
 
+        # v_fma_mix* is fused, but HLSL may round `a * b` before the add, so binary32 sources with long
+        # mantissas can differ from the hardware by 1 ULP (same as v_fma_f32 in VEC_F).
         expr = '%s * %s + %s' % tuple(operand(*a) for a in zip(ops[1:4], half, hi))
         if clamp:
             expr = 'saturate(%s)' % expr
