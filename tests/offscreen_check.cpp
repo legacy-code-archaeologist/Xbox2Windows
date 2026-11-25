@@ -1443,14 +1443,20 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
 
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
-// comma separated.
+// comma separated. An optional fourth argument sets the four entry constants (ud0..ud3) as four hex words;
+// without it they are all 0.
 OperationResult run_startup_flat_param(const OperationContext& ctx)
 {
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     std::uint32_t words[4]{};
-    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words);
+    std::uint32_t constants[4]{};
+    if (ctx.argc == 7 && std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &constants[0], &constants[1], &constants[2],
+                                     &constants[3]) != 4)
+        return {OutcomeKind::fail, "entry constants are not four hex words"};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words, 1, 1, D3D12_CULL_MODE_NONE, FALSE, 3,
+                             ctx.argc == 7 ? constants : nullptr);
     if (std::memcmp(words, expected, sizeof(words)) != 0) {
         std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
                      expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
@@ -1578,7 +1584,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-image-cube-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
-    {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).

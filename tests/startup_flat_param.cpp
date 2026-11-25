@@ -3,7 +3,7 @@
 // Draws one pixel with a translated vertex and pixel stage and returns the four 32-bit words of
 // the colour. The entry constants (cbuffer entry : register(b0)) are visible to both stages, because
 // the translated vertex stage reads ud0, the rectangle-list switch; they are all 0 here (plain
-// triangles). The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
+// triangles) unless the caller passes four words. The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
 // exported.
 #include "desktop_gpu.h"
 
@@ -33,7 +33,7 @@ std::vector<char> read_blob(const char* path)
 
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width, UINT height,
-                              D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices)
+                              D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices, const std::uint32_t* constants)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -96,8 +96,8 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     auto* list = commands.list.Get();
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
-    const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};
-    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
+    const std::uint32_t zeros[entry_constants] = {0, 0, 0, 0};
+    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants ? constants : zeros, 0);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);
