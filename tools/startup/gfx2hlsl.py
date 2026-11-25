@@ -462,8 +462,111 @@ def reg_range(tok):
     return None
 
 
-# Scalar instructions with no scalar or exec effect, allowed inside a compute block s_cbranch_execz skips.
-SKIPPABLE_SCALAR = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+# Scalar state for the compute execz-block check (Stage.execz_refusals): registers as 's<n>', 'vcc', 'exec', 'm0'
+# and 'scc'. Reads may be over-approximated and must-writes under-approximated; both only add refusals.
+# The low half of a mask (vcc_lo, exec_lo) is 'vcc' / 'exec', the high half 'vcc_hi' / 'exec_hi', and a 64-bit
+# operand both, so a write of one half never counts as writing the other.
+SCALAR_TOKEN = re.compile(r'\bs\[(\d+):(\d+)\]|\bs(\d+)\b|\b(vcc|exec)(_lo|_hi)?\b|\b(m0)\b|\bsrc_(scc)\b')
+EXEC_KEYS = {'exec', 'exec_hi'}
+NO_SCALAR_EFFECT = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+# Forms that print no destination: every printed scalar operand is read. v_cmpx writes EXEC implicitly; its e32 and
+# SDWA forms print only sources, and the repository decoder prints the e64 form's unused SDST field first.
+# s_setpc reads its address; s_movrel* address a register through m0, so their printed operand is not a plain write.
+NO_DESTINATION = ('v_cmpx', 's_setpc', 's_movrel', 'v_movrel')
+IMPLICIT_VCC_READ = ('v_div_fmas',)
+SCC_READERS = ('s_cselect', 's_cmov', 's_addc', 's_subb', 's_cbranch_scc')
+READ_MODIFY_WRITE = ('s_addk_i32', 's_mulk_i32', 's_cmov', 's_bitset', 'v_mac', 'v_fmac')
+TWO_DESTINATIONS = ('v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale', 'v_mad_u64_u32', 'v_mad_i64_i32')
+# Effects outside scalar registers, or control flow the wave takes as a whole: refused inside such a block.
+EXECZ_REFUSED = ('s_endpgm', 's_store', 's_atomic', 's_buffer_store', 's_buffer_atomic', 's_barrier', 's_sendmsg',
+                 's_setreg', 's_setpc', 's_swappc', 's_dcache', 's_icache', 's_gl1', 's_memtime', 's_memrealtime',
+                 's_trap', 's_sleep', 'v_writelane', 's_movrel', 'v_movrel')
+
+
+def scalar_tokens(text):
+    out = set()
+    for lo, hi, single, mask, half, m0, scc in SCALAR_TOKEN.findall(text):
+        if lo:
+            out.update('s%d' % n for n in range(int(lo), int(hi) + 1))
+        elif mask:
+            out.update({'_lo': {mask}, '_hi': {mask + '_hi'}}.get(half, {mask, mask + '_hi'}))
+        else:
+            out.add('s' + single if single else m0 or scc)
+    return out
+
+
+def is_exec(regs):
+    return regs in ({'exec'}, EXEC_KEYS)
+
+
+def exec_stays_clear(name, asm, saved):
+    """True when an exec write cannot set the bit of a lane whose bit is clear: exec & x (s_and_saveexec, v_cmpx,
+    s_and or s_andn2 with exec as the kept operand), or exec | x, exec ^ x or a move of x where x is only ever a copy
+    of exec made inside the same skipped block (so x's bit is clear for that lane too)."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    if base.startswith(('s_and_saveexec', 'v_cmpx')):
+        return True
+    if not ops or not is_exec(scalar_tokens(ops[0])):
+        return False
+    srcs = [scalar_tokens(op) for op in ops[1:]]
+    # saved tracks register names, not which exec half was copied, so only a 32-bit restore is trusted
+    copies = lambda regs: bool(regs) and regs <= saved and base.endswith('32')
+    if base in ('s_and_b32', 's_and_b64'):
+        return any(is_exec(regs) for regs in srcs)
+    if base in ('s_andn2_b32', 's_andn2_b64'):
+        return bool(srcs) and is_exec(srcs[0])
+    if base in ('s_or_b32', 's_or_b64', 's_xor_b32', 's_xor_b64') and len(srcs) == 2:
+        return all(is_exec(regs) or copies(regs) for regs in srcs)
+    if base in ('s_mov_b32', 's_mov_b64') and len(srcs) == 1:
+        return copies(srcs[0])
+    return False
+
+
+def exec_copies_after(name, asm, saved, may):
+    """The registers that hold only copies of exec made in the block, after this instruction."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    dests = scalar_tokens(ops[0]) - EXEC_KEYS - {'scc'} if ops else set()
+    saved = saved - (may - EXEC_KEYS - {'scc'})
+    if base.startswith('s_and_saveexec') or (base in ('s_mov_b32', 's_mov_b64') and len(ops) == 2
+                                             and is_exec(scalar_tokens(ops[1]))):
+        saved |= dests
+    return saved
+
+
+def scalar_effects(name, asm):
+    """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    _, ops, _ = parse(asm)
+    if base.startswith(NO_SCALAR_EFFECT) or base == 's_endpgm':
+        reads = {'scc'} if base.startswith('s_cbranch_scc') else {'vcc'} if base.startswith('s_cbranch_vcc') else \
+            {'exec'} if base.startswith('s_cbranch_exec') else set()
+        return reads, set(), set()
+    if base.startswith('v_cmpx'):
+        return scalar_tokens(' '.join(ops)) | {'exec'}, {'exec'}, set(EXEC_KEYS)
+    if '_store' in base or base.startswith(('ds_write', 'exp') + NO_DESTINATION) or not ops:
+        return scalar_tokens(' '.join(ops)) | ({'m0'} if 'movrel' in base else set()), set(), set()
+    if base.startswith(('s_cmp', 's_bitcmp')):
+        return scalar_tokens(' '.join(ops)), {'scc'}, {'scc'}
+    two = base.startswith(TWO_DESTINATIONS)
+    dests, srcs = ops[:2] if two else ops[:1], ops[2:] if two else ops[1:]
+    writes = scalar_tokens(' '.join(dests))
+    reads = scalar_tokens(' '.join(srcs))
+    if base.startswith(READ_MODIFY_WRITE):
+        reads |= writes
+    if base.startswith(SCC_READERS) or (base in SCA and 'scc' in SCA[base][0]):
+        reads.add('scc')
+    if base.startswith(IMPLICIT_VCC_READ):
+        reads.add('vcc')
+    may = set()
+    if 'saveexec' in base or 'wrexec' in base:
+        reads.add('exec')
+        writes.add('exec')
+        may |= EXEC_KEYS
+    if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
+        writes.add('scc')
+    return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the
 # symbolic tracking does not hold).
@@ -1316,6 +1419,73 @@ class Stage:
         words = [self.is_const(n) for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def execz_refusals(self):
+        """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
+
+        The wave runs such a block when any lane is active, so its scalar results are the same for every lane; the
+        model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
+        join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
+        therefore accepted unchanged when every scalar register, mask and SCC it may define is dead where it joins,
+        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted in a
+        straight-line block (no branch in it, none into it) when it cannot set the bit of a lane whose bit is clear
+        (exec_stays_clear): such a lane's bit is clear on entry, so the wave leaves it clear and its exec at the
+        join is the model's. A live definition, another exec write, a refused effect, a branch leaving the block
+        or a backward s_cbranch_execz is refused."""
+        offsets = [ins[0] for ins in self.ins]
+        index = {off: i for i, off in enumerate(offsets)}
+        effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
+        succ = []
+        targets = []  # every branch target, the proven calculated s_setpc_b64 ones included
+        for i, (off, n, name, asm) in enumerate(self.ins):
+            to = int(parse(asm)[1][0].split('_')[1], 16) if name.startswith(('s_cbranch', 's_branch')) else None
+            if name == 's_setpc_b64':  # a proven calculated jump reaches its target
+                to = getattr(self, 'calculated_pc', {}).get(off)
+            nxt = [i + 1] if i + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm') else []
+            if to is not None:
+                targets.append(to)
+            succ.append(nxt + ([index[to]] if to in index else []))
+        live_in = [set() for _ in self.ins]
+        changed = True
+        while changed:
+            changed = False
+            for i in reversed(range(len(self.ins))):
+                out = set().union(*(live_in[s] for s in succ[i])) if succ[i] else set()
+                reads, writes, _ = effects[i]
+                value = reads | (out - writes)
+                if value != live_in[i]:
+                    live_in[i], changed = value, True
+        refused = {}
+        for b, (off, n, name, asm) in enumerate(self.ins):
+            if name != 's_cbranch_execz':
+                continue
+            t = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+            if t is None or t <= b:
+                refused.setdefault(off, 's_cbranch_execz to a block before it')
+                continue
+            live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
+            saved = set()  # registers whose every write in the block so far is a copy of exec
+            # The copies are tracked in program order, which is every path only in a straight-line block: no branch
+            # in it and no branch into it. Elsewhere an exec write is refused.
+            straight = not any(self.ins[k][2].startswith(('s_cbranch', 's_branch')) for k in range(b + 1, t)) and \
+                not any(index.get(target) in range(b + 1, t) for target in targets)
+            for i in range(b + 1, t):
+                at, _, inner, inner_asm = self.ins[i]
+                may = effects[i][2]
+                reason = None
+                if inner.startswith(EXECZ_REFUSED):
+                    reason = 'effect outside scalar registers'
+                elif inner.startswith(('s_cbranch', 's_branch')) and not (
+                        b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
+                    reason = 'branch out of the block'
+                elif may & EXEC_KEYS and not (straight and exec_stays_clear(inner, inner_asm, saved)):
+                    reason = 'exec write'
+                elif (may - EXEC_KEYS) & live:
+                    reason = 'definition of %s, live where the block joins' % ', '.join(sorted((may - EXEC_KEYS) & live))
+                saved = exec_copies_after(inner, inner_asm, saved, may)
+                if reason:
+                    refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
+        return refused
+
     # ---- instruction translation -------------------------------------------------------------
     def joined_registers(self, with_cfg=False):
         """{branch target: registers whose program-order symbol may not hold on every path into it}.
@@ -1456,7 +1626,6 @@ class Stage:
             refusals.append((str(reason), self.kind))
             self.calculated_pc = {}
         targets = set()
-        skipped = []  # compute: (branch, target) of each s_cbranch_execz
         targets.update(target for target in self.calculated_pc.values() if target is not None)
         # (branch, target) of every branch, the proven s_setpc_b64 jumps included
         branches = [(pc, target) for pc, target in self.calculated_pc.items() if target is not None]
@@ -1465,9 +1634,8 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
-                if name == 's_cbranch_execz' and self.kind == 'cs':
-                    skipped.append((off, target))
         join_writes = self.join_writes(branches)
+        refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
         joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
@@ -1615,13 +1783,8 @@ class Stage:
                 dests = scalar_destinations(name, asm)
                 written |= every_sgpr if 'any' in dests else dests
                 try:
-                    if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
-                            name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
-                            and not name.startswith(SKIPPABLE_SCALAR)
-                            and not (name == 's_setpc_b64' and off in self.calculated_pc)):
-                        # The wave runs this block when any lane is active, so its scalar state changes for every
-                        # lane; the one-lane model would skip it for an inactive lane.
-                        raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
+                    if off in refused:
+                        raise Unsupported(refused[off])
                     base = re.sub(r'_e(32|64)$', '', name)
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
