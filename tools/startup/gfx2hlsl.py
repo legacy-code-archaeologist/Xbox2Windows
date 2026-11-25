@@ -3808,34 +3808,85 @@ class Stage:
         self.attrs.setdefault(attr, set()).add(how)
         return attr, component
 
-    def mix(self, ops, mods, high):
-        """v_fma_mix{lo,hi}_f16: fma of operands that are f32 or f16 halves; the f16 result goes to one half."""
-        sel = [0, 0, 0]
+    def mix(self, ops, mods, dest):
+        """v_fma_mix_f32 / v_fma_mix{lo,hi}_f16: fma of sources that are binary32 words or binary16 halves.
+
+        Per source (LLVM 15 SelectVOP3PMadMixModsImpl): op_sel_hi set means the source is binary16, and
+        op_sel set picks its high half. abs, then neg, apply after widening. dest is 'f32', 'lo' or 'hi'.
+        """
+        half, hi, clamp = [0, 0, 0], [0, 0, 0], False
         for m in mods:
-            if m.startswith('op_sel_hi:'):
-                sel = [int(x) for x in m[11:-1].split(',')]
-            elif m.startswith('op_sel:'):
-                raise Unsupported('op_sel on fma_mix')
-        def operand(tok, is_half):
-            if not is_half or tok in ('-0', '0'):
+            if m.startswith('op_sel_hi:['):
+                half = [int(x) for x in m[11:-1].split(',')]
+            elif m.startswith('op_sel:['):
+                hi = [int(x) for x in m[8:-1].split(',')]
+            elif m == 'clamp':
+                clamp = True
+            else:
+                raise Unsupported('fma_mix modifier %s' % m)
+
+        def operand(tok, is_half, is_hi):
+            if not is_half and is_hi:
+                raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)
+            if tok == '-0':
+                # neg on inline 0 is -0.0 in either format; f() would print +0.0, which changes a -0 product.
+                return '(-0.0)'
+            if not is_half:
+                if tok.startswith('--') and tok[1:] in FLOATS:
+                    # neg on a negative inline float prints as `--0.5`; `(--0.5)` is an HLSL decrement.
+                    return '(-(%s))' % self.f(tok[1:])
+                if re.fullmatch(r'-(\d+|0x[0-9a-fA-F]+)', tok):
+                    # The decoder prints neg on inline 1..64 or a literal as a negative integer, which f()
+                    # reads without the sign-bit flip. Refuse until the decoder resolves it from the encoding.
+                    raise Unsupported('negated integer or literal fma_mix source %s' % tok)
                 return self.f(tok)
-            return 'f16tof32(%s)' % self.u(tok, low16_only=True)
-        expr = '%s * %s + %s' % tuple(operand(t, s) for t, s in zip(ops[1:4], sel))
-        if 'clamp' in mods:
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            if neg:
+                tok = tok[1:]
+            absolute = tok.startswith('|') and tok.endswith('|')
+            if absolute:
+                tok = tok[1:-1]
+            r = reg_range(tok)
+            if tok == '0':
+                text = '0.0'
+            elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                word = (int(tok, 16) >> (16 if is_hi else 0)) & 0xffff
+                text = 'f16tof32(0x%04xu)' % word
+            elif tok == '0.5' and not is_hi:
+                text = '0.5'
+            elif r and r[1] == r[2]:
+                # Only a high-half read needs the upper 16 bits defined.
+                text = 'f16tof32(%s%s)' % (self.u(tok, low16_only=not is_hi), ' >> 16' if is_hi else '')
+            else:
+                raise Unsupported('binary16 fma_mix source %s' % tok)
+            if absolute:
+                text = 'abs(%s)' % text
+            return '(-%s)' % text if neg else text
+
+        # v_fma_mix* is fused, but HLSL may round `a * b` before the add, so binary32 sources with long
+        # mantissas can differ from the hardware by 1 ULP (same as v_fma_f32 in VEC_F).
+        expr = '%s * %s + %s' % tuple(operand(*a) for a in zip(ops[1:4], half, hi))
+        if clamp:
             expr = 'saturate(%s)' % expr
         d = reg_range(ops[0])[1]
+        if dest == 'f32':
+            self.set_v(d, 'U(%s)' % expr)
+            return
         self.used_v.add(d)
-        if high:
+        if dest == 'hi':
             self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
         else:
             keep_low16 = d in self.low16_only_v
             self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr), low16_only=keep_low16)
 
+    def op_v_fma_mix_f32(self, ops, mods):
+        self.mix(ops, mods, 'f32')
+
     def op_v_fma_mixlo_f16(self, ops, mods):
-        self.mix(ops, mods, False)
+        self.mix(ops, mods, 'lo')
 
     def op_v_fma_mixhi_f16(self, ops, mods):
-        self.mix(ops, mods, True)
+        self.mix(ops, mods, 'hi')
 
     def i64_words(self, tok):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair or an inline int."""

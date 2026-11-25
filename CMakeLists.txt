@@ -2813,6 +2813,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_gfx2hlsl_watch PROPERTIES TIMEOUT 120)
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
+    # gfx2hlsl lowers v_fma_mix_f32 and selects binary16 source halves on all three mixed-precision FMAs.
+    add_test(NAME startup_gfx2hlsl_fma_mix COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
@@ -2892,6 +2895,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+    if(STARTUP_FXC)
+        # The v_fma_mix* translations from startup_gfx2hlsl_fma_mix, compiled for ps_5_1.
+        add_test(NAME startup_gfx2hlsl_fma_mix_fxc COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py" fxc "${STARTUP_FXC}")
+    endif()
     # gfx2hlsl conversion operations: translation controls, then a draw of the translated pairs with
     # reference words and one mutated lowering per operation (v_cvt_f16_f32 through DXC only).
     # Compute translator: integer inequality lane guards.
@@ -3192,6 +3200,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py" preserve "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_mad_dispatch_${adapter} startup_gfx2hlsl_mad_preserve_${adapter}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl v_fma_mix*: every translated form dispatched against a CPU reference that decodes the VOP3P
+    # word itself, plus a control that drops the high-half shift.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_fma_mix_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_fma_mix_dispatch_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).

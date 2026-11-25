@@ -167,6 +167,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_fma_mix_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_a16_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_d16_check.py
