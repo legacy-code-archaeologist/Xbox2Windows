@@ -15065,3 +15065,9 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_image_1d$' -V
 python -B tests/startup_gfx2hlsl_mad_u32_u16_check.py
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_u32_u16_' -V
 ```
+One read of such a register is accepted in vertex and pixel stages: `s_and_b64 D, S, exec` (either order) or
+`s_orn2_b64 D, S, exec` as the instruction at a target that only forward `s_cbranch_execz` branches and a
+fall-through enter, when the fall-through wrote S as a plain run-time number. On a skipping edge the lane's exec bit
+is 0, so bit 0 of the result is 0 (1 for `s_orn2_b64`) whatever S holds. This relies on the one-lane model, in which
+a lane whose exec bit is 0 takes the branch; it is pure Python only, not run on a GPU, and its words are built from
+the field layouts rather than assembled.

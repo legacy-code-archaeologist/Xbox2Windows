@@ -29,6 +29,13 @@ The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
 - CALC: s23 = 1, a proven s_setpc_b64 skips s23 = 2 and lands on the read (a calculated jump is a branch; 1).
 - LOOP_RFL, JOIN_RFL: v_readfirstlane_b32 of a loop counter, and of a register written on one path of a join (both
   refused as unproven, never recomputed with a folded constant).
+- exec_join(): a lane mask written on the fall-through of a forward s_cbranch_execz and ANDed with exec by the
+  instruction at the branch target, while the skipping edge still brings a descriptor word. On the skipping edge
+  the lane's exec bit is 0, so bit 0 of `S & exec` is 0 (and of `S | ~exec` is 1) whatever S holds: these two
+  forms read the joined register. That a lane whose exec bit is 0 behaves as if it took the branch is the
+  translator's one-lane model, not something this check proves. The words are built here from the SOP2, SOPP and
+  VOP3 field layouts and checked against the decoder's text; they are not in SOURCES, so `binary` does not
+  assemble them.
 """
 import struct
 import subprocess
@@ -249,6 +256,94 @@ def check_controls():
           'on every path are kept; straight-line code still folds')
 
 
+def sop2(op, dst, src0, src1):
+    return struct.pack('<I', 0x80000000 | op << 23 | dst << 16 | src1 << 8 | src0)
+
+
+S_AND_B32, S_AND_B64, S_OR_B64, S_ANDN2_B64, S_ORN2_B64 = 14, 15, 17, 21, 23
+SCC1, VCCZ, EXECZ = 5, 6, 8
+EXEC = 126
+JOINED_S16 = 'numeric use of s16 holding joined at a branch target'
+
+
+def exec_join(at_target, branch=EXECZ, fall=None, before=b'', read='1002007e'):
+    """s[16:23] = a descriptor; exec &= (v1 != 0); branch over `fall` (default: s16 = lane mask v0 != 0) to
+    `at_target`; then `read` (default: v0 = s16) and the export. `before` goes in front of the branch."""
+    def cmp_ne(sdst, v):  # v_cmp_ne_i32_e64 sdst, 0, v
+        return struct.pack('<II', 0xd4000000 | 0x85 << 16 | sdst, 128 | (256 + v) << 9)
+    fall = cmp_ne(16, 0) if fall is None else fall
+    return (bytes.fromhex('04040cf4000000fa' '8002007e' '8002027e') + cmp_ne(30, 1) + sop2(S_AND_B64, EXEC, EXEC, 30)
+            + before + struct.pack('<I', 0xbf800000 | branch << 16 | len(fall) // 4) + fall + at_target
+            + bytes.fromhex(read + EXPORT_WORDS))
+
+
+def exec_join_hlsl(*args, **kwargs):
+    return G.Pipeline(VS_WORDS, exec_join(*args, **kwargs), root('t', 1)).hlsl_ps().splitlines()
+
+
+def exec_join_refused(fragment, *args, **kwargs):
+    try:
+        exec_join_hlsl(*args, **kwargs)
+    except G.Unsupported as reason:
+        assert fragment in str(reason), str(reason)
+        return
+    raise AssertionError('accepted, expected a refusal naming %r' % fragment)
+
+
+def check_exec_join():
+    and_s16 = sop2(S_AND_B64, 16, 16, EXEC)
+    # The built words decode to the program described above.
+    assert [asm for *_, asm in G.decode(exec_join(and_s16))] == [
+        's_load_dwordx8 s[16:23], s[8:9], 0x0', 'v_mov_b32_e32 v0, 0', 'v_mov_b32_e32 v1, 0',
+        'v_cmp_ne_i32_e64 s30, 0, v1', 's_and_b64 exec, exec, s[30:31]', 's_cbranch_execz label_0x28',
+        'v_cmp_ne_i32_e64 s16, 0, v0', 's_and_b64 s[16:17], s[16:17], exec', 'v_mov_b32_e32 v0, s16',
+        'exp mrt0 v0, v0, v0, v0 done vm', 's_endpgm'], G.decode(exec_join(and_s16))
+    # Accepted: the mask ANDed with exec at the target (either operand order), and ORed with its complement.
+    hlsl = exec_join_hlsl(and_s16)
+    assert "        pc = ((exec & 1) == 0) ? 2 : 1;" in hlsl and '        s16 = (s16 & exec) & 1;' in hlsl, hlsl
+    swapped, orn2 = exec_join_hlsl(sop2(S_AND_B64, 16, EXEC, 16)), exec_join_hlsl(sop2(S_ORN2_B64, 16, 16, EXEC))
+    assert '        s16 = (exec & s16) & 1;' in swapped and '        s16 = (s16 | ~exec) & 1;' in orn2
+    # exec as the destination: the same statement, and the lane stays off on the skipping edge.
+    assert '        exec = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, EXEC, 16, EXEC), read='8002007e')
+    # The emitted right-hand sides with exec bit 0, the only case in which the variable s16 may not hold the
+    # register: every word of s16 gives 0 for the AND and 1 for the OR with the complement.
+    def rhs(text):
+        line, = (l for l in text if l.startswith('        s16 = ') and l.endswith(') & 1;'))
+        return line[len('        s16 = '):-1]
+    for word in (0, 1, 3, 0x7ffffffe, 0xffffffff, 0x80000001):
+        for text, want in ((hlsl, 0), (swapped, 0), (orn2, 1)):
+            assert eval(rhs(text), {'s16': word, 'exec': 0}) == want, (rhs(text), word)
+    # Another destination: the result is read, and the source stays joined for the read after it.
+    assert '        s32 = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 32, 16, EXEC), read='2002007e')  # v0 = s32
+    exec_join_refused(JOINED_S16, sop2(S_AND_B64, 32, 16, EXEC))
+    # Refused, each for one missing piece of the argument:
+    # the skipping branch is not s_cbranch_execz, so exec says nothing about the edge;
+    exec_join_refused(JOINED_S16, and_s16, branch=SCC1)
+    exec_join_refused(JOINED_S16, and_s16, branch=VCCZ)
+    # a second edge of another kind enters the same target (s_cbranch_scc1 over the execz branch and the write);
+    exec_join_refused(JOINED_S16, and_s16, before=struct.pack('<I', 0xbf800000 | SCC1 << 16 | 3))
+    # the AND is one instruction after the target (s_nop in between), where exec is no longer the edge's;
+    exec_join_refused(JOINED_S16, struct.pack('<I', 0xbf800000) + and_s16)
+    # an operation exec does not absorb: OR, AND with the complement, the complement of the mask, a 32-bit AND;
+    for op, src0, src1 in ((S_OR_B64, 16, EXEC), (S_ANDN2_B64, 16, EXEC), (S_ORN2_B64, EXEC, 16),
+                           (S_AND_B32, 16, EXEC), (S_AND_B64, 16, 30)):
+        exec_join_refused(JOINED_S16, sop2(op, 16, src0, src1))
+    # the fall-through leaves a constant, not a plain run-time number (s_mov_b32 s16, 3);
+    exec_join_refused(JOINED_S16, and_s16, fall=bytes.fromhex('830390be'))
+    # a plain read at the target.
+    exec_join_refused(JOINED_S16, b'')
+    # Without the lowering every accepted form is refused where it reads s16.
+    absorbed = G.Stage.exec_absorbed_source
+    G.Stage.exec_absorbed_source = lambda self, base, srcs: None
+    try:
+        for word in (and_s16, sop2(S_AND_B64, 16, EXEC, 16), sop2(S_ORN2_B64, 16, 16, EXEC)):
+            exec_join_refused(JOINED_S16, word)
+    finally:
+        G.Stage.exec_absorbed_source = absorbed
+    print('exec join: a mask ANDed with exec (or ORed with its complement) at a target that only s_cbranch_execz '
+          'skips to is read; 12 refusal controls and the old behaviour hold')
+
+
 def check_binary(llvm_mc):
     for name, (source, words) in SOURCES.items():
         built = assemble(llvm_mc, source).hex()
@@ -321,6 +416,7 @@ def run_reload(dxc, runner, adapter, directory):
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         check_controls()
+        check_exec_join()
     elif len(sys.argv) == 3 and sys.argv[1] == 'binary':
         check_binary(sys.argv[2])
     elif len(sys.argv) == 5 and sys.argv[1] in ('dispatch', 'control'):
