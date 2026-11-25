@@ -9,6 +9,11 @@ Read-only on the cache, like --refusals. The output holds only aggregate counts,
 no keys, paths, offsets, operands, disassembly or generated HLSL.
 
     python -B tools/startup/local_join_mask_probe.py <copy of shader_cache> > probe.json
+    python -B tools/startup/local_join_mask_probe.py --compute <copy of shader_cache> > probe-with-compute.json
+
+Graphics requests only by default (compute takes much longer); progress goes to stderr every 25 requests.
+4. "mask from descriptor data" and "descriptor operand ... holds X" (other than joins): source symbol kinds and the
+   opcode that last wrote the register.
 """
 import collections
 import json
@@ -120,8 +125,42 @@ def wrap_scalar(original):
                 dest = 'dest mask' if self.is_lane_mask(operands[0]) else 'dest word'
                 NAND.append('%s %s; %s; srcs %s' % (getattr(self, 'kind', '?'), base, dest,
                                                      ' | '.join(operand_class(self, t) for t in operands[1:])))
-        return original(self, base, ops, *rest, **kw)
+        try:
+            return original(self, base, ops, *rest, **kw)
+        except G.Unsupported as error:
+            if str(error) == 'mask from descriptor data':
+                def low(t):
+                    r = G.reg_range(t)
+                    return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else t
+                srcs = [low(t) for t in ops[1:]]
+                MASKDESC.append('%s %s -> %s; srcs %s' % (
+                    getattr(self, 'kind', '?'), base, re.sub(r'\d+', 'N', ops[0]),
+                    ' | '.join(operand_class(self, t) for t in srcs)))
+            raise
     return scalar
+
+
+MASKDESC = []    # 'mask from descriptor data' refusals of the current request
+HOLDS = []       # 'descriptor operand ... holds X' refusals of the current request
+
+
+def wrap_descriptor(original):
+    def descriptor(self, tok):
+        try:
+            return original(self, tok)
+        except G.Unsupported as error:
+            text = str(error)
+            if 'holds' in text and 'joined at a branch target' not in text:
+                r = G.reg_range(tok)
+                if r and r[0] == 's':
+                    sym = self.sym.get(r[1])
+                    writer = last_writer(self, r[1])
+                    width = r[2] - r[1] + 1
+                    HOLDS.append('%s %d-dword descriptor holds %s; first register last written by %s%s' % (
+                        getattr(self, 'kind', '?'), width, kind(sym), writer,
+                        '; past the first branch' if getattr(self, 'past_entry', False) else '; in the entry block'))
+            raise
+    return descriptor
 
 
 SPILL = []       # shape classes of the current request's 'needs straight-line code' spill refusals
@@ -182,21 +221,32 @@ REG = re.compile(r'\bs\[?(\d+)')
 
 def main(argv):
     global G
+    with_compute = '--compute' in argv
+    argv = [a for a in argv if a != '--compute']
     if len(argv) != 1 or not os.path.isdir(argv[0]):
         raise SystemExit(__doc__)
     G = load_patched()
     G.Stage.scalar = wrap_scalar(G.Stage.scalar)
     G.Stage.spill_operands = wrap_spill(G.Stage.spill_operands)
+    G.Stage.descriptor = wrap_descriptor(G.Stage.descriptor)
     out_dir = argv[0]
-    tallies = {'graphics': collections.Counter(), 'compute': collections.Counter()}
-    nand = {'graphics': collections.Counter(), 'compute': collections.Counter()}
-    spill = {'graphics': collections.Counter(), 'compute': collections.Counter()}
-    for compute in (False, True):
-        side = 'compute' if compute else 'graphics'
-        for key in dict.fromkeys(G.request_keys(out_dir, compute=compute)):
+    sides = ('graphics', 'compute') if with_compute else ('graphics',)
+    tallies = {side: collections.Counter() for side in sides}
+    nand = {side: collections.Counter() for side in sides}
+    spill = {side: collections.Counter() for side in sides}
+    maskdesc = {side: collections.Counter() for side in sides}
+    holds = {side: collections.Counter() for side in sides}
+    for side in sides:
+        compute = side == 'compute'
+        keys = list(dict.fromkeys(G.request_keys(out_dir, compute=compute)))
+        for done, key in enumerate(keys, 1):
+            if done % 25 == 0 or done == len(keys):
+                print('%s: %d of %d requests' % (side, done, len(keys)), file=sys.stderr, flush=True)
             EVENTS.clear()
             NAND.clear()
             SPILL.clear()
+            MASKDESC.clear()
+            HOLDS.clear()
             try:
                 sites = G.compute_refusals(out_dir, key) if compute else G.request_refusals(out_dir, key, [])
             except Exception as error:  # keep going; count the crash class only
@@ -219,10 +269,16 @@ def main(argv):
                 nand[side][item] += 1
             for item in set(SPILL):
                 spill[side][item] += 1
+            for item in set(MASKDESC):
+                maskdesc[side][item] += 1
+            for item in set(HOLDS):
+                holds[side][item] += 1
     print(json.dumps({side: {'joined (requests per class)': dict(tallies[side].most_common()),
                              'nand/nor mixed (requests per class)': dict(nand[side].most_common()),
-                             'lane spill needs straight-line (requests per class)': dict(spill[side].most_common())}
-                      for side in tallies}, indent=1))
+                             'lane spill needs straight-line (requests per class)': dict(spill[side].most_common()),
+                             'mask from descriptor data (requests per class)': dict(maskdesc[side].most_common()),
+                             'descriptor operand holds (requests per class)': dict(holds[side].most_common())}
+                      for side in sides}, indent=1))
 
 
 if __name__ == '__main__':
