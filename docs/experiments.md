@@ -14750,3 +14750,13 @@ the generated shader already carries SCC as a `bool scc`, so the source lowers t
 float 1.0 by that bit. It works in either source position and through the same path for every scalar
 operate that reads its sources as integers. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
+### `off` in compressed exports and `vcc_hi` sources in `gfx2hlsl` (#1723)
+
+`exp mrt0 v0, v0, off, off compr` now translates. The `off` pair is not written: the stage records the channel mask 0x3 for the target and the manifest `wmask` line carries it to the desktop pipeline's render-target write mask, so B and A keep their old values. A read of `vcc_hi` folds to zero only when the stage is marked wave32. Nothing validates the guest wave mode yet, so every real shader still refuses `vcc_hi`; a wave64 shader holds lanes 32..63 there and must not read zero.
+
+Translation-only checks, no GPU run, so the draw result with a partial write mask on hardware is unverified:
+
+```bash
+python3 -B tests/startup_gfx2hlsl_off_vcchi_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_off_vcchi$' -V
+```

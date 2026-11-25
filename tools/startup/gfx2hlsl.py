@@ -1289,6 +1289,12 @@ class Stage:
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
+        if tok == 'vcc_hi':
+            # Only a stage whose guest wave32 mode was validated may fold the high half to zero; in wave64
+            # it holds lanes 32..63, so an unverified read stays refused.
+            if not getattr(self, 'wave32', False):
+                raise Unsupported('vcc_hi read without a validated wave32 mode')
+            return '0u'
         if tok == 'm0':
             m = self.sym.get('m0')
             if m:
