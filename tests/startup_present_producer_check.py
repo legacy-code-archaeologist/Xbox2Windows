@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 RED, GREEN, BLUE, MAGENTA = "255,0,0,255", "0,255,0,255", "0,0,255,255", "255,0,255,255"
-BACKEND, EXECUTABLE = sys.argv[1:]
+BACKEND, EXECUTABLE, *OPTIONS = sys.argv[1:]
 
 
 def run(mode, rgb=""):
@@ -52,7 +52,16 @@ def check_auto(magenta=False):
     print(f"auto {rgb} control: excludes early and near matches and compares paired samples within the armed window ({adapter})")
 
 
-if __name__ == "__main__":
+def check_barriers():
+    logs, _, adapter = run("barriers")
+    records = re.findall(r"CommandList::slot26\(ResourceBarrier\): forwarded=(\d+) refused=(\d+)", logs)
+    assert records == [("2", "5"), ("0", "1"), ("0", "1")], logs
+    print(f"slot 26: forwarded global and resource UAV barriers, refused five unsupported records, an unreadable array and a closed list ({adapter})")
+
+
+if __name__ == "__main__" and OPTIONS == ["barriers"]:
+    check_barriers()
+elif __name__ == "__main__":
     check(False)
     check(True)
     check_auto()

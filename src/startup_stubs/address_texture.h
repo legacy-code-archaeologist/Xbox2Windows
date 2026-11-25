@@ -82,12 +82,56 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
         return count == ~0u ? first < r.MipLevels : inside(first, count, r.MipLevels);
     };
     if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
-        return r.DepthOrArraySize == 1 && mips_fit(v.Texture2D.MostDetailedMip, v.Texture2D.MipLevels) &&
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 1 &&
+               mips_fit(v.Texture2D.MostDetailedMip, v.Texture2D.MipLevels) &&
                !v.Texture2D.PlaneSlice && v.Texture2D.ResourceMinLODClamp == 0.0f;
     if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
-        return mips_fit(v.Texture2DArray.MostDetailedMip, v.Texture2DArray.MipLevels) &&
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+               mips_fit(v.Texture2DArray.MostDetailedMip, v.Texture2DArray.MipLevels) &&
                inside(v.Texture2DArray.FirstArraySlice, v.Texture2DArray.ArraySize, r.DepthOrArraySize) &&
                !v.Texture2DArray.PlaneSlice && v.Texture2DArray.ResourceMinLODClamp == 0.0f;
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+               mips_fit(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels) &&
+               v.Texture3D.ResourceMinLODClamp == 0.0f;
     return false;
+}
+
+inline bool supports_volume_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return false;
+    if (!r.Width || !r.Height || !r.DepthOrArraySize || !r.MipLevels) return false;
+    if (r.SampleDesc.Count != 1 || r.SampleDesc.Quality != 0) return false;
+    if (r.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return false;
+    if (r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return false;
+    if (v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE3D) return false;
+    if (v.Format != r.Format) return false;
+    if (address_depth_format(r.Format)) return false;
+    const auto elem = gfx10::element_of(r.Format);
+    if (!elem.bytes || (elem.texels > 1 && ((r.Width % elem.texels) != 0 || (r.Height % elem.texels) != 0)))
+        return false;
+    return address_view_fits(r, v);
+}
+
+// Packed texel payload bytes of a 3D volume across all mip levels (excluding D3D12 256-byte row pitch padding).
+// In device contexts, address_texture_bytes evaluates SliceFootprints::size to account for D3D12 copyable footprint
+// row pitch (256-byte alignment) and subresource placement alignment.
+inline std::uint64_t volume_texture_bytes(const D3D12_RESOURCE_DESC& desc)
+{
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) return 0;
+    const auto elem = gfx10::element_of(desc.Format);
+    if (!elem.bytes || !elem.texels || !desc.Width || !desc.Height || !desc.DepthOrArraySize) return 0;
+    std::uint64_t total = 0;
+    std::uint64_t w = desc.Width, h = desc.Height, d = desc.DepthOrArraySize;
+    const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
+    for (UINT i = 0; i < mips; ++i) {
+        const std::uint64_t blocks_w = (w + elem.texels - 1) / elem.texels;
+        const std::uint64_t blocks_h = (h + elem.texels - 1) / elem.texels;
+        total += blocks_w * blocks_h * d * elem.bytes;
+        w = (w > 1) ? (w >> 1) : 1;
+        h = (h > 1) ? (h >> 1) : 1;
+        d = (d > 1) ? (d >> 1) : 1;
+    }
+    return total;
 }
 } // namespace x2w_startup

@@ -158,21 +158,24 @@ except G.Unsupported as reason:
     got = str(reason)
 check('refused: partial compr export to param0', got == 'partial compressed export to param0', got)
 
-# 7. Typed colour targets (#1999 F): 32-bit-channel integer and float formats get a matching shader
-# output; narrower integer channels are refused rather than guessed.
+# 7. Typed colour targets (#1999 F): each verified format gets a matching shader output.
 typed = (('R32G32B32A32_UINT', 3, 'uint4 mrt0', 'uint4(v0'), ('R32G32B32A32_SINT', 4, 'int4 mrt0', 'asint(uint4'),
          ('R32G32_UINT', 17, 'uint4 mrt0', 'uint4(v0'), ('R32G32_SINT', 18, 'int4 mrt0', 'asint(uint4'),
+         ('R8G8B8A8_UINT', 30, 'uint4 mrt0', 'uint4(v0'), ('R8G8B8A8_SINT', 32, 'int4 mrt0', 'asint(uint4'),
          ('R32_UINT', 42, 'uint4 mrt0', 'uint4(v0'), ('R32_SINT', 43, 'int4 mrt0', 'asint(uint4'),
          ('R32G32_FLOAT', 16, 'float4 mrt0', 'float4(F(('), ('R32_FLOAT', 41, 'float4 mrt0', 'float4(F(('))
 for name, fmt, signature, store in typed:
     got = translate(exp(0, 0xf, (0, 1, 2, 3)), (fmt,))
     ok = isinstance(got, tuple) and signature in got[0] and store in assignment(got[0], 0).replace('uint4(U(v', 'uint4(v')
     check('typed target ' + name, ok, repr(got)[:300])
-for name, fmt in (('R32G32B32A32_UINT', 3), ('R16G16B16A16_UINT', 12), ('R8G8B8A8_UINT', 30), ('R8_UINT', 62),
-                  ('R8G8B8A8_SINT', 32), ('R16_SINT', 59), ('R8_SINT', 64)):
+for name, fmt in (('R16G16B16A16_UINT', 12), ('R16G16B16A16_SINT', 14), ('R8_UINT', 62),
+                  ('R16_SINT', 59), ('R8_SINT', 64)):
     got = translate(exp(0, 0xf, (0, 1, 2, 3)), (fmt,))
-    want = isinstance(got, tuple) if fmt == 3 else got == 'unverified %s RTV format %d' % ('UINT' if fmt in G.UINT_RTVS else 'SINT', fmt)
-    check('typed target %s %s' % (name, 'translated' if fmt == 3 else 'refused'), want, repr(got)[:200])
+    want = 'unverified %s RTV format %d' % ('UINT' if fmt in G.UINT_RTVS else 'SINT', fmt)
+    check('typed target %s refused' % name, got == want, repr(got)[:200])
+for fmt in (30, 32):
+    got = translate(exp(0, 0xf, (0, 1, 2, 3), compr=True), (fmt,))
+    check('packed integer export refused for format %d' % fmt, got == 'packed integer export mrt0', repr(got)[:200])
 
 print('export mask checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

@@ -716,6 +716,11 @@ def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4
         else:
             write = ("    outputData.Store2(view.x + index * stride + offset, "
                      "asuint(f16tof32(uint2(value & 0xffffu, value >> 16u))));")
+    elif components == 3:
+        sig = "void store_heap_xyz_d16(uint slot, uint index, uint offset, uint2 value)"
+        fmt_check = f"    if (view.w != {descriptor_format_word(74):#x}u || (view.y & 0xc000ffffu) != 0u) return;"
+        write = ("    uint3 halfWords = uint3(value.x & 0xffffu, value.x >> 16u, value.y & 0xffffu);\n"
+                 "    outputData.Store3(view.x + index * stride + offset, asuint(f16tof32(halfWords)));")
     else:
         sig = "void store_heap_words4(uint slot, uint index, uint offset, bool d16, uint4 value)"
         fmt_check = (f"    uint formatWord = d16 ? {descriptor_format_word(77):#x}u : {descriptor_format_word(75):#x}u;\n"
@@ -2738,8 +2743,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if heap_store_view is not None:
-                    if channels not in ("xyzw", "d16_xyzw", "d16_xy", "d16_x"):
-                        raise ValueError("Heap store view requires buffer_store_format_xyzw or a D16 x, xy or xyzw store")
+                    if channels != "xyzw" and not packed:
+                        raise ValueError("Heap store view requires buffer_store_format_xyzw or a D16 formatted store")
                     if not any(tag == ("constant_word", heap_slot_word) and reg not in pending
                                for reg, tag in scalar.items()):
                         raise ValueError("Heap store view slot constant is not ready")
@@ -2873,6 +2878,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 heap_store_components = components
                 if channels in ("d16_x", "d16_xy"):
                     stores.append(f"    store_heap_word_d16({slot}, {address}, {offset}u, {words[0]});")
+                elif channels == "d16_xyz":
+                    stores.append(f"    store_heap_xyz_d16({slot}, {address}, {offset}u, uint2({', '.join(words)}));")
                 else:
                     supplied = words + ["0u"] * (4 - len(words))
                     mode = "true" if packed else "false"
@@ -3003,7 +3010,7 @@ def main():
                              "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
     parser.add_argument("--heap-store-view", nargs=5, type=lambda n: int(n, 0),
                         metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "TABLE_BUFFER_BYTES", "OUTPUT_BYTES"),
-                        help="select a UINT4 or expanded D16 FLOAT1/FLOAT2/FLOAT4 store view from t0 "
+                        help="select a UINT4 or expanded D16 FLOAT1/FLOAT2/FLOAT3/FLOAT4 store view from t0 "
                              "and bound writes by OUTPUT_BYTES of u0")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")

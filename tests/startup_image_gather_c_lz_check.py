@@ -36,7 +36,7 @@ sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 from pixel_compare_check import COMPARE, passes  # noqa: E402
 from startup_gfx2hlsl_bit_alu_check import mov_literal  # noqa: E402
-from startup_image_3d_check import FULLSCREEN_VS, compile_hlsl  # noqa: E402
+from startup_image_3d_check import FULLSCREEN_VS, CompileQueue, compile_hlsl  # noqa: E402
 from startup_sampler_heap_check import VS_WORDS, assemble, root_blob  # noqa: E402
 
 SIDE = 8
@@ -470,6 +470,11 @@ def lane_signatures(matrix):
 
 
 def draw(directory, dxc, renderer=None, adapter=None, fxc=None, evidence=None):
+    with CompileQueue() as queue:
+        draw_cases(queue, directory, dxc, renderer, adapter, fxc, evidence)
+
+
+def draw_cases(queue, directory, dxc, renderer, adapter, fxc, evidence):
     directory.mkdir(parents=True, exist_ok=True)
     if evidence:
         evidence.mkdir(parents=True, exist_ok=True)
@@ -477,6 +482,18 @@ def draw(directory, dxc, renderer=None, adapter=None, fxc=None, evidence=None):
     summary = []
 
     identifiers = {}
+    # The vertex stage is the same for every case: compile it once per compiler, all compilers together.
+    for kind, compiler, vs_profile, _ps in compilers:
+        queue.submit(compile_hlsl, compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile, directory)
+    vs_paths = {kind: queue.call(compile_hlsl, compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile,
+                                 directory) for kind, compiler, vs_profile, _ps in compilers}
+    # Each case submits its pixel-stage compiles when it is declared. flush() then draws the declared cases in
+    # order, so a failed compile or draw is still the first failure in declaration order.
+    pending = []
+
+    def flush():
+        while pending:
+            pending.pop(0)()
 
     def run(case_index, group, label, code, function, reference, u, v, count, first, expected, *,
             bad=False, hlsl_edits=()):
@@ -489,6 +506,7 @@ def draw(directory, dxc, renderer=None, adapter=None, fxc=None, evidence=None):
             text = text.replace(old, new)
         smpc = [line for line in pipe.manifest().splitlines() if line.startswith('smpc ')]
         assert len(smpc) == 1, pipe.manifest()
+        plan = []
         for kind, compiler, vs_profile, ps_profile in compilers:
             # Lowercase before sanitizing so labels that differ only in case cannot collide, and keep the
             # case index and compiler in the name so no case overwrites another's artifacts.
@@ -499,44 +517,52 @@ def draw(directory, dxc, renderer=None, adapter=None, fxc=None, evidence=None):
             assert name not in identifiers, 'duplicate evidence identifier %r (%r and %r)' % (
                 name, identifiers.get(name), (group, label))
             identifiers[name] = (group, label)
-            vs_path = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile, directory)
-            shader_path = compile_hlsl(compiler, kind, text, name, ps_profile, directory)
-            case = directory / (name + '.case')
-            case.write_bytes(case_bytes(count, first, expected))
-            if renderer is None:
-                continue
-            command = [renderer, adapter, '--check-pixel-compare-gather', str(shader_path), str(case),
-                       smpc[0], str(vs_path)]
-            result = subprocess.run(command, capture_output=True, text=True)
-            output = result.stdout + result.stderr
-            print('%s %s\n%s' % (label, kind, output), end='', flush=True)
-            if result.returncode == 77:
-                raise SystemExit(77)
-            if bad:
-                assert result.returncode == 1 and 'pixel_mismatch' in output, (label, kind, output)
-            else:
-                assert result.returncode == 0, (label, kind, output)
-                assert 'pixels=64 channels=256 max_absolute_error=0' in output, (label, kind, output)
-            artifacts = [name + '.hlsl', name + '.manifest', name + '.case', shader_path.name, name + '.log']
-            summary.append({'case_index': case_index, 'group': group, 'label': label, 'compiler': kind,
-                            'profile': ps_profile, 'function': function, 'reference': str(reference),
-                            'u': str(u), 'v': str(v), 'count': count, 'first': first,
-                            'expected': list(expected), 'smpc': smpc[0],
-                            'shader_edits': [list(edit) for edit in hlsl_edits],
-                            'result': 'expected-mismatch' if bad else 'pass',
-                            'exit': result.returncode, 'artifacts': artifacts, 'output': output})
-            if evidence:
-                (evidence / (name + '.hlsl')).write_text(text, encoding='ascii')
-                (evidence / (name + '.manifest')).write_text(pipe.manifest(), encoding='ascii')
-                (evidence / (name + '.case')).write_bytes(case.read_bytes())
-                (evidence / shader_path.name).write_bytes(shader_path.read_bytes())
-                (evidence / (name + '.log')).write_text(output, encoding='ascii')
+            queue.submit(compile_hlsl, compiler, kind, text, name, ps_profile, directory)
+            plan.append((kind, compiler, ps_profile, name))
+
+        def finish():
+            for kind, compiler, ps_profile, name in plan:
+                vs_path = vs_paths[kind]
+                shader_path = queue.call(compile_hlsl, compiler, kind, text, name, ps_profile, directory)
+                case = directory / (name + '.case')
+                case.write_bytes(case_bytes(count, first, expected))
+                if renderer is None:
+                    continue
+                command = [renderer, adapter, '--check-pixel-compare-gather', str(shader_path), str(case),
+                           smpc[0], str(vs_path)]
+                result = subprocess.run(command, capture_output=True, text=True)
+                output = result.stdout + result.stderr
+                print('%s %s\n%s' % (label, kind, output), end='', flush=True)
+                if result.returncode == 77:
+                    raise SystemExit(77)
+                if bad:
+                    assert result.returncode == 1 and 'pixel_mismatch' in output, (label, kind, output)
+                else:
+                    assert result.returncode == 0, (label, kind, output)
+                    assert 'pixels=64 channels=256 max_absolute_error=0' in output, (label, kind, output)
+                artifacts = [name + '.hlsl', name + '.manifest', name + '.case', shader_path.name, name + '.log']
+                summary.append({'case_index': case_index, 'group': group, 'label': label, 'compiler': kind,
+                                'profile': ps_profile, 'function': function, 'reference': str(reference),
+                                'u': str(u), 'v': str(v), 'count': count, 'first': first,
+                                'expected': list(expected), 'smpc': smpc[0],
+                                'shader_edits': [list(edit) for edit in hlsl_edits],
+                                'result': 'expected-mismatch' if bad else 'pass',
+                                'exit': result.returncode, 'artifacts': artifacts, 'output': output})
+                if evidence:
+                    (evidence / (name + '.hlsl')).write_text(text, encoding='ascii')
+                    (evidence / (name + '.manifest')).write_text(pipe.manifest(), encoding='ascii')
+                    (evidence / (name + '.case')).write_bytes(case.read_bytes())
+                    (evidence / shader_path.name).write_bytes(shader_path.read_bytes())
+                    (evidence / (name + '.log')).write_text(output, encoding='ascii')
+
+        pending.append(finish)
 
     for case_index, (label, function, reference, u, v, count, first) in enumerate(cases()):
         expected = expected_case(function, reference, u, v, count, first)
         word0 = CLAMP_LAST_TEXEL | (CLAMP_LAST_TEXEL << 3) | (COMPARE[function] << 12)
         run(case_index, 'positive', label, fixture(reference, u, v, word0), function, reference, u, v,
             count, first, expected)
+    flush()
     if renderer is None:
         print('compiled %d comparison-gather cases; no renderer was given' % len(cases()))
         if evidence:
@@ -589,6 +615,7 @@ def draw(directory, dxc, renderer=None, adapter=None, fxc=None, evidence=None):
     run(mutant_base + 7, 'mutant', 'mutant swapped middle lanes', mid_code, mid_function, mid_reference,
         mid_u, mid_v, mid_count, mid_first, mid_expected, bad=True,
         hlsl_edits=(('v5 = U(t.y);', 'v5 = U(t.z);'), ('v6 = U(t.z);', 'v6 = U(t.y);')))
+    flush()
     if evidence:
         (evidence / 'summary.json').write_text(json.dumps(summary, indent=1), encoding='ascii')
 

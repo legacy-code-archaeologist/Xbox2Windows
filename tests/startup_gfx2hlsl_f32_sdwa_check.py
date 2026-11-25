@@ -49,6 +49,7 @@ sys.path.insert(0, str(HERE))
 import startup_gfx2hlsl_f32_lg_check as L  # noqa: E402
 import startup_gfx2hlsl_f32_nan_check as N  # noqa: E402
 import startup_gfx2hlsl_vopc_sdwa_check as S  # noqa: E402
+from startup_image_3d_check import CompileQueue  # noqa: E402
 from startup_gfx2hlsl_f32_lg_check import (  # noqa: E402
     CLEAR, HEIGHT, ONE, PAIRS, VALUES, WIDTH, G, as_float, assemble, compile_hlsl, flushed, modified,
     old_reference, reference)
@@ -621,7 +622,7 @@ def draw(renderer, adapter, vs, ps, expected):
                           str(expected)], capture_output=True, text=True)
     if run.returncode == 77:
         print(run.stdout + run.stderr)
-        sys.exit(77)
+        sys.exit(1 if failures else 77)
     return run
 
 
@@ -629,20 +630,36 @@ def pixel_lines(run):
     return ' / '.join(ln for ln in (run.stdout + run.stderr).splitlines() if 'pixel' in ln)
 
 
+def prefetch(queue, compilers, directory):
+    """Start every compile check_draw will ask for, in the order it asks. A compile missed here is made inline."""
+    for kind, compiler, vs_profile, ps_profile in compilers:
+        queue.submit(compile_hlsl, compiler, kind, L.FULLSCREEN_VS, 'vs_%s' % kind, vs_profile, directory)
+        for name, (_words, results) in FIXTURES.items():
+            queue.submit(compile_hlsl, compiler, kind, pixel_hlsl(name), 'ps_%s_%s' % (name, kind), ps_profile,
+                         directory)
+            if results[0][0] in GUARDED:
+                queue.submit(compile_hlsl, compiler, kind, pixel_hlsl(name, 'old'), 'ps_%s_old_%s' % (name, kind),
+                             ps_profile, directory)
+            queue.submit(N.compile_strict, compiler, kind, pixel_hlsl(name), 'ps_%s_strict_%s' % (name, kind),
+                         ps_profile, directory)
+
+
 def check_draw(dxc, renderer, adapter, fxc=None):
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
     if not fxc:
         print('  no FXC given: the nlt/nle/ngt/nge old-text controls are not drawn')
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, CompileQueue() as queue:
         directory = Path(tmp)
+        prefetch(queue, compilers, directory)
         for kind, compiler, vs_profile, ps_profile in compilers:
-            vs = compile_hlsl(compiler, kind, L.FULLSCREEN_VS, 'vs_%s' % kind, vs_profile, directory)
+            vs = queue.call(compile_hlsl, compiler, kind, L.FULLSCREEN_VS, 'vs_%s' % kind, vs_profile, directory)
             modes, header = set(), None
             for name, (_words, results) in FIXTURES.items():
                 cond = results[0][0]
                 files = {d: L.words_file(directory, '%s_%s' % (name, d), image(name, denormals=d))
                          for d in L.DENORMALS}
-                ps = compile_hlsl(compiler, kind, pixel_hlsl(name), 'ps_%s_%s' % (name, kind), ps_profile, directory)
+                ps = queue.call(compile_hlsl, compiler, kind, pixel_hlsl(name), 'ps_%s_%s' % (name, kind), ps_profile,
+                                directory)
                 matched, report = None, []
                 for denormals in L.DENORMALS:
                     run = draw(renderer, adapter, vs, ps, files[denormals])
@@ -659,8 +676,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     kind, adapter, name, WIDTH * HEIGHT, matched if sensitive else 'either'), matched is not None,
                     '\n'.join(report))
                 if cond in GUARDED:
-                    bad = compile_hlsl(compiler, kind, pixel_hlsl(name, 'old'), 'ps_%s_old_%s' % (name, kind),
-                                       ps_profile, directory)
+                    bad = queue.call(compile_hlsl, compiler, kind, pixel_hlsl(name, 'old'), 'ps_%s_old_%s' % (name, kind),
+                                     ps_profile, directory)
                     if BROKEN_BY[cond] in ('ieee', kind):
                         for denormals in L.DENORMALS:
                             run = draw(renderer, adapter, vs, bad, files[denormals])
@@ -682,8 +699,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                         print('  recorded: %s %s %s old text: %s' % (
                             kind, adapter, name, pixel_lines(run) or 'all pixels matched'))
                 # Diagnostic, not checked: the text with IEEE-strict compares, which the startup cache does not use.
-                strict = N.compile_strict(compiler, kind, pixel_hlsl(name), 'ps_%s_strict_%s' % (name, kind),
-                                          ps_profile, directory)
+                strict = queue.call(N.compile_strict, compiler, kind, pixel_hlsl(name), 'ps_%s_strict_%s' % (name, kind),
+                                    ps_profile, directory)
                 outcome = 'no image matched'
                 for denormals in L.DENORMALS:
                     run = draw(renderer, adapter, vs, strict, files[denormals])

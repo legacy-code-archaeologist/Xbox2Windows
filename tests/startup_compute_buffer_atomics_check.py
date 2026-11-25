@@ -223,6 +223,47 @@ def exchange_bytes():
 
 EXCHANGE_BYTES = exchange_bytes()
 
+# Two single-lane groups address separate counters 32 bytes apart. Each stores
+# the GLC return with bit zero flipped so a missing observer store differs
+# from the initial sentinel in the word 64 bytes past its base.
+SOFFSET_SOURCE = '''\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx4 s[16:19], s[10:11], 32
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s13, s7, 5
+v_mov_b32 v1, s13
+v_add_nc_u32 v4, 7, v1
+buffer_atomic_add v4, off, s[16:19], s13{immediate} glc
+s_waitcnt vmcnt(0)
+v_xor_b32 v4, 1, v4
+buffer_store_dword v4, v1, s[16:19], 0 offen offset:64
+s_endpgm
+'''
+
+
+def soffset_code(immediate):
+    return (HEAD
+            + bytes.fromhex('07850d8f 0d02027e')  # s_lshl_b32 s13, s7, 5; v_mov_b32 v1, s13
+            + vop2(0x25, 4, 0x87, 1)            # v_add_nc_u32 v4, 7, v1
+            + mubuf(0x32, 4, 0, 16, 13, offen=False, offset=immediate, glc=True)
+            + bytes.fromhex('703f8cbf')          # s_waitcnt vmcnt(0)
+            + vop2(0x1d, 4, 0x81, 4)            # v_xor_b32 v4, 1, v4
+            + mubuf(0x1c, 4, 1, 16, 0x80, offset=64)
+            + bytes.fromhex('000081bf'))
+
+
+def soffset_pipe(immediate):
+    return cs_pipe(soffset_code(immediate), rsrc2=USER7 | (1 << 7))
+
+
+def soffset_reference(immediate):
+    out = [SENTINEL] * WORDS
+    for soffset in (0, 32):
+        out[(soffset + immediate) // 4] = (SENTINEL + 7 + soffset) & MASK
+        out[(soffset + 64) // 4] = SENTINEL ^ 1
+    return out
+
 
 def reduce_reference():
     out = [SENTINEL] * WORDS
@@ -309,6 +350,16 @@ def controls(llvm_mc):
     assert 'u0.InterlockedCompareExchange(a, v8, v7, ao);' in exch_hlsl
     assert 'v7 = ao;' in exch_hlsl and 'v8 = ao;' not in exch_hlsl, exch_hlsl
 
+    for immediate in (0, 4):
+        pipe = soffset_pipe(immediate)
+        if llvm_mc:
+            modifier = f' offset:{immediate}' if immediate else ''
+            assert soffset_code(immediate) == assemble(llvm_mc, SOFFSET_SOURCE.format(immediate=modifier))
+        hlsl = pipe.hlsl_cs()
+        assert f'a = (s13 + {immediate}) & 0xfffffffcu;' in hlsl
+        assert 'u0.InterlockedAdd(a, v4, ao);' in hlsl and 'v4 = ao;' in hlsl
+        assert pipe.manifest().splitlines()[-1] == 'uav 0 table 1 32', pipe.manifest()
+
     # Individual opcodes with and without glc, plus llvm-mc byte checks.
     for op_name, (opcode, width, method) in ATOMIC_OPCODES.items():
         data_tok = 'v[2:3]' if width == 2 else 'v2'
@@ -335,8 +386,13 @@ def controls(llvm_mc):
     refused('unaligned immediate offset', lambda: cs_pipe(single_atomic_code('add', offset=2)))
     refused('unaligned immediate offset', lambda: cs_pipe(single_atomic_code('add', offset=1)))
 
-    # Refused modifiers, missing offen, bad data/soffset ranges, modified/aliased descriptors, non-cs stages.
+    # The off variant is limited to add + glc + a scalar register, with the same offset and modifier checks.
     refused('without the offen address form', lambda: cs_pipe(single_atomic_code('add', offen=False)))
+    refused('without the offen address form', lambda: cs_pipe(single_atomic_code('sub', offen=False, glc=True, soffset_enc=13)))
+    refused('off requires a scalar register soffset', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True)))
+    refused('unaligned immediate offset', lambda: soffset_pipe(2))
+    refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', offen=False, idxen=True, glc=True, soffset_enc=13)))
+    refused('buffer soffset vcc_lo', lambda: cs_pipe(single_atomic_code('add', offen=False, glc=True, soffset_enc=0x6a)))
     refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True)))
     refused('buffer atomic modifier idxen', lambda: cs_pipe(single_atomic_code('add', idxen=True, offen=True)))
     refused('buffer atomic modifier slc', lambda: cs_pipe(single_atomic_code('add', slc=True)))
@@ -367,7 +423,7 @@ def controls(llvm_mc):
         refused(f'buffer_atomic_{op_name}', lambda op=opcode: cs_pipe(
             HEAD + v_mov_imm(0, 0) + v_mov_imm(2, 1) + mubuf(op, 2, 0, 16, 0x80) + bytes.fromhex('000081bf')
         ))
-    print('buffer_atomic controls (11 ops, glc/non-glc, alignment, modifiers, descriptors, refusals) passed')
+    print('buffer_atomic controls (11 ops, scalar byte offset, glc/non-glc, alignment, modifiers, descriptors, refusals) passed')
 
 
 def run_case(directory, compiler, renderer, adapter, name, hlsl, groups, want):
@@ -395,6 +451,26 @@ def dispatch(directory, compiler, renderer, adapter):
     exch_want = exchange_reference()
     res = run_case(directory, compiler, renderer, adapter, 'exchange_glc_exec_cmpswap', exch_hlsl, (1, 1, 1), exch_want)
     assert res.returncode == 0 and f'compared_words={WORDS} mismatches=0' in res.stdout, (res.stdout, res.stderr)
+
+    for immediate in (0, 4):
+        hlsl = soffset_pipe(immediate).hlsl_cs()
+        want = soffset_reference(immediate)
+        res = run_case(directory, compiler, renderer, adapter, f'soffset_add_{immediate}', hlsl, (2, 1, 1), want)
+        assert res.returncode == 0 and f'compared_words={WORDS} mismatches=0' in res.stdout, (res.stdout, res.stderr)
+
+    hlsl = soffset_pipe(4).hlsl_cs()
+    want = soffset_reference(4)
+    mutations = (
+        ('dropped_soffset', 'a = (s13 + 4)', 'a = 4', 1, (SENTINEL + 7 + 39) & MASK),
+        ('dropped_immediate', 'a = (s13 + 4)', 'a = (s13 + 0)', 0, (SENTINEL + 7) & MASK),
+        ('dropped_soffset_glc_return', 'v4 = ao;', '', 16, 7 ^ 1),
+        ('dropped_soffset_observer_store', 'u0.Store(a, v4);', '', 16, SENTINEL),
+    )
+    for name, original, replacement, word, value in mutations:
+        assert hlsl.count(original) == 1
+        result = run_case(directory, compiler, renderer, adapter, name, hlsl.replace(original, replacement), (2, 1, 1), want)
+        assert result.returncode == 1 and f'word={word} expected={want[word]:08x} actual={value:08x}' in result.stderr, (
+            name, result.returncode, result.stdout, result.stderr)
 
     # Negative controls on GPU: every mutated shader must fail at the predicted first mismatch word.
     wrong_sub_want = reduce_want.copy()

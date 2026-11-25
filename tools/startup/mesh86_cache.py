@@ -79,7 +79,7 @@ _MESH_SRV_HANDLE = re.compile(
 _MESH_SRV_LOAD = re.compile(
     r'%\d+ = call %dx\.types\.ResRet\.i32 @dx\.op\.rawBufferLoad\.i32'
     r'\(i32 139, %dx\.types\.Handle (%\d+), i32 0, i32 undef, i8 1, i32 4\)')
-_MESH_OUTPUT_OPS = frozenset(('setMeshOutputCounts', 'storeVertexOutput.f32',
+_MESH_OUTPUT_OPS = frozenset(('groupId.i32', 'setMeshOutputCounts', 'storeVertexOutput.f32',
                               'storeVertexOutput.i32', 'emitIndices'))
 _PIXEL_IO_OPS = frozenset(('loadInput.i32', 'loadInput.f32', 'storeOutput.i32', 'storeOutput.f32'))
 

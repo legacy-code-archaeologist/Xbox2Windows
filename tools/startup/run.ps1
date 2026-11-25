@@ -28,7 +28,8 @@ param(
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
-    [switch]$TraceCalls                        # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -52,6 +53,7 @@ if (-not $FakeUser -and $env:X2W_FAKE_USER -ne "1") {
 }
 if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
+if ($TraceApi) { $env:X2W_TRACE_API = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
 if ($Render) {
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null

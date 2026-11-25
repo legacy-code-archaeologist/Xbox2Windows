@@ -456,7 +456,7 @@ def run_pixel_words(renderer, adapter, vs, ps, expected_path):
     )
     if run.returncode == 77:
         print(run.stdout + run.stderr, end='', flush=True)
-        sys.exit(77)
+        sys.exit(1 if failures else 77)
     if 'debug_layer=enabled' in run.stdout:
         assert 'debug_errors=0 debug_warnings=0' in run.stdout, (run.stdout, run.stderr)
     return run

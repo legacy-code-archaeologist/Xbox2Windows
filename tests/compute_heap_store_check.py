@@ -14,6 +14,8 @@ TABLE_BYTE = 256
 FLOAT1 = 0x01016FAC  # gfx10 format 22 (BUF_FMT_32_FLOAT), identity selectors and RESOURCE_LEVEL set
 UINT1 = 0x01014FAC   # gfx10 format 20 (BUF_FMT_32_UINT)
 FLOAT2 = 0x01040FAC  # gfx10 format 64 (BUF_FMT_32_32_FLOAT)
+FLOAT3 = 0x0104AFAC  # gfx10 format 74 (BUF_FMT_32_32_32_FLOAT)
+UINT3 = 0x01048FAC   # gfx10 format 72 (BUF_FMT_32_32_32_UINT)
 UINT4 = 0x0104BFAC   # gfx10 format 75, identity XYZW selectors and RESOURCE_LEVEL set
 FLOAT4 = 0x0104DFAC
 STORE = "buffer_store_format_xyzw v[10:13], v8, s[20:23], 0 idxen offset:4"
@@ -36,6 +38,9 @@ D16_X_PROGRAM = SETUP + [
 ]
 D16_XY_STORE = D16_X_STORE.replace("d16_x ", "d16_xy ")
 D16_XY_PROGRAM = base.variant(D16_X_PROGRAM, (D16_X_STORE, D16_XY_STORE))
+D16_XYZ_STORE = D16_STORE.replace("d16_xyzw", "d16_xyz")
+D16_XYZ_PROGRAM = base.variant(D16_PROGRAM, (D16_STORE, D16_XYZ_STORE),
+                               ("v_mov_b32_e32 v11, 0x80000001", "v_mov_b32_e32 v11, s25"))
 # 0x3c00..0x3c03 are consecutive binary16 values starting at 1.0.
 D16_X = (0x3f800000, 0x3f802000, 0x3f804000, 0x3f806000)
 # High half 0x4200 poisons each word so leaking high bits or missing & 0xffffu shifts fails readback.
@@ -92,6 +97,21 @@ D16_XY_CASES = (
     ("base past the declared extent", (640, 12 << 16, 4, FLOAT2, 1), ()),
     ("live slot beyond the declared count", (12, 12 << 16, 4, FLOAT2, 1), ()),
 )
+# Each accepted three-dword texel has an adjacent guard, including the one at the declared u0 limit.
+D16_XYZ_CASES = (
+    ("four float3 records", (12, 16 << 16, 4, FLOAT3, 1), (4, 8, 12, 16)),
+    ("second base and short count", (116, 20 << 16, 2, FLOAT3, 1), (30, 35)),
+    ("released view", (12, 16 << 16, 4, FLOAT3, 2), ()),
+    ("last complete float3", (496, 16 << 16, 4, FLOAT3, 1), (125,)),
+    ("only eight bytes left", (500, 16 << 16, 4, FLOAT3, 1), ()),
+    ("wrong UINT3 format", (12, 16 << 16, 4, UINT3, 1), ()),
+    ("short stride", (12, 12 << 16, 4, FLOAT3, 1), ()),
+    ("misaligned base", (14, 16 << 16, 4, FLOAT3, 1), ()),
+    ("misaligned stride", (12, 18 << 16, 4, FLOAT3, 1), ()),
+    ("unsupported high address", (12, (16 << 16) | 1, 4, FLOAT3, 1), ()),
+    ("base past the declared extent", (640, 16 << 16, 4, FLOAT3, 1), ()),
+    ("live slot beyond the declared count", (12, 16 << 16, 4, FLOAT3, 1), ()),
+)
 BINDING = dict(table_reg=7, descriptor_offset=0x30, constant_descriptor=0x40, source_descriptor=0x50, group_reg=11)
 
 
@@ -104,6 +124,8 @@ def controls():
     assert base.aot.descriptor_format_word(22) == FLOAT1
     assert base.aot.descriptor_format_word(20) == UINT1
     assert base.aot.descriptor_format_word(64) == FLOAT2
+    assert base.aot.descriptor_format_word(74) == FLOAT3
+    assert base.aot.descriptor_format_word(72) == UINT3
     # Pin the translator call here. draw() exercises the generated guards against actual UAV contents.
     assert "store_heap_words4(params[0].x, tid.x, 4u, false, uint4(tid.x," in lower()
     assert "store_heap_words4(params[0].x, tid.x, 4u, true," in lower(D16_PROGRAM)
@@ -129,8 +151,13 @@ def controls():
     refuses("Unverified ALU operand", lower, D16_X_PROGRAM[:7] + D16_X_PROGRAM[8:])
     refuses("Heap store view requires buffer_store_format_xyzw", lower,
             base.variant(PROGRAM, (STORE, STORE.replace("xyzw v[10:13]", "xy v[10:11]"))))
+    xyz = lower(D16_XYZ_PROGRAM)
+    assert f"{FLOAT3:#x}u" in xyz and "outputData.Store3(" in xyz and "outputData.Load(" not in xyz
+    for registers in ("v10", "v[10:12]"):
+        refuses("Unverified raw UAV store", lower,
+                base.variant(D16_XYZ_PROGRAM, (D16_XYZ_STORE, D16_XYZ_STORE.replace("v[10:11]", registers))))
     refuses("Heap store view requires buffer_store_format_xyzw", lower,
-            base.variant(D16_PROGRAM, (D16_STORE, D16_STORE.replace("d16_xyzw", "d16_xyz"))))
+            base.variant(PROGRAM, (STORE, STORE.replace("xyzw v[10:13]", "xyz v[10:12]"))))
     xy = lower(D16_XY_PROGRAM)
     assert f"{FLOAT2:#x}u" in xy and "outputData.Store2(" in xy and "outputData.Load(" not in xy
     refuses("Unverified raw UAV store", lower,
@@ -166,8 +193,9 @@ def verify_binary(directory, code, library, program=PROGRAM):
 
 
 def draw(directory, compiler, renderer, backend, mode):
-    program = {"uint4": PROGRAM, "d16_xyzw": D16_PROGRAM, "d16_x": D16_X_PROGRAM, "d16_xy": D16_XY_PROGRAM}[mode]
-    cases = {"d16_x": D16_X_CASES, "d16_xy": D16_XY_CASES}.get(mode, CASES)
+    program = {"uint4": PROGRAM, "d16_xyzw": D16_PROGRAM, "d16_x": D16_X_PROGRAM,
+               "d16_xy": D16_XY_PROGRAM, "d16_xyz": D16_XYZ_PROGRAM}[mode]
+    cases = {"d16_x": D16_X_CASES, "d16_xy": D16_XY_CASES, "d16_xyz": D16_XYZ_CASES}.get(mode, CASES)
     source = lower(program)
     table = [0] * WORDS
     for slot, (_, record, _) in enumerate(cases):
@@ -181,13 +209,18 @@ def draw(directory, compiler, renderer, backend, mode):
         hlsl.write_text(text, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, hlsl], check=True)
 
-    def run(slot, payload=D16_X_PAYLOADS[0][1], expected_x=D16_X, table_words=table, expected_y=0x40400000):
+    default_payload = 0x42000001 if mode == "d16_xyz" else D16_X_PAYLOADS[0][1]
+
+    def run(slot, payload=default_payload, expected_x=D16_X, table_words=table, expected_y=0x40400000,
+            expected_z=0x33800000):
         result = [base.SENTINEL] * WORDS
         for thread, start in enumerate(cases[slot][2]):
             if mode == "d16_x":
                 result[start] = expected_x[thread]
             elif mode == "d16_xy":
                 result[start:start + 2] = [expected_x[thread], expected_y]
+            elif mode == "d16_xyz":
+                result[start:start + 3] = [D16_X[thread], 0xc0000000, expected_z]
             elif mode == "d16_xyzw":
                 # D16 y, z, w are -2, the smallest positive binary16 subnormal, and negative zero.
                 result[start:start + 4] = [D16_X[thread], 0xc0000000, 0x33800000, 0x80000000]
@@ -224,15 +257,22 @@ def draw(directory, compiler, renderer, backend, mode):
             result = run(0, payload=payload, expected_y=expected_y)
             assert result.returncode == 0, (hex(payload), result.stderr)
             extra += 1
-        for wrong_format in (FLOAT4, base.aot.descriptor_format_word(62)):  # UINT2
-            wrong_view = table.copy()
-            wrong_view[TABLE_BYTE // 4 + 5 * 8 + 3] = wrong_format
-            result = run(5, table_words=wrong_view)
-            assert result.returncode == 0, (hex(wrong_format), result.stderr)
+    elif mode == "d16_xyz":
+        for payload, z in ((0x7e010001, 0x33800000), (0x3c008000, 0x80000000), (0x4200c000, 0xc0000000)):
+            result = run(0, payload=payload, expected_z=z)
+            assert result.returncode == 0, (hex(payload), result.stderr)
             extra += 1
-    width_str = {"d16_x": "4u", "d16_xy": "8u"}.get(mode, "16u")
-    format_guard = {"d16_x": f"{FLOAT1:#x}u", "d16_xy": f"{FLOAT2:#x}u"}.get(mode, "formatWord")
-    wrong_stride = {"d16_x": 8, "d16_xy": 12}.get(mode, 24)
+    mismatched_formats = {"d16_xy": (FLOAT4, base.aot.descriptor_format_word(62)), "d16_xyz": (FLOAT2, FLOAT4)}
+    for wrong_format in mismatched_formats.get(mode, ()):
+        wrong_view = table.copy()
+        wrong_view[TABLE_BYTE // 4 + 5 * 8 + 3] = wrong_format
+        result = run(5, table_words=wrong_view)
+        assert result.returncode == 0, (hex(wrong_format), result.stderr)
+        extra += 1
+    width_str = {"d16_x": "4u", "d16_xy": "8u", "d16_xyz": "12u"}.get(mode, "16u")
+    format_guard = {"d16_x": f"{FLOAT1:#x}u", "d16_xy": f"{FLOAT2:#x}u",
+                    "d16_xyz": f"{FLOAT3:#x}u"}.get(mode, "formatWord")
+    wrong_stride = {"d16_x": 8, "d16_xy": 12, "d16_xyz": 16}.get(mode, 24)
     mutations = (
         ("view.x + index * stride + offset", "index * stride + offset", 0),
         (" || index >= view.z", "", 1),
@@ -263,6 +303,15 @@ def draw(directory, compiler, renderer, backend, mode):
             ("offset + 8u > bytes - view.x", "offset + 4u > bytes - view.x", 4,
              "word=127 expected=c5c5c5c5 actual=3f800000"),
         )
+    elif mode == "d16_xyz":
+        mutations += (
+            ("value.y & 0xffffu", "value.y >> 16u", 0, "word=6 expected=33800000 actual=40400000"),
+            ("Store3(view.x + index * stride + offset, asuint(f16tof32(halfWords)))",
+             "Store4(view.x + index * stride + offset, uint4(asuint(f16tof32(halfWords)), 0u))", 0,
+             "word=7 expected=c5c5c5c5 actual=00000000"),
+            ("offset + 12u > bytes - view.x", "offset + 8u > bytes - view.x", 4,
+             "word=126 expected=c5c5c5c5 actual=3f800000"),
+        )
     for old, new, slot, *first_mismatch in mutations:
         assert source.count(old) == 1, old
         compile_shader(source.replace(old, new))
@@ -272,7 +321,7 @@ def draw(directory, compiler, renderer, backend, mode):
             words = [line for line in result.stderr.splitlines() if line.startswith("word=")]
             assert words[:1] == first_mismatch, (old, result.stderr)
     kind = {"uint4": "UINT4", "d16_xyzw": "D16-to-FLOAT4", "d16_x": "D16_X-to-FLOAT1",
-            "d16_xy": "D16_XY-to-FLOAT2"}[mode]
+            "d16_xy": "D16_XY-to-FLOAT2", "d16_xyz": "D16_XYZ-to-FLOAT3"}[mode]
     print(f"{backend} {kind}: {len(cases) + extra} heap-store cases and {len(mutations)} shader mutations checked")
     return 0
 
@@ -286,13 +335,13 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             if mode == "draw":
-                for kind in ("uint4", "d16_xyzw", "d16_x", "d16_xy"):
+                for kind in ("uint4", "d16_xyzw", "d16_x", "d16_xy", "d16_xyz"):
                     result = draw(directory, *args, kind)
                     if result:
                         sys.exit(result)
                 sys.exit(0)
             assembler, objcopy, library = args
-            for program in (PROGRAM, D16_PROGRAM, D16_X_PROGRAM, D16_XY_PROGRAM):
+            for program in (PROGRAM, D16_PROGRAM, D16_X_PROGRAM, D16_XY_PROGRAM, D16_XYZ_PROGRAM):
                 code = base.assemble(directory, assembler, objcopy, program, cpu="gfx1013")
                 verify_binary(directory, code, library, program)
     else:

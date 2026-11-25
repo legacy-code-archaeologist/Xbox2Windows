@@ -127,6 +127,17 @@ void write_two_mesh_groups() {
 }
 
 [numthreads(1, 1, 1)]
+void initialize_mesh_record() {
+    data.Store4(0, uint4(0, 1, 1, 0));
+}
+
+[numthreads(2, 1, 1)]
+void append_mesh_groups() {
+    uint previous;
+    data.InterlockedAdd(0, 1u, previous);
+}
+
+[numthreads(1, 1, 1)]
 void write_one_rect() {
     data.Store4(4, uint4(3, 1, 0, 0));
 }
@@ -457,7 +468,19 @@ struct MeshLeaseDraw {
     IUnknown* argument{};
     UINT64 argument_offset{};
     std::optional<UINT> expected_right;
+    std::function<void()> before_submit;
 };
+
+bool mesh_fence_reached(ID3D12Fence* fence, DWORD milliseconds)
+{
+    const auto deadline = GetTickCount64() + milliseconds;
+    do {
+        const auto completed = fence->GetCompletedValue();
+        if (completed == 1) return true;
+        if (completed == UINT64_MAX || GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    } while (true);
+}
 
 void submit_wrapped(IUnknown* queue, IUnknown* list)
 {
@@ -836,6 +859,18 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         if (refusal == Refusal::mesh_attachment_count)
             slot<Targets>(wrapped, 50)(wrapped, 0, nullptr, FALSE, nullptr);
     } else {
+        if (leased && leased->before_submit) {
+            // A submission-level refusal skips the entire wrapped list,
+            // including its clear. Initialize the readback target separately.
+            ComputeCommands clear_targets(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                auto* target = targets[i].Get();
+                transition(clear_targets.list.Get(), target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                clear_targets.list->ClearRenderTargetView(rtvs[i], clear, 0, nullptr);
+                transition(clear_targets.list.Get(), target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            }
+            clear_targets.submit_and_wait(device);
+        }
         for (const auto target_view : rtvs) slot<Clear>(wrapped, 52)(wrapped, target_view.ptr, clear, 0, nullptr);
         const UINT bound_targets = target_count - (refusal == Refusal::mesh_attachment_count ? 1 : 0);
         slot<Targets>(wrapped, 50)(wrapped, bound_targets, rtvs.data(), FALSE, nullptr);
@@ -1002,11 +1037,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         const auto queue = native_object<ID3D12CommandQueue>(device, guest, leased->queue);
         ComPtr<ID3D12Fence> completion;
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)), "create mesh consumer fence");
+        if (leased->before_submit) leased->before_submit();
         submit_wrapped(leased->queue, wrapped);
         check(queue->Signal(completion.Get(), 1), "signal mesh consumer completion");
         if (leased->drop_recording) wrapped_list.Reset();
         if (leased->queued) leased->queued(completion.Get());
-        check(completion->SetEventOnCompletion(1, nullptr), "wait for mesh consumer");
+        check(mesh_fence_reached(completion.Get(), 5000) ? S_OK : E_FAIL, "wait for mesh consumer");
         check(device->GetDeviceRemovedReason(), "leased mesh GPU completion");
     } else {
         if (gate) {
@@ -1326,6 +1362,8 @@ int main(int argc, char** argv) try
     }
     wchar_t lease_xmem[MAX_PATH]{};
     const bool lease_fixture = GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_XMEM", lease_xmem, MAX_PATH) != 0;
+    const bool dual_lease = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DUAL", nullptr, 0) != 0;
+    if (dual_lease) check(lease_fixture && !lease_arguments ? S_OK : E_FAIL, "configure combined mesh XMem fixture");
     if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
@@ -1382,7 +1420,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || refusal_census) {
+    if (indexed || lease_arguments || dual_lease || refusal_census) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1453,6 +1491,14 @@ int main(int argc, char** argv) try
         const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
             guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
             {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
+        if (dual_lease) {
+            const bool init_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_INIT_ONLY", nullptr, 0) != 0;
+            const auto initialize = writer_pipeline(device.Get(), writer.Get(), "initialize_mesh_record");
+            ComPtr<ID3D12PipelineState> append;
+            if (!init_only) append = writer_pipeline(device.Get(), writer.Get(), "append_mesh_groups");
+            return check_mesh_dual_xmem(device.Get(), guest.Get(), lease_xmem, info.Get(), log_path,
+                                        writer.Get(), initialize.Get(), append.Get(), root.Get(), pso.Get(), signature.Get()) ? 0 : 1;
+        }
         const auto work = writer_pipeline(device.Get(), writer.Get(), "write_one_mesh_group");
         if (lease_fixture) {
             MeshLeaseWriter source(device.Get(), guest.Get(), lease_xmem);

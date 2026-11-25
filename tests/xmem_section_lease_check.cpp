@@ -33,8 +33,9 @@ int wmain(int argc, wchar_t** argv) try {
     const bool page_batch = argc == 4 && std::wcscmp(argv[3], L"page-batch") == 0;
     const bool mesh = argc == 4 && std::wcscmp(argv[3], L"mesh") == 0;
     const bool vertex = argc == 4 && std::wcscmp(argv[3], L"vertex") == 0;
+    const bool single_page = argc == 3 && std::wcscmp(argv[1], L"single-page") == 0;
     if ((argc != 3 && !mesh && !vertex && !page_batch) ||
-        (std::wcscmp(argv[1], L"warp") && std::wcscmp(argv[1], L"hardware"))) return 2;
+        (!single_page && std::wcscmp(argv[1], L"warp") && std::wcscmp(argv[1], L"hardware"))) return 2;
     const bool warp = std::wcscmp(argv[1], L"warp") == 0;
     SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1");
@@ -53,6 +54,40 @@ int wmain(int argc, wchar_t** argv) try {
     };
     const auto release = [unpin](ULONG64 id) { return unpin(x2w_xmem_section_lease_version, id); };
     constexpr UINT64 window = UINT64{16} << 30, page = 65536;
+    if (single_page) {
+        constexpr auto version = x2w_xmem_single_page_lease_version;
+        constexpr SIZE_T size = 12, offset = page - size;
+        void* base = reserve(nullptr, page, 0x20402000, 0x21, PAGE_READWRITE);
+        require(base != nullptr, "reserve ordinary CPU window");
+        const auto address = reinterpret_cast<ULONG_PTR>(base) + offset;
+        ULONG_PTR count = 1, original{}, replacement{}, hole = 0;
+        require(alloc(0x280, &count, &original) && count == 1 && map(&base, 1, &original), "map original page");
+        X2WXMemSectionLease old{}, refused{};
+        require(!acquire(address, size, &refused, sizeof(refused)), "mirror ABI rejects ordinary address");
+        require(!pin(version, address, size + 1, &refused, sizeof(refused)), "single-page ABI rejects crossing");
+        require(pin(version, address, size, &old, sizeof(old)) && old.first_byte == offset &&
+                old.window_bytes == page, "pin bounded record ending at page boundary");
+        require(match_section(version, old.id, offset, address, size) &&
+                !match_section(version, old.id, offset - 1, address - 1, size) &&
+                !match_section(version, old.id, offset, address, 0) &&
+                !match_section(x2w_xmem_section_lease_version, old.id, offset, address, size) &&
+                !release(old.id), "lease respects its byte bounds and ABI");
+        auto* view = static_cast<const unsigned char*>(MapViewOfFile(old.section, FILE_MAP_READ,
+            static_cast<DWORD>(old.section_offset >> 32), static_cast<DWORD>(old.section_offset), page));
+        require(view != nullptr && CloseHandle(old.section), "open independent read view");
+        std::memset(reinterpret_cast<void*>(address), 0x51, size);
+        require(map(&base, 1, &hole) && !match_section(version, old.id, offset, address, size) &&
+                !pin(version, address, size, &refused, sizeof(refused)), "unmapped address is refused");
+        require(free_pages(1, &original) && alloc(0x280, &count, &replacement) &&
+                count == 1 && map(&base, 1, &replacement), "replace grant at same address");
+        std::memset(reinterpret_cast<void*>(address), 0xb2, size);
+        require(!match_section(version, old.id, offset, address, size), "replacement grant does not match");
+        for (SIZE_T i = 0; i < size; ++i) require(view[offset + i] == 0x51, "pin retains original bytes");
+        require(UnmapViewOfFile(view) && unpin(version, old.id) && !unpin(version, old.id), "retire pin once");
+        require(map(&base, 1, &hole) && free_pages(1, &replacement), "release replacement page");
+        std::puts("Ordinary CPU record stayed pinned across unmap, grant retirement and same-address remap.");
+        return 0;
+    }
     constexpr UINT64 first_byte = 0xf800, bytes = 4096;
     auto* const cpu = static_cast<unsigned char*>(reserve(nullptr, window, 0x20402000, 0x21, 4));
     const auto mirror = reinterpret_cast<UINT64>(reserve(nullptr, window, 0x20402000, 3, 0x801));
@@ -79,7 +114,7 @@ int wmain(int argc, wchar_t** argv) try {
     require(!acquire(mirror + first_byte, bytes, &gap, sizeof(gap)-1), "reject a malformed output");
     gap.id = 123;
     gap.window_bytes = 456;
-    require(!pin(x2w_xmem_section_lease_version + 1, mirror + first_byte, bytes, &gap, sizeof(gap)) &&
+    require(!pin(UINT_MAX, mirror + first_byte, bytes, &gap, sizeof(gap)) &&
             !gap.section && !gap.id && !gap.section_offset && !gap.window_bytes && !gap.first_byte,
             "reject the wrong version and clear the valid output structure");
     require(!unpin(x2w_xmem_section_lease_version + 1, lease.id), "wrong-version release keeps the lease");

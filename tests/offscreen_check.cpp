@@ -1099,6 +1099,10 @@ OperationResult run_dxr_placed_build(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_placed_build(ctx.device));
 }
+OperationResult run_dxr_slot70_as(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_slot70_as(ctx.device));
+}
 
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
@@ -1671,6 +1675,7 @@ const OperationSpec kOperations[] = {
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
+    {"--dxr-slot70-as", 3, 3, nullptr, kNoGate, run_dxr_slot70_as},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},

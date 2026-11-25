@@ -25,7 +25,7 @@ def source_envelope(stage):
     return b'DXBC' + bytes(16) + struct.pack('<IIII', 1, 36 + len(part), 1, 36) + part
 
 
-def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, skip_wait=False):
+def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None):
     for suffix, stage in (('ms', 13), ('ps', 0)):
         (work / f'source.{suffix}.dxbc').write_bytes(source_envelope(stage))
     environment = dict(os.environ, X2W_MESH86_FIXTURE_DIR=str(work), X2W_SHADER_CACHE=str(work))
@@ -35,9 +35,20 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, skip_wait=Fals
         environment['X2W_MESH86_FIXTURE_DEPTH'] = '1'
     if lease_xmem:
         environment['X2W_MESH86_FIXTURE_XMEM'] = str(lease_xmem)
-        environment.pop('X2W_TEST_MESH_XMEM_SKIP_WAIT', None)
-        if skip_wait:
+        for flag in ('X2W_TEST_MESH_XMEM_SKIP_WAIT', 'X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT',
+                     'X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT', 'X2W_MESH86_FIXTURE_DUAL',
+                     'X2W_MESH86_FIXTURE_INIT_ONLY', 'X2W_MESH_INDIRECT_XMEM'):
+            environment.pop(flag, None)
+        if mode == 'skip-wait':
             environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
+        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only'):
+            environment.update(X2W_MESH86_FIXTURE_DUAL='1', X2W_MESH_INDIRECT_XMEM='1')
+            if mode == 'dual-skip-srv':
+                environment['X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT'] = '1'
+            elif mode == 'dual-skip-argument':
+                environment['X2W_TEST_MESH_XMEM_SKIP_ARGUMENT_WAIT'] = '1'
+            elif mode == 'dual-init-only':
+                environment['X2W_MESH86_FIXTURE_INIT_ONLY'] = '1'
     cmd = [fixture, backend, 'mesh']
     capture = subprocess.run(cmd, env=environment)
     if capture.returncode:
@@ -49,7 +60,8 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, skip_wait=Fals
     assert root.startswith(b'DXBC') and stream[:16] == bytes(16)
     ms, ps = (work / f'desktop.{suffix}.cso' for suffix in ('ms', 'ps'))
     mesh_source = HERE / ('xmem_mesh_root_srv.hlsl' if lease_xmem else 'startup_indirect_mesh.hlsl')
-    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'mesh', '-Fo', ms, mesh_source], check=True)
+    defines = ['-D', 'X2W_MESH_DUAL=1'] if environment.get('X2W_MESH86_FIXTURE_DUAL') else []
+    subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'mesh', *defines, '-Fo', ms, mesh_source], check=True)
     if lease_xmem:
         subprocess.run([dxc, '-T', 'ps_6_0', '-E', 'pixel', '-D', 'X2W_MESH_LEASE_COLOR=1',
                         '-Fo', ps, mesh_source], check=True)
@@ -76,6 +88,6 @@ if __name__ == '__main__':
     for depth_only in ((False,) if lease else (False, True)):
         with tempfile.TemporaryDirectory(prefix='mesh86-', dir=Path.cwd()) as directory:
             result = run(dxc, fixture, backend, Path(directory), depth_only, Path(lease[0]) if lease else None,
-                         len(lease) > 1 and lease[1] == 'skip-wait')
+                         lease[1] if len(lease) > 1 else None)
             if result:
                 sys.exit(result)

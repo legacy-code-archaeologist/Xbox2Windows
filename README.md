@@ -98,6 +98,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | [Publish RGBA8 textures from completed archive records](docs/experiments.md#publishing-a-texture-from-each-complete-archive-record) | `ctest --preset release --no-tests=error -R '^cpu_archive_texture_publication$' -V` |
 | [Draw each archive record through D3D12](docs/experiments.md#drawing-each-archive-record-through-d3d12) | `ctest --preset dev --no-tests=error -R '^cpu_archive_texture_gpu_warp$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
+| [Cached mesh draw with two queue writers](docs/experiments.md#cached-mesh-draw-with-two-queue-writers) | `ctest --preset release --no-tests=error -R '^startup_indirect_mesh_lease_(warp\|hardware)_dual' -V` |
 | [Amplification plus mesh pipeline on WARP](docs/experiments.md#amplification-and-mesh-pipeline-forms) | `ctest --preset dev --no-tests=error -R '^mesh_amplified_draw_warp$' -V` |
 | Textured mesh fallback at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^mesh_textured_fallback_' -V` |
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |
@@ -171,6 +172,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | gfx1030 coarse-gradient pixel sampling | Lower [four 2D coarse-gradient forms](docs/experiments.md#gfx1030-2d-explicit-and-coarse-gradient-sampling) with statically known finite slopes. | `ctest --preset dev --no-tests=error -R '^pixel_aot_sample_coarse_gradient_' -V` |
 | gfx1030 explicit-gradient pixel sampling | Lower [four 2D gradient sample forms](docs/experiments.md#offline-pixel-shader-recompilation), including packed binary16 slopes and immediate offsets. | `ctest --preset dev --no-tests=error -R '^pixel_aot_sample_gradient_' -V` |
 | Shader census | [Distinguish archive records, header digests and cache-index entries](docs/experiments.md#reporting-shader-census-populations) before choosing a coverage denominator. | `ctest --preset dev --no-tests=error -R "^shader_metadata_census$" -V` |
+| Compute container index | [Correlate local slot 67 requests with archive candidates](docs/experiments.md#local-compute-container-index) and report repeated records and ambiguous matches. | `python -B tests/compute_container_index_check.py` |
 | Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
 | gfx1030 image LOD query | Lower [clamped and raw 2D LOD queries](docs/experiments.md#gfx1030-2d-image-lod-queries) for `image_get_lod` in pixel shaders. | `ctest --preset dev --no-tests=error -R '^pixel_aot_get_lod_'` |
 | Pipeline readiness | Join explicit pipeline references to the native shader manifest and optionally probe pixel and mesh lowering. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |

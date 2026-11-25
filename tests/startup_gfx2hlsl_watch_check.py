@@ -10,6 +10,7 @@ failures as one worker, an unexpected translator error must become <key>.fail, a
 pool must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall
 back to the processor count.
 """
+import json
 import os
 import re
 import struct
@@ -139,6 +140,42 @@ with tempfile.TemporaryDirectory() as tmp:
         gfx2hlsl.translate_request = real
     fail = d / ('%016x.fail' % 9)
     expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
+    # It names the function, file and line that raised it (the lambda above).
+    expect('translator error located', bool(re.fullmatch(
+        r'translator error: ZeroDivisionError: division by zero \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
+
+# An error raised inside a standard-library call is located at the code that made the call, not in the library.
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    touch(d / ('req_%016x.rtv' % 9))
+    real = gfx2hlsl.translate_request
+    gfx2hlsl.translate_request = lambda out_dir, key: json.loads('{')
+    try:
+        gfx2hlsl.translate_pending(str(d), jobs=1)
+    finally:
+        gfx2hlsl.translate_request = real
+    fail = d / ('%016x.fail' % 9)
+    expect('library error located at its caller', bool(re.fullmatch(
+        r'translator error: JSONDecodeError: .* \(in <lambda>, %s line \d+\)\n'
+        % re.escape(Path(__file__).name), fail.read_text())) if fail.exists() else None, True)
+
+# An operand refusal's .fail names the instruction that refused it; the refusal message itself is unchanged.
+sys.path.insert(0, str(ROOT / 'tests'))
+import startup_gfx2hlsl_dpp_quad_swap_check as quad  # noqa: E402
+
+AND_NEG = struct.pack('<III', (0b110101 << 26) | ((0x100 + 0x1b) << 16) | 1,  # v_and_b32_e64 v1, v30, -v30
+                      (256 + 30) | ((256 + 30) << 9) | (1 << 30), 0xbf810000)  # s_endpgm
+with tempfile.TemporaryDirectory() as tmp:
+    result = gfx2hlsl.translate_to(tmp, 3, quad.VS_WORDS, AND_NEG, quad.root_blob(), check=False)
+    expect('operand refusal result', result, "unsupported: operand '-v30' in v_and_b32_e64")
+    expect('operand refusal .fail', Path(tmp, '%016x.fail' % 3).read_text(), "operand '-v30' in v_and_b32_e64\n")
+    try:
+        gfx2hlsl.Pipeline(quad.VS_WORDS, AND_NEG, quad.root_blob())
+    except gfx2hlsl.Unsupported as error:
+        expect('the refusal message is unchanged', str(error), "operand '-v30'")
+    else:
+        failures.append('the negated v_and_b32 operand was not refused')
 
 # A broken process pool (a worker killed from outside) ends one pass, not the watcher.
 from concurrent.futures.process import BrokenProcessPool  # noqa: E402

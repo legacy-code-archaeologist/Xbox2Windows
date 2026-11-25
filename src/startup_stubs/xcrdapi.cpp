@@ -8,6 +8,7 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
@@ -577,6 +578,7 @@ void log_bcpack_summary()
 
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
+    X2W_ZONE("DirectStorage request");
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);

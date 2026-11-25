@@ -48,6 +48,7 @@ BINARY = {
     M.VPCMPEQW: "pcmpeqw", M.VPCMPGTW: "pcmpgtw",
     M.VPSIGNW: "psignw", M.VPMULHRSW: "pmulhrsw", M.VPHADDW: "phaddw",
     M.VPANDN: "pandn", M.VPAVGB: "pavgb", M.VPMADDUBSW: "pmaddubsw", M.VPSHUFB: "pshufb",
+    M.VPADDB: "paddb", M.VPSUBB: "psubb", M.VPCMPEQB: "pcmpeqb", M.VPCMPGTB: "pcmpgtb",
 }
 SHIFTS = {M.VPSRAW: "psraw", M.VPSLLW: "psllw", M.VPSRLW: "psrlw"}
 MOVES = {M.VMOVDQU, M.VMOVDQA}
@@ -124,6 +125,14 @@ V pxor(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[
 V pand(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] & b.b[i]; return r; }
 V pandn(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>((~a.b[i]) & b.b[i]); return r; }
 V por(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] | b.b[i]; return r; }
+// Wraparound byte add/subtract and byte-lane equality / signed greater-than compares.
+#define BYTEWISE(name, expr) \
+    V name(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>(expr); return r; }
+BYTEWISE(paddb, a.b[i] + b.b[i])
+BYTEWISE(psubb, a.b[i] - b.b[i])
+BYTEWISE(pcmpeqb, a.b[i] == b.b[i] ? 0xFFu : 0u)
+BYTEWISE(pcmpgtb, static_cast<std::int8_t>(a.b[i]) > static_cast<std::int8_t>(b.b[i]) ? 0xFFu : 0u)
+#undef BYTEWISE
 // Unsigned byte average rounded up: (a + b + 1) >> 1 without 8-bit overflow.
 V pavgb(const V& a, const V& b) {
     V r;

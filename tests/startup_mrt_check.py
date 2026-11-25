@@ -15,8 +15,7 @@ FLOAT_WORDS = (1, 2, 0x7fc00001, 0x80000001)
 INTEGER_WORD = 0x80000001
 # Typed formats whose channels are all 32 bits: DXGI value -> (shader output type, channels).
 INTEGER_FORMATS = ((42, 'uint', 1), (43, 'int', 1), (17, 'uint', 2), (18, 'int', 2), (3, 'uint', 4), (4, 'int', 4))
-# Narrower integer channels are refused until a readback shows how the hardware truncates them.
-REFUSED_INTEGER_FORMATS = (30, 32, 12, 14, 57, 59, 62, 64)
+REFUSED_INTEGER_FORMATS = (12, 14, 57, 59, 62, 64)
 
 
 def pixel(values, unorm=False):
@@ -41,8 +40,9 @@ def compile_shader(compiler, kind, stage, source, blob, listing, unoptimized=Fal
 
 
 def signature(listing):
-    return dict(re.findall(r'^\s*(?://|;)\s+SV_Target\s+(\d+)\s+\S+\s+\d+\s+\S+\s+(float|uint|s?int)\b',
-                           listing.read_text(errors='replace'), re.M))
+    targets = re.findall(r'^\s*(?://|;)\s+SV_Target\s+(\d+)\s+\S+\s+\d+\s+\S+\s+(float|uint|s?int)\b',
+                         listing.read_text(errors='replace'), re.M)
+    return {slot: 'int' if kind == 'sint' else kind for slot, kind in targets}
 
 
 def check(work, consumer, backend, kind, dxc, fxc):
@@ -96,8 +96,6 @@ def check(work, consumer, backend, kind, dxc, fxc):
         # The harness clears every target to (0, 0, 1, 1); integer channels hold those values as words.
         assert cleared == struct.pack(f'<{channels}I', *(0, 0, 1, 1)[:channels]) + bytes.fromhex('0000ffff'), cleared.hex()
         outputs = compile_pair(key)
-        if outputs.get('0') == 'sint':
-            outputs['0'] = 'int'
         assert outputs == {'0': expected_type, '1': 'float'}, outputs
         manifest = cache / f'{key}.txt'
         manifest.rename(str(manifest) + '.pending')
@@ -113,10 +111,13 @@ def check(work, consumer, backend, kind, dxc, fxc):
             for narrow in REFUSED_INTEGER_FORMATS:
                 line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {narrow} 28'
                 refused = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
-                (cache / f'req_{refused}.rtv').write_text(line)
+                marker = cache / f'req_{refused}.rtv'
+                marker.write_text(line)
                 result = gfx2hlsl.translate_request(cache, int(refused, 16))
-                assert result.startswith('unsupported: unverified '), result
+                assert re.fullmatch(rf'unsupported: unverified (UINT|SINT) RTV format {narrow}', result), result
                 assert not (cache / f'{refused}.txt').exists()
+                # Later --pending runs would retry this synthetic request on every valid format.
+                marker.unlink()
             print(f'{kind} {backend} narrow integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
             # A pre-existing base translation may lack its original request files.
             base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'
@@ -131,6 +132,26 @@ def check(work, consumer, backend, kind, dxc, fxc):
     assert 'RTV manifest mismatch' in log and 'desktop pipeline for' not in log, log
     assert pixels.hex() == '000000000000ffff', pixels.hex()
     print(f'{kind} {backend} stale signedness control: refused before PSO creation')
+
+    # Distinguish signed and unsigned saturation from writing the low eight bits.
+    ps.write_bytes(pixel((0xffffffff, 0xffffff7f, 0x80, 0x100), unorm=True))
+    for fmt, expected_type, rgba in ((30, 'uint', 'ffff80ff'), (32, 'int', 'ff807f7f')):
+        key, cleared = request(fmt, (fmt, 28))
+        assert cleared == bytes.fromhex('000001010000ffff'), cleared.hex()
+        outputs = compile_pair(key)
+        assert outputs == {'0': expected_type, '1': 'float'}, outputs
+        pixels, _ = draw(fmt)
+        assert pixels == bytes.fromhex(rgba + 'ff0000ff'), pixels.hex()
+        source = (cache / f'{key}.ps.hlsl').read_text()
+        end = '    return o;'
+        assert source.count(end) == 1
+        trunc = 'o.mrt0 & 255u' if fmt == 30 else 'asint(asuint(o.mrt0) << 24u) >> 24u'
+        wrong = cache / f'{key}.low-byte.hlsl'
+        wrong.write_text(source.replace(end, f'    o.mrt0 = {trunc};\n{end}'))
+        compile_shader(compiler, kind, 'ps', wrong, cache / f'{key}.ps.cso', cache / f'{key}.low-byte.asm')
+        control, _ = draw(fmt)
+        assert control == bytes.fromhex('ff7f8000ff0000ff'), control.hex()
+        print(f'{kind} {backend} RGBA8 {expected_type} MRT0={rgba}; low-byte control={control[:4].hex()}')
 
     ps.write_bytes(pixel(FLOAT_WORDS))
     key, _ = request(2, (2,))

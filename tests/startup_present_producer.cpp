@@ -29,6 +29,7 @@ int main(int argc, char** argv)
     const bool reverse = argc >= 2 && std::strcmp(argv[1], "reverse") == 0;
     const bool use_magenta = argc >= 2 && std::strcmp(argv[1], "auto-magenta") == 0;
     const bool automatic = use_magenta || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
+    const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
@@ -108,8 +109,29 @@ int main(int argc, char** argv)
         call(queue, 10, 1, arg(lists));
         return finish();
     };
-    if (!emit(automatic ? chosen : blue) || !present()) return 8; // discover the title's present surface
-    if (automatic) {
+    if (barriers) {
+        D3D12_RESOURCE_DESC uav_desc = desc;
+        uav_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        void* uav = nullptr;
+        if (FAILED(slot<Create>(device, 27)(device, &properties, D3D12_HEAP_FLAG_NONE, &uav_desc,
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource), &uav)) ||
+            !uav || !ok(call(list, 139, arg(allocator)))) return 15;
+        D3D12_RESOURCE_BARRIER records[7]{};
+        records[0].Type = records[2].Type = records[3].Type = records[4].Type = records[5].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        records[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        records[2].UAV.pResource = static_cast<ID3D12Resource*>(uav);
+        records[3].UAV.pResource = static_cast<ID3D12Resource*>(target); // lacks UAV access
+        records[4].UAV.pResource = reinterpret_cast<ID3D12Resource*>(1); // unrecognized wrapper
+        records[5].Flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+        records[6].Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        if (call(list, 26, std::size(records), arg(records)) != 0 || call(list, 26, 1, 1) != 0 ||
+            !ok(call(list, 9)) || call(list, 26, 1, arg(records)) != 0) return 16;
+        void* lists[]{list};
+        call(queue, 10, 1, arg(lists));
+        if (!finish()) return 17;
+    } else if (!emit(automatic ? chosen : blue) || !present()) {
+        return 8; // discover the title's present surface
+    } else if (automatic) {
         // #1 matches too early; #3 changes color, #4 almost matches and #5 matches again.
         // The delayed sample at #6 arms #7 and #8, then a blue write at #9 is out of range.
         if (!present() || !emit(use_magenta ? red : green) || !present() || !emit(use_magenta ? near_magenta : near_red) || !present() ||

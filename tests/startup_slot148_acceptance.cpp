@@ -34,6 +34,19 @@
 // Separately, an observer queue on the same desktop device reads the resolved GPU ranges while the
 // submissions are held.
 //
+// Preflight. The held-phase observer read needs a second queue to make progress while the console
+// queue waits on an unsignalled fence. Before the steps, the console queue waits on such a fence and
+// the observer reads the sentinel with a 1 s limit; the fence is then signalled and both queues
+// drained. If the read did not finish, the client prints "queues serialized: held-phase checks not
+// applicable" and skips only the three held-phase observer reads. All other checks still run,
+// including the in-list readback staying zero while held (a CPU read). The final line then
+// begins "slot 148 acceptance passed with skips". X2W_TEST_FORCE_SERIALIZED_QUEUES=1 (fixtures
+// only) takes that path on any adapter.
+//
+// Cleanup. Every return opens the gate and drains the console queue, and the client drains both
+// queues before it exits. Each wait is bounded at 10 s. If a drain does not finish, the desktop
+// objects that work may still use are kept rather than released.
+//
 // Payloads are non-uniform: byte i of payload s is (i * 29 + 0x5b) ^ s. A and B use the #2068
 // values 0xa1 and 0xb2 as seeds, the stale fill 0x5c and the sentinel 0xe7. Any two payloads
 // differ at every byte, and a read shifted by 4 or 16 bytes differs at every byte.
@@ -75,10 +88,10 @@
 // address; 13 an allocation after a successful Close was not refused, or the closed range still
 // resolved; 14 invalid arguments not refused or alignment not honoured; 15 observer payload
 // mismatch; 16 overwrite control did not read B; 17 reuse control: B reuses A's range but A's read
-// did not show B; 18 ordering (console work ran before the gate opened, or a timeout); 19 device
-// removed or debug-layer errors; 20 A's range was handed to B while A was held; 21 the advertised
-// slot refused a valid request; 22 an in-list read ran before its submission was released; 23
-// in-list payload mismatch; 24 the resolver accepted a range of another list or from before a
+// did not show B; 18 ordering (console work ran before the gate opened, a timeout, or a preflight
+// that did not drain); 19 device removed or debug-layer errors; 20 A's range was handed to B while
+// A was held; 21 the advertised slot refused a valid request; 22 an in-list read ran before its
+// submission was released; 23 in-list payload mismatch; 24 the resolver accepted a range of another list or from before a
 // Reset; 25 slot 43 bound a range of another list or from before a Reset; 2 to 5 usage and setup.
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
@@ -230,6 +243,7 @@ struct Client {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> copy;
     Reads observed;
+    bool serialized = false;  // from the preflight: the held-phase observer reads cannot run
 
     void* fence()
     {
@@ -430,11 +444,38 @@ struct Client {
                SUCCEEDED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&observer_fence))) &&
                make_reads(observed);
     }
-    // The observer: copies [first, first + 0x280) and [second, second + 0x280) on the GPU, in order.
-    bool read(Word first, Word second, std::vector<unsigned char>& out)
+    enum class ObserverResult { complete, timeout, failure };
+
+    static ObserverResult wait_observer(ID3D12Fence* fence, UINT64 value, DWORD ms)
     {
-        if (FAILED(observer_allocator->Reset()) || FAILED(observer_list->Reset(observer_allocator.Get(), copy.Get())))
-            return false;
+        if (fence->GetCompletedValue() >= value) return ObserverResult::complete;
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) return ObserverResult::failure;
+        const DWORD waited = SUCCEEDED(fence->SetEventOnCompletion(value, event))
+            ? WaitForSingleObject(event, ms) : WAIT_FAILED;
+        CloseHandle(event);
+        if (waited == WAIT_OBJECT_0) return ObserverResult::complete;
+        if (waited == WAIT_TIMEOUT) return ObserverResult::timeout;
+        return ObserverResult::failure;
+    }
+    // Bounded drains: every submission on the observer or console queue so far has completed.
+    bool drain_observer()
+    {
+        return !observer_fence ||
+            wait_observer(observer_fence.Get(), observer_value, kWaitMs) == ObserverResult::complete;
+    }
+    bool drain_console()
+    {
+        void* drained = queue ? fence() : nullptr;
+        return !queue || (drained && ok(invoke(queue, kQueueSignal, arg(drained), 1)) && reached(drained, 1));
+    }
+    // The observer: copies [first, first + 0x280) and [second, second + 0x280) on the GPU, in order. A
+    // read that does not finish within `ms` stays pending; drain_observer() waits for it.
+    ObserverResult read(Word first, Word second, std::vector<unsigned char>& out, DWORD ms = kWaitMs)
+    {
+        if (!drain_observer() || FAILED(observer_allocator->Reset()) ||
+            FAILED(observer_list->Reset(observer_allocator.Get(), copy.Get())))
+            return ObserverResult::failure;
         observer_list->SetComputeRootSignature(root.Get());
         const Word sources[] = {first, second};
         for (Word i = 0; i < 2; ++i) {
@@ -447,15 +488,55 @@ struct Client {
         observer_list->CopyBufferRegion(observed.readback.Get(), 0, observed.target.Get(), 0, 2 * kBytes);
         transition(observer_list.Get(), observed.target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (FAILED(observer_list->Close())) return false;
+        if (FAILED(observer_list->Close())) return ObserverResult::failure;
         ID3D12CommandList* lists[] = {observer_list.Get()};
         observer->ExecuteCommandLists(1, lists);
-        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        const bool finished = event && SUCCEEDED(observer->Signal(observer_fence.Get(), ++observer_value)) &&
-                              SUCCEEDED(observer_fence->SetEventOnCompletion(observer_value, event)) &&
-                              WaitForSingleObject(event, kWaitMs) == WAIT_OBJECT_0;
-        if (event) CloseHandle(event);
-        return finished && map_bytes(observed.readback.Get(), out);
+        if (FAILED(observer->Signal(observer_fence.Get(), ++observer_value))) return ObserverResult::failure;
+        const auto result = wait_observer(observer_fence.Get(), observer_value, ms);
+        if (result != ObserverResult::complete) return result;
+        return map_bytes(observed.readback.Get(), out) ? ObserverResult::complete : ObserverResult::failure;
+    }
+
+    // Preflight: can the observer queue finish a read while the console queue waits on an unsignalled
+    // fence? The held phase needs that. Returns 1 if it can, 0 if the queues are serialized, and -1 if
+    // the probe's work did not drain after the fence was signalled or read the wrong bytes.
+    int queues_progress()
+    {
+        void* probe_gate = fence();
+        if (!probe_gate || !ok(invoke(queue, kQueueWait, arg(probe_gate), 1))) return -1;
+        std::vector<unsigned char> bytes;
+        const Word base = sentinel->GetGPUVirtualAddress();
+        const auto observed_result = read(base, base, bytes, 1000);
+        const bool opened = ok(invoke(probe_gate, kFenceSignal, 1));
+        const bool observer_drained = drain_observer();
+        const bool console_drained = drain_console();
+        if (!opened || !observer_drained || !console_drained || observed_result == ObserverResult::failure)
+            return -1;
+        if (observed_result == ObserverResult::timeout && !map_bytes(observed.readback.Get(), bytes)) return -1;
+        for (Word i = 0; i < 2 * kBytes; ++i)
+            if (bytes[i] != pattern(kSentinel, i % kBytes)) return -1;
+        return observed_result == ObserverResult::complete ? 1 : 0;
+    }
+
+    // Leaves no work pending at exit: drains both queues (bounded). If a drain does not finish, the
+    // desktop objects are kept (leaked) rather than released while the GPU may still use them.
+    ~Client()
+    {
+        const bool observer_drained = drain_observer();
+        const bool console_drained = drain_console();
+        if (observer_drained && console_drained) return;
+        std::printf("cleanup: queues did not drain within %lu ms; desktop objects are kept\n",
+                    static_cast<unsigned long>(kWaitMs));
+        observed.target.Detach();
+        observed.readback.Detach();
+        sentinel.Detach();
+        observer_list.Detach();
+        observer_allocator.Detach();
+        observer.Detach();
+        observer_fence.Detach();
+        copy.Detach();
+        root.Detach();
+        desktop.Detach();
     }
 
     UINT64 debug_errors()
@@ -493,10 +574,21 @@ bool matches(const std::vector<unsigned char>& bytes, Word slot, Word from, Word
 
 enum class Mode { fresh, allocator, overwrite };
 
-// Opens the gate on every return, so a failed check never leaves the console queue blocked.
+// On every return: opens the gate and drains the console queue (bounded). If the queue does not
+// drain, the read buffers are kept (leaked), so nothing the GPU may still use is released.
 struct Gate {
+    Client& c;
     void* fence;
-    ~Gate() { invoke(fence, kFenceSignal, 1); }
+    Reads& reads;
+    ~Gate()
+    {
+        invoke(fence, kFenceSignal, 1);
+        if (c.drain_console()) return;
+        std::printf("cleanup: the console queue did not drain within %lu ms; the read buffers are kept\n",
+                    static_cast<unsigned long>(kWaitMs));
+        reads.target.Detach();
+        reads.readback.Detach();
+    }
 };
 
 // Submit A behind a gate, Reset, write and submit B, read both while held, then release the gate.
@@ -515,7 +607,7 @@ int held_sequence(Client& c, Mode mode)
     if (const int result = c.traced(list, label, first)) return result;
     if (const int result = c.write_and_record(list, first, kPayloadA, listed, 0)) return result;
     if (const int result = c.close(list, label, &first)) return result;
-    const Gate held{gate};
+    const Gate held{c, gate, listed};
     if (!ok(invoke(c.queue, kQueueWait, arg(gate), 1)) || !c.submit(list, done, 1)) return setup;
 
     // Reset while A is held: on another allocator, or on A's own allocator after resetting it.
@@ -544,11 +636,23 @@ int held_sequence(Client& c, Mode mode)
     if (!map_bytes(listed.readback.Get(), early)) return setup;
     const bool untouched = std::all_of(early.begin(), early.end(), [](unsigned char v) { return v == 0; });
     const Word before = invoke(done, kFenceCompleted);
-    const bool read = c.read(first.gpu, second.gpu, observed);
-    const Word after = invoke(done, kFenceCompleted);
-    std::printf("%s: while held, in-list readback untouched = %d; console submissions completed before the "
-                "observer read %llu, after it %llu (expected 1, 0, 0)\n",
-                label, untouched ? 1 : 0, static_cast<unsigned long long>(before), static_cast<unsigned long long>(after));
+    bool read = true;
+    Word after = 0;
+    if (c.serialized) {
+        std::printf("%s: while held, in-list readback untouched = %d; console submissions completed %llu "
+                    "(expected 1, 0); queues serialized: held-phase observer read not applicable\n",
+                    label, untouched ? 1 : 0, static_cast<unsigned long long>(before));
+    } else {
+        read = c.read(first.gpu, second.gpu, observed) == Client::ObserverResult::complete;
+        after = invoke(done, kFenceCompleted);
+        std::printf("%s: while held, in-list readback untouched = %d; console submissions completed before the "
+                    "observer read %llu, after it %llu (expected 1, 0, 0)\n",
+                    label, untouched ? 1 : 0, static_cast<unsigned long long>(before),
+                    static_cast<unsigned long long>(after));
+        if (!read)
+            std::printf("%s: the observer read did not finish within %lu ms while the gate was closed\n", label,
+                        static_cast<unsigned long>(kWaitMs));
+    }
     if (!untouched) return list_read_order;
     const bool opened = ok(invoke(gate, kFenceSignal, 1));
     if (!read || before || after || !opened || !Client::reached(done, 2)) return ordering;
@@ -558,10 +662,13 @@ int held_sequence(Client& c, Mode mode)
     const int a_failure = mode == Mode::overwrite ? overwrite_control : mode == Mode::allocator ? held_reuse : 0;
     if (!matches(recorded, 1, 0, kBytes, kPayloadB, "in-list B")) return list_payload;
     if (!matches(recorded, 0, 0, kBytes, wanted, "in-list A")) return a_failure ? a_failure : list_payload;
-    if (!matches(observed, 1, 0, kBytes, kPayloadB, "observer B")) return payload;
-    if (!matches(observed, 0, 0, kBytes, wanted, "observer A")) return a_failure ? a_failure : payload;
-    std::printf("%s: in-list and observer reads: A holds payload 0x%02x and B payload 0x%02x, all %llu bytes\n", label,
-                wanted, kPayloadB, static_cast<unsigned long long>(kBytes));
+    if (!c.serialized) {
+        if (!matches(observed, 1, 0, kBytes, kPayloadB, "observer B")) return payload;
+        if (!matches(observed, 0, 0, kBytes, wanted, "observer A")) return a_failure ? a_failure : payload;
+    }
+    std::printf("%s: %s reads: A holds payload 0x%02x and B payload 0x%02x, all %llu bytes\n", label,
+                c.serialized ? "in-list" : "in-list and observer", wanted, kPayloadB,
+                static_cast<unsigned long long>(kBytes));
     return pass;
 }
 
@@ -586,7 +693,7 @@ int forced_reuse(Client& c)
     // A's range is live again as part of B, so reading it is defined. Byte i of A's range is byte
     // i - shift of B, where shift is B's start relative to A's.
     std::vector<unsigned char> bytes;
-    if (!c.read(first.gpu, second.gpu, bytes)) return ordering;
+    if (c.read(first.gpu, second.gpu, bytes) != Client::ObserverResult::complete) return ordering;
     const Word from = second.gpu > first.gpu ? second.gpu - first.gpu : 0;
     const Word to = (std::min)(kBytes, second.gpu + kBytes - first.gpu);
     for (Word i = from; i < to; ++i) {
@@ -607,8 +714,13 @@ int forced_reuse(Client& c)
 bool run_reads(Client& c, void* list, Reads& reads, std::vector<unsigned char>& out)
 {
     void* done = c.fence();
-    return done && ok(invoke(list, kCloseSlot)) && c.submit(list, done, 1) && Client::reached(done, 1) &&
-           map_bytes(reads.readback.Get(), out);
+    const bool submitted = done && ok(invoke(list, kCloseSlot)) && c.submit(list, done, 1);
+    if (submitted && Client::reached(done, 1)) return map_bytes(reads.readback.Get(), out);
+    if (!c.drain_console()) {
+        reads.target.Detach();
+        reads.readback.Detach();
+    }
+    return false;
 }
 
 // The wrong-list and stale-generation controls for the resolver and the guest consumer.
@@ -722,6 +834,17 @@ int main(int argc, char** argv)
         !c.consumer_setup())
         return setup;
 
+    // Preflight for the held phase. X2W_TEST_FORCE_SERIALIZED_QUEUES=1 (fixtures only) takes the
+    // serialized path on any adapter, so that path is tested where the queues do make progress.
+    const int progress = c.queues_progress();
+    const bool forced = GetEnvironmentVariableA("X2W_TEST_FORCE_SERIALIZED_QUEUES", debug, sizeof(debug)) && debug[0] == '1';
+    std::printf("preflight: the observer queue %s while the console queue waited on an unsignalled fence%s\n",
+                progress > 0 ? "finished a read" : progress == 0 ? "made no progress" : "failed the probe",
+                forced ? "; X2W_TEST_FORCE_SERIALIZED_QUEUES=1" : "");
+    if (progress < 0) return ordering;
+    c.serialized = forced || progress == 0;
+    if (c.serialized) std::puts("queues serialized: held-phase checks not applicable");
+
     int result = held_sequence(c, Mode::fresh);
     if (!result) result = held_sequence(c, Mode::allocator);
     if (!result) result = held_sequence(c, Mode::overwrite);
@@ -733,7 +856,10 @@ int main(int argc, char** argv)
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
                 static_cast<unsigned long long>(errors));
     if (!result && (removed != S_OK || errors)) result = device_state;
-    if (!result) std::puts("slot 148 acceptance passed");
-    else std::printf("slot 148 acceptance failed: exit %d\n", result);
+    if (result) std::printf("slot 148 acceptance failed: exit %d\n", result);
+    else if (c.serialized)
+        std::puts("slot 148 acceptance passed with skips: held-phase observer reads in fresh, allocator and overwrite "
+                  "(queues serialized); every other check ran");
+    else std::puts("slot 148 acceptance passed");
     return result;
 }

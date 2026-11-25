@@ -189,6 +189,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
 // Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
+    X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
     if (p.failed || !queue || !surface) return false;
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();

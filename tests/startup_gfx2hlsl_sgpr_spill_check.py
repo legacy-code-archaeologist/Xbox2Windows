@@ -214,7 +214,7 @@ def draw(renderer, adapter, vs, ps, expected):
                           str(expected)], capture_output=True, text=True)
     if run.returncode == 77:
         print(run.stdout + run.stderr)
-        sys.exit(77)
+        sys.exit(1 if failures else 77)
     return run
 
 

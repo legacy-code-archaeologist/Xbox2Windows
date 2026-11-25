@@ -296,6 +296,31 @@ void check_address_textures()
     v.Texture2DArray.ArraySize = 2; fits("last two slices", true);
     v.Texture2DArray.ArraySize = ~0u; fits("unspecified array size", false);
     v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; fits("cube view", false);
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    v.Texture3D.MipLevels = 10;
+    fits("3D view on 2D chain", false);
+
+    D3D12_RESOURCE_DESC vol = texture(32, 32, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    vol.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    vol.DepthOrArraySize = 16;
+    v = {};
+    v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.Texture2D.MipLevels = 4;
+    if (x2w_startup::address_view_fits(vol, v)) fail("2D view on 3D volume");
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    v.Texture3D.MipLevels = 4;
+    if (!x2w_startup::address_view_fits(vol, v)) fail("whole 3D volume view");
+    v.Texture3D.MostDetailedMip = 2;
+    v.Texture3D.MipLevels = 2;
+    if (!x2w_startup::address_view_fits(vol, v)) fail("sub-mip 3D volume view");
+    v.Texture3D.MipLevels = 3;
+    if (x2w_startup::address_view_fits(vol, v)) fail("3D volume view past mip count");
+    v.Texture3D.MostDetailedMip = 0;
+    v.Texture3D.MipLevels = 4;
+    v.Texture3D.ResourceMinLODClamp = 1.0f;
+    if (x2w_startup::address_view_fits(vol, v)) fail("3D volume view explicit LOD clamp");
 }
 } // namespace
 
@@ -317,6 +342,6 @@ int main(int argc, char** argv)
         std::printf("startup_gfx10_layout: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 9 round trips, 11 refusals, 19 address descriptions, 21 views)\n");
+    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 9 round trips, 11 refusals, 19 address descriptions, 27 views)\n");
     return 0;
 }

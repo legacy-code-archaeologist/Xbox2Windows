@@ -29,6 +29,8 @@ reads the read buffer at that index and stores to its own destination:
 - case H is case J's shape with a nested if inside the skipped block (s_and_saveexec, restored with s_or of the
   saved mask): lanes tid.x < 3 store two words, lanes 3-5 one word, the rest none.
 - case G reads two independently offset LDS dwords with the address in the first destination VGPR.
+- cases L-uint and L-unorm use the same formatted load with native descriptor stride and word 3 supplied by the
+  harness. The descriptor selects unaligned UINT16 pairs or an UNORM8 field and permutes the outputs.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -331,6 +333,28 @@ WORDS_G = bytes.fromhex(
     '06038abe80038bbe05030cf4000000fa7fc08cbf0783148f14000a3a9f0a0a36820a0a3482000834100034d804050000'
     '7fc08cbf00008abfff080c367c0000000524dcd8060000067fc08cbf0786158f1500124a83121234001074e009060480000081bf')
 
+SOURCE_L = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+v_mov_b32 v1, 1
+buffer_load_format_xyzw v[5:8], v[0:1], s[12:15], 0 idxen offen offset:2
+s_waitcnt vmcnt(0)
+v_lshlrev_b32 v4, 4, v0
+buffer_store_dwordx4 v[5:8], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_L = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '8102027e' '02300ce000050380'
+    '703f8cbf' '84000834' '001078e004050480' '000081bf')
+LOAD_L = bytes.fromhex('02300ce000050380')
+L_STRIDE = 6
+L_WORD3 = {
+    'L-uint': (27 << 12) | 5 | (4 << 3) | (1 << 6),  # Y, X, one, zero
+    'L-unorm': (1 << 12) | 1 | (4 << 3) | (7 << 6) | (5 << 9),  # one, X, W, Y
+}
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -344,6 +368,7 @@ CASES = {
     'H': (SOURCE_H, WORDS_H, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'K': (SOURCE_K, WORDS_K, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1)),
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
+    **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -412,6 +437,11 @@ STRIDE_CLEAR = 's_and_b32 s17, s17, 0xc000ffff'
 CASES['I'] = (SOURCE_A.replace('buffer_store_dword', STRIDE_CLEAR + '\nbuffer_store_dword'), splice(STRIDE_CLEAR),
               *CASES['A'][2:])
 
+# Replace the nonzero stride constant in s5 with the first active lane of a
+# fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
+CASES['A-ff1'] = ('s_ff1_i32_b32 s5, exec_lo\n' + SOURCE_A,
+                  bytes.fromhex('7e1385be') + WORDS_A, *CASES['A'][2:])
+
 
 def root_blob(constants=2, table_range=False):
     """RTS0: param 0 = root constants (b0), param 1 = a descriptor table with no ranges.
@@ -434,11 +464,33 @@ def input_word(i):
     return (0x8b02a7f1 + i * 0x413b1) & MASK  # tests/compute_check.cpp fills the read buffer this way
 
 
+def formatted_input():
+    # Every selected R8_UNORM field is an exact endpoint, while the UINT16 halves
+    # are all distinct and the neighbouring bytes are nonzero.
+    data = bytearray(b'\x7b' * (WORDS * 4))
+    for lane in range(16):
+        at = 6 * lane + 3
+        data[at:at + 4] = bytes([255 * (lane % 2), 31 + lane, 62 + lane, 96 + lane])
+    return data
+
+
 def expected(name):
     if name == 'I':
         return expected('A')
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name in L_WORD3:
+        data = formatted_input()
+        for lane in range(16):
+            at = 6 * lane + 3
+            if name == 'L-uint':
+                low, high = struct.unpack_from('<HH', data, at)
+                result = (high, low, 1, 0)
+            else:
+                one = 0x3f800000
+                result = (one, one if data[at] == 255 else 0, one, 0)
+            out[4 * lane:4 * lane + 4] = result
+        return out
     producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
     if name in producer_offsets:
         # The original fill begins at dword 4, the single-field variants at dword 0.
@@ -476,9 +528,10 @@ def expected(name):
                 for tz in range(local[2]):
                     for ty in range(local[1]):
                         for tx in range(local[0]):
-                            if name == 'A':
+                            if name in ('A', 'A-ff1'):
                                 i = (gx + 3 * gy + 6 * gz) * 24 + tx + 2 * ty + 6 * tz
-                                out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * STRIDE) & MASK)
+                                stride = 0 if name == 'A-ff1' else STRIDE
+                                out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * stride) & MASK)
                             elif name == 'K':
                                 i = gx * 8 + tx
                                 if gx == 1:  # only group 1's wave enters the block
@@ -674,10 +727,39 @@ def check_lds():
     assert 'groupshared' not in translate('A', rsrc2=CASES['A'][2] | 1 << 15).hlsl_cs()
 
 
+def check_formatted_loads():
+    manifest = translate('L-uint').manifest()
+    assert manifest.endswith('udsrc 2 stride 0\nudsrc 3 descword3 0\nsrv 0 buf table 1 0\nuav 0 table 1 16\n'), manifest
+    prefix = WORDS_L[:WORDS_L.index(LOAD_L)]
+    end = bytes.fromhex('000081bf')
+    for width in range(1, 5):
+        load = LOAD_L[:2] + bytes([4 * (width - 1)]) + LOAD_L[3:]
+        hlsl = translate('L-uint', code=prefix + load + end).hlsl_cs()
+        assert 'a = v0 * ud2 + v1 + 2;' in hlsl
+        assert hlsl.count(' = ((ud3 >> ') == width
+    # Word 3 is overwritten in an otherwise intact native descriptor.
+    refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
+    # At a branch target, there is no local descriptor load to prove.
+    refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
+    local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
+    assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
+
+
 def check_controls():
+    ff1 = bytes.fromhex('7e1385be')
+    end = bytes.fromhex('000081bf')
+    # A write to EXEC can disable lane zero; a backward branch can re-enter
+    # the instruction with a different mask even at code offset zero.
+    for code in (bytes.fromhex('8003febe') + ff1 + end,
+                 ff1 + bytes.fromhex('feff82bf') + end):
+        refused('compute entry EXEC mask', lambda: translate('A', code=code))
+    refused('requires compute exec_lo', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
+    assert 's5 = 0u;' in translate('A-ff1').hlsl_cs()
+    assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
     check_mbcnt()
+    check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
     assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
@@ -904,9 +986,12 @@ CONTROLS = {
     'g-swapped-offsets': ('G', 'v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];',
                           'v6 = lds[(a + 144u) >> 2];\n    v7 = lds[(a + 20u) >> 2];'),
     'g-overlap': ('G', 'v7 = lds[(a + 144u)', 'v7 = lds[(v6 + 144u)'),
+    'l-byte-offset': ('L-uint', 'a = v0 * ud2 + v1 + 2;', 'a = v0 * ud2 + 2;'),
+    'l-swizzle': ('L-unorm', 'v6 = ((ud3 >> 3)', 'v6 = ((0u >> 3)'),
+    'l-integer-one': ('L-uint', 'c1 = w >> 16; c2 = 0u; c3 = 1u; one = 1u;', 'c1 = w >> 16; c2 = 0u; c3 = 1u;'),
 }
 
-# First bad word for the masked bit-count and paired LDS read controls.
+# First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
@@ -916,6 +1001,9 @@ CONTROL_MISMATCH = {
     'd-exec': 'word=2 expected=ffffffff actual=00000000',
     'g-swapped-offsets': 'word=0 expected=00000004 actual=00000000',
     'g-overlap': 'word=1 expected=00000000 actual=00000004',
+    'l-byte-offset': 'word=0 expected=0000603e actual=00003e1f',
+    'l-swizzle': 'word=5 expected=3f800000 actual=00000000',
+    'l-integer-one': 'word=2 expected=00000001 actual=3f800000',
 }
 
 
@@ -934,8 +1022,12 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
     subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', str(cso), str(src)], check=True)
     groups = CASES[name][4]
     constants = [KEY, STRIDE] + [0] * 14
+    source = b''
+    if name in L_WORD3:
+        constants[2:4] = [L_STRIDE, L_WORD3[name]]
+        source = formatted_input()
     case.write_bytes(struct.pack('<I', groups[0] | groups[1] << 8 | groups[2] << 16)
-                     + struct.pack('<%dI' % WORDS, *expected(name)) + struct.pack('<16I', *constants))
+                     + struct.pack('<%dI' % WORDS, *expected(name)) + struct.pack('<16I', *constants) + source)
     return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
 
 
@@ -950,6 +1042,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             runs = [(CONTROLS[control][0], control)]
         else:
             runs = [(name, None) for name in CASES]
+            runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
         for name, mutation in runs:
             run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
             print(run.stdout, end='')

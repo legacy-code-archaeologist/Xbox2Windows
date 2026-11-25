@@ -37,6 +37,9 @@ excluding the 28 forms carved out to cpu_vex_aot.py (PR #325)):
     encoding stays with cpu_vex_aot.py.
   - 256-bit (VEX.L=1, AVX2, register operands only) horizontal add / subtract: vphaddw/d/sw,
     vphsubw/d/sw. Each 128-bit lane is computed independently.
+  - 256-bit (VEX.L=1, AVX2, register operands only) pack with saturation: vpacksswb, vpackssdw,
+    vpackusdw. Each 128-bit lane is computed independently (128-bit vpackuswb stays with
+    cpu_vex_aot.py).
 
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 flat 32/64-bit GPR load/store mov for scratch GPRs, and terminal ret.
@@ -91,6 +94,7 @@ WIDE_BINARY_HELPERS = {
         "vpsubsb", "vpsubsw", "vpsubusb", "vpsubusw",
         "vphaddw", "vphaddd", "vphaddsw", "vphsubw", "vphsubd", "vphsubsw",
         "vpmuldq", "vpmuludq", "vpmulhrsw", "vpsadbw",
+        "vpacksswb", "vpackssdw", "vpackusdw",
     )
 }
 WIDE_BINARY_CODES = {
@@ -107,6 +111,7 @@ WIDE_BINARY_CODES = {
         "VPSUBSB", "VPSUBSW", "VPSUBUSB", "VPSUBUSW",
         "VPHADDW", "VPHADDD", "VPHADDSW", "VPHSUBW", "VPHSUBD", "VPHSUBSW",
         "VPMULDQ", "VPMULUDQ", "VPMULHRSW", "VPSADBW",
+        "VPACKSSWB", "VPACKSSDW", "VPACKUSDW",
     )
 }
 # 256-bit one-source forms: the 128-bit helper runs on each half. vpshufhw/vpshuflw use the

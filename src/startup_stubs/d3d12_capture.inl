@@ -15,6 +15,8 @@ struct PipelineInfo {
     D3D12_BLEND_DESC stream_blend{};
     bool has_stream_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    bool has_stream_rasterizer = false;
+    D3D12_RASTERIZER_DESC stream_rasterizer{};
     DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
@@ -94,7 +96,8 @@ bool title_backed(u64 title_handle, u64 bytes)
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
                    Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
                    const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
-                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN,
+                   const D3D12_RASTERIZER_DESC* rasterizer = nullptr)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -105,6 +108,10 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
     if (depth_stencil) {
         info.stream_depth_stencil = *depth_stencil;
         info.has_stream_depth_stencil = true;
+    }
+    if (rasterizer) {
+        info.stream_rasterizer = *rasterizer;
+        info.has_stream_rasterizer = true;
     }
     info.stream_dsv_format = dsv_format;
     info.path = path;
@@ -169,11 +176,41 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+// Resources by the title memory they start at (note_lock held), for the memory SRV lookups. An entry stays
+// as long as the resource's record in resource_infos does (never pruned); every lookup applies its own
+// live-reference filter, so a released resource is skipped there and found again if it is referenced again.
+x2w_startup::AddressIndex<const Wrapper*>& resource_address_index() { static x2w_startup::AddressIndex<const Wrapper*> m; return m; }
+// X2W_RESOURCE_INDEX_CHECK=1 checks the index on every memory SRV call (check_resource_address_index);
+// =2 is the negative control: the same check with index inserts skipped, which it must report.
+int resource_index_check_mode()
+{
+    // Only "1" and "2" turn it on; anything else, including a value too long for the buffer, is off.
+    static const int mode = [] {
+        char v[4]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_RESOURCE_INDEX_CHECK", v, sizeof(v));
+        return n == 1 && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+    }();
+    return mode;
+}
+u64 resource_index_extent(const ResourceInfo& info)
+{
+    return (std::max)(info.bytes, info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0);
+}
+// The index entry of a resource whose record is already published (publish_placement's hook); may throw.
+void index_resource(const Wrapper* w, const ResourceInfo& info)
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (!base || resource_index_check_mode() == 2) return;
+    resource_address_index().insert(base, resource_index_extent(info), w);
+}
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
-    resource_infos()[w] = ResourceInfo{*console, bytes};
+    const ResourceInfo info{*console, bytes};
+    // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
+    x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
+        resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
 }
 void retire_placement(Wrapper* w)
 {

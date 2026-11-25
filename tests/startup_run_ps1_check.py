@@ -4,8 +4,8 @@
 On Windows the script runs under every PowerShell found (powershell is Windows
 PowerShell 5.1, pwsh is PowerShell 7) in a scratch tree whose debug_launch.py
 is a stub, so no process is ever started under a debugger. On other hosts,
-without a PowerShell, or with --text-only, only the text after the debugger
-call is checked. Mutated copies of the script must fail the same checks.
+without a PowerShell, or with --text-only, the launcher statements are checked
+as text. Mutated copies of the script must fail the same checks.
 """
 import json
 import os
@@ -24,12 +24,14 @@ HEAD_LINES = 5  # run.ps1 prints this many lines of "<LogDir>.out"
 # prints seven lines and exits with the code under test.
 STUB = """\
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-Path(__file__).with_name("argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+record = [sys.argv[1:], os.environ.get("X2W_TRACE_API")]
+Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
 watch = Path(__file__).with_name("watch.json")
 deadline = time.monotonic() + 30
@@ -120,7 +122,7 @@ def alive(pid):
 
 
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False):
+             early_exit=False, trace_api_env=None):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -145,6 +147,10 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
     env["NO_COLOR"] = "1"
     env.pop("X2W_FAKE_USER", None)
+    if trace_api_env is None:
+        env.pop("X2W_TRACE_API", None)
+    else:
+        env["X2W_TRACE_API"] = trace_api_env
     if fake_user_env:
         env["X2W_FAKE_USER"] = "1"
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
@@ -184,10 +190,11 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         found.append(f"stub exit {code}: {summary.name} does not hold the debugger's output")
     want = [str(exe), str(data), str(log), "--timeout", "9", "--memory-gib", "3",
             "--trace-files", "1", "--continue-asserts", "4", *passed]
-    record = startup / "argv.json"
+    record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
-    if got != want:
-        found.append(f"stub exit {code}: the debugger received {got}, expected {want}")
+    expected = [want, "1" if "-TraceApi" in switches else trace_api_env]
+    if got != expected:
+        found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API] was {got}, expected {expected}")
     watch = startup / "watch.json"
     if translate:
         started = json.loads(watch.read_text(encoding="utf-8")) if watch.is_file() else None
@@ -217,6 +224,8 @@ def run_problems(shell, script, work, first_only):
         return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
+    found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
+    found += run_case(shell, script, 0, work, trace_api_env="1")
     if found and first_only:
         return found
     found += run_case(shell, script, 7, work, translate=True)
@@ -252,6 +261,12 @@ def text_problems(script):
         found.append("the log head is not printed between the capture and the exit")
     if not FAKE_USER_WARN.search(code):
         found.append("missing Write-Warning when -FakeUser is not passed")
+    before = "\n".join(statements[:calls[0]])
+    if not re.search(r"^\[switch\]\s*\$TraceApi\b", before, re.I | re.M):
+        found.append("missing -TraceApi switch")
+    if not re.search(r"""^if\s*\(\s*\$TraceApi\s*\)\s*\{\s*\$env:X2W_TRACE_API\s*=\s*["']1["']\s*\}""",
+                     before, re.I | re.M):
+        found.append("missing -TraceApi environment opt-in before launch")
     if not WATCH_CLEANUP.search("\n".join(after)):
         found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found

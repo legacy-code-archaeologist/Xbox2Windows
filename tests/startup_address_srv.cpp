@@ -484,7 +484,8 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.view.Buffer.StructureByteStride = 4;
     structured.address = ptr(buf0);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
-    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    // An acceleration-structure view of a placed buffer that is not in the acceleration-structure state is
+    // refused (as_wrong_state); draw(4) proves the structured descriptor stayed in place.
     ViewAt as_view{};
     as_view.view.Format = DXGI_FORMAT_UNKNOWN;
     as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
@@ -738,5 +739,119 @@ int draw_formatted_buffer(void* guest, void* list)
     const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
     invoke(list, 21, 1, ptr(&viewport));
     draw_at(4);  // Nonzero data proves the accepted format is sampled.
+    return 0;
+}
+
+// 3D volume memory SRV (device slot 70) with 2 mips (4x4x2 and 2x2x1) in RGBA8_UNORM format.
+int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE3D, 0, 4, 4, 2, 2,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};
+    UINT rows[2]{};
+    UINT64 row_bytes[2]{};
+    UINT64 total_bytes = 0;
+    desktop->GetCopyableFootprints(&desc, 0, 2, 0, footprints, rows, row_bytes, &total_bytes);
+    if (!total_bytes || total_bytes == ~UINT64{0}) return 50;
+    // Footprint row pitch (256 bytes) is larger than packed row bytes (4 texels * 4 bytes = 16 bytes).
+    if (footprints[0].Footprint.RowPitch <= row_bytes[0]) return 52;
+
+    static std::vector<unsigned char> backing;
+    backing.assign(static_cast<std::size_t>(total_bytes), 0);
+
+    const auto write_voxel = [&](UINT mip, UINT z, UINT y, UINT x, const unsigned char rgba[4]) {
+        const auto& fp = footprints[mip].Footprint;
+        const UINT64 slice_pitch = fp.RowPitch * rows[mip];
+        const UINT64 offset = footprints[mip].Offset + z * slice_pitch + y * fp.RowPitch + x * 4;
+        if (offset + 4 <= backing.size())
+            std::memcpy(backing.data() + offset, rgba, 4);
+    };
+
+    const unsigned char c0[4] = {200, 50, 10, 255};   // mip 0, slice 0
+    const unsigned char c1[4] = {50, 200, 10, 255};   // mip 0, slice 1
+    const unsigned char c2[4] = {10, 50, 200, 255};   // mip 1, slice 0
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+            write_voxel(0, 0, y, x, c0);
+            write_voxel(0, 1, y, x, c1);
+        }
+    for (UINT y = 0; y < 2; ++y)
+        for (UINT x = 0; x < 2; ++x)
+            write_voxel(1, 0, y, x, c2);
+
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(backing.data()), ptr(&desc),
+                                           D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&placed)))))
+        return 51;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture3D.MostDetailedMip = 0;
+    v.view.Texture3D.MipLevels = 2;
+    v.address = ptr(backing.data());
+
+    // Col 0: view of mip 0+1, shader samples (0, 0, slice 0, mip 0)
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(0);
+
+    // Col 1: shader samples (0, 0, slice 1, mip 0)
+    draw(1);
+
+    // Col 2: view restricted to mip 1
+    v.view.Texture3D.MostDetailedMip = 1;
+    v.view.Texture3D.MipLevels = 1;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(2);
+
+    // Refusals before column 3:
+    // 1. Wrong view dimension (2D view on 3D resource)
+    ViewAt bad_dim = v;
+    bad_dim.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_dim), cpu);
+
+    // 2. Short backing / unregistered interior address
+    ViewAt bad_addr = v;
+    bad_addr.address = ptr(backing.data()) + 1;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_addr), cpu);
+
+    // 3. Mip range out of bounds
+    ViewAt bad_mip = v;
+    bad_mip.view.Texture3D.MostDetailedMip = 2;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_mip), cpu);
+
+    // 4. Explicit non-zero LOD clamp
+    ViewAt bad_clamp = v;
+    bad_clamp.view.Texture3D.ResourceMinLODClamp = 1.0f;
+    invoke(guest, 70, ptr(&desc), ptr(&bad_clamp), cpu);
+
+    // 5. Wrong layout (console layout 0x105)
+    D3D12_RESOURCE_DESC bad_layout = desc;
+    bad_layout.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    invoke(guest, 70, ptr(&bad_layout), ptr(&v), cpu);
+
+    // Col 3: all refusals preserved the previous descriptor (mip 1 view)
+    draw(3);
+
+    // Col 4-7: rebind mip 0+1
+    v.view.Texture3D.MostDetailedMip = 0;
+    v.view.Texture3D.MipLevels = 2;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    draw(4);
+    draw(5);
+    draw(6);
+    draw(7);
+
     return 0;
 }

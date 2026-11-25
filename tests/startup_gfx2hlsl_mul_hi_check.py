@@ -49,6 +49,10 @@ BODY_WORDS = bytes.fromhex(
 )
 PS_WORDS = PRE_WORDS + BODY_WORDS + POST_WORDS
 
+# VOP3A uses source selector 255 followed by the literal DWORD (#1792).
+LITERAL_SOURCE = 'v_mul_hi_u32 v12, v0, 0xaaaaaaab\n'
+LITERAL_WORDS = bytes.fromhex('0c006ad500ff0100abaaaaaa')
+
 SPECIAL = (
     0, 1, 2, 3, 0xffff, 0x10000, 0x10001, 0x0001ffff, 0x7fffffff, 0x80000000, 0x80000001,
     0xdeadbeef, 0xcafebabe, 0x9e3779b9, 0x85ebca6b, 0xffff0000, 0xffff0001, 0xfffffffe, MASK,
@@ -107,12 +111,18 @@ def eval_emitted_helper(ps_text):
         return ret_e.run(env)[0]
 
     return run
-  
+
 def controls():
     _, text = translate()
     found = re.findall(r'^\s*v(1[2-5]) = mul_hi_u32\(v(\d+), v(\d+)\);$', text, re.M)
     check('v_mul_hi_u32: four lane calls emitted',
           found == [('12', '0', '4'), ('13', '1', '5'), ('14', '2', '6'), ('15', '3', '7')])
+
+    literal_ps = PRE_WORDS + LITERAL_WORDS + BODY_WORDS[8:] + POST_WORDS
+    literal_text = G.Pipeline(vs_words([(0, 0, 0)] * 4), literal_ps, root_blob()).hlsl_ps()
+    literal_match = re.search(r'v12 = mul_hi_u32\(v0, (0[xX][0-9a-fA-F]+|[0-9]+)u\);', literal_text)
+    check('v_mul_hi_u32: encoded literal reaches the helper',
+          literal_match is not None and int(literal_match[1], 0) == 0xaaaaaaab)
 
     helper = eval_emitted_helper(text)
     mismatch = next(((a, b, helper(a, b), ref_mul_hi_u32(a, b)) for a, b in GRID
@@ -163,6 +173,8 @@ def check_binary(llvm_mc):
     built = assemble(llvm_mc, BODY_SOURCE)
     if built != BODY_WORDS:
         raise AssertionError('v_mul_hi_u32: assembled %s, recorded %s' % (built.hex(), BODY_WORDS.hex()))
+    if assemble(llvm_mc, LITERAL_SOURCE) != LITERAL_WORDS:
+        raise AssertionError('literal v_mul_hi_u32 fixture differs from llvm-mc')
     for name, source, words in (('prologue', PRE_SOURCE, PRE_WORDS), ('export', POST_SOURCE, POST_WORDS)):
         if assemble(llvm_mc, source) != words:
             raise AssertionError('%s fixture differs from llvm-mc' % name)
