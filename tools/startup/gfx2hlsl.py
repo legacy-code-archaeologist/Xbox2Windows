@@ -5273,7 +5273,7 @@ class Stage:
             # Local merge of #2028 with main's #2389: a plain scalar word keeps the generic SCA lowering
             # (firstbitlow, -1 for zero). A lane mask source takes main's compute-entry path below.
             return self.scalar('s_ff1_i32_b32', ops)
-        if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
+        if getattr(self, 'kind', None) != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
             raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
@@ -6931,8 +6931,7 @@ VEC_U.update({
     # AMD RDNA 2 ISA reference: the 24-bit multiplies read the low 24 bits of each source, the signed forms as a
     # two's complement field. The mul and mad forms keep the low 32 bits of the product; the hi forms keep bits 63..32
     # of the 48-bit product. The 24-bit field is sign-extended with a left shift of 8 and an arithmetic right shift.
-    'v_mul_i32_i24': (2, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8))'),
-    'v_mad_i32_i24': (3, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8)) + {2}'),
+    # v_mul_i32_i24 / v_mad_i32_i24: main's VEC_U entries (#2410) above; the local duplicates are dropped.
     # v_mul_hi_u32_u24 is deliberately not lowered. Its result is at most 0xffff, so as a float output word it is
     # always a binary32 denormal, and FXC 10.0.26100 at ps_5_1 (the startup path) folds a float output whose
     # provable range lies below 0x00800000 to a constant zero (any form tried, even a plain shift without a

@@ -371,7 +371,7 @@ constexpr UINT draw_side = 4;      // 4x4 R8G8B8A8_UNORM target
 constexpr UINT draw_covered = 3;   // scissor leaves the last row and column untouched as the sentinel
 constexpr int draw_seed = 77;
 constexpr UINT draw_clear_pixel = 0xffff00ffu;  // ClearRenderTargetView({1, 0, 1, 1}) in R8G8B8A8_UNORM
-constexpr char draw_revision[] = "x2w-startup-shader-14";  // d3d12_draw.inl cached_translation
+constexpr char draw_revision[] = "x2w-startup-shader-15";  // d3d12_draw.inl cached_translation (local branch: #2010 bumps it)
 
 constexpr char draw_vertex_shader[] = R"(
 struct Varying { float4 position : SV_Position; };
