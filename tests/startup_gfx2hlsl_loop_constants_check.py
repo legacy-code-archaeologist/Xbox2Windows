@@ -11,8 +11,14 @@ branch target another path arrives, so the value is only known there if no other
 A constant that no other path writes stays folded (control). Folding the counter froze it at 1, so the exit test
 fired only for a trip count of 1 and every other loop ran until the dispatcher guard (65,536 iterations).
 
-Mutations (each must turn the battery red): constants kept at every join (the behavior before this check), and
-the loop body range left out (only forward branches handled).
+"No other path writes the register" is judged from the constant's own write: the constant stays known at a branch
+target when the block of that write dominates the target and no block on a path from the write to the target writes
+the register again. A write in an earlier arm, before the constant was set, does not count (a register reused for a
+constant sampler word after an earlier conditional block used it for something else). A later arm or a loop body
+that writes it still drops it.
+
+Mutation (must turn the battery red): constants kept at every join (the behavior before this check). Leaving the
+loop body range out of join_writes alone does not: the joined set and the dominance rule see the loop body too.
 """
 import os
 import sys
@@ -67,6 +73,36 @@ CASES = [
                                           's_endpgm'),
      ['s8 = 0x00000003u + 0x00000001u;', 's14 = s14 + 0x00000001u;'],
      ['s8 = s7 + 0x00000001u;']),
+    # An earlier arm writes s7, then every path sets it to 3; the second conditional block does not write it.
+    ('constant set after an earlier arm wrote the register',
+     ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_000c', 's_mov_b32 s7, 5', 's_mov_b32 s7, 3', 's_cmp_eq_u32 s2, 1',
+      's_cbranch_scc1 label_001c', 's_mov_b32 s9, 1', 's_add_u32 s8, s7, 1', 's_endpgm'),
+     ['s8 = 0x00000003u + 0x00000001u;'],
+     ['s8 = s7 + 0x00000001u;']),
+    # The same program with the second arm writing s7: two values reach the join.
+    ('constant set after an earlier arm, later arm writes it',
+     ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_000c', 's_mov_b32 s7, 5', 's_mov_b32 s7, 3', 's_cmp_eq_u32 s2, 1',
+      's_cbranch_scc1 label_001c', 's_mov_b32 s7, 9', 's_add_u32 s8, s7, 1', 's_endpgm'),
+     ['s8 = s7 + 0x00000001u;'],
+     ['s8 = 0x00000003u + 0x00000001u;', 's8 = 0x00000009u + 0x00000001u;']),
+    # The constant is set in an arm only: its write does not dominate the join, whatever the arm before it did.
+    ('constant set in an arm after an earlier arm wrote the register',
+     ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_000c', 's_mov_b32 s7, 5', 's_cmp_eq_u32 s2, 1',
+      's_cbranch_scc1 label_0018', 's_mov_b32 s7, 3', 's_add_u32 s8, s7, 1', 's_endpgm'),
+     ['s8 = s7 + 0x00000001u;'],
+     ['s8 = 0x00000003u + 0x00000001u;', 's8 = 0x00000005u + 0x00000001u;']),
+    # An earlier arm writes s7, every path sets it to 3, and a loop reads it: kept when the body leaves it alone,
+    # dropped when the body writes it after the read.
+    ('constant set after an earlier arm, read in a loop',
+     ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_000c', 's_mov_b32 s7, 5', 's_mov_b32 s7, 3', 's_add_u32 s8, s7, 1',
+      's_cmp_eq_u32 s8, s2', 's_cbranch_scc0 label_0010', 's_endpgm'),
+     ['s8 = 0x00000003u + 0x00000001u;'],
+     ['s8 = s7 + 0x00000001u;']),
+    ('constant set after an earlier arm, written in the loop',
+     ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_000c', 's_mov_b32 s7, 5', 's_mov_b32 s7, 3', 's_add_u32 s8, s7, 1',
+      's_mov_b32 s7, 4', 's_cmp_eq_u32 s8, s2', 's_cbranch_scc0 label_0010', 's_endpgm'),
+     ['s8 = s7 + 0x00000001u;'],
+     ['s8 = 0x00000003u + 0x00000001u;', 's8 = 0x00000004u + 0x00000001u;']),
 ]
 
 for label, program, wanted, unwanted in CASES:

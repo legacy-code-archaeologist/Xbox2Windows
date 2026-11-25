@@ -339,12 +339,12 @@ def lane_mask_controls():
     check('an overwritten mask is a plain word: refused', got == 's_nand_b32 on a lane mask', got)
 
     # 5. Mutations: each rule disabled accepts a program refused above.
-    saved = G.Stage.unjoined_masks
-    G.Stage.unjoined_masks = lambda self, target, last_write: set()
+    saved = G.Stage.unjoined
+    G.Stage.unjoined = lambda self, target, last_write, regs: set()
     try:
         got = [text_refusal(*skip, 's_nand_b32 s6, s5, s4', 's_endpgm'), text_refusal(*loop)]
     finally:
-        G.Stage.unjoined_masks = saved
+        G.Stage.unjoined = saved
     check('mutation without the join rule accepts both programs', all(t.startswith('accepted') for t in got), str(got))
     saved = G.Stage.descriptor_scc_reads
     G.Stage.descriptor_scc_reads = lambda self, branches, effects: iter(())
