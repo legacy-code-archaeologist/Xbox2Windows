@@ -2105,12 +2105,14 @@ These are measured on one executable; treat them as hypotheses for others.
   negative denormal. Uncompressed exports to `R8G8B8A8_UINT` and `R8G8B8A8_SINT` use unsigned
   and signed integer shader outputs. The output merger clamps each channel to 0–255 or −128–127
   respectively. With export words `ffffffff ffffff7f 00000080 00000100`, the stored bytes are
-  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The other 8- and 16-bit integer views
-  still return `unverified UINT/SINT RTV format <n>`.
+  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The same conversion applies to one or two
+  8-bit channels and one, two or four 16-bit channels. An uncompressed UINT export to
+  `R10G10B10A2_UINT` clamps RGB to 0–1023 and alpha to 0–3 before storage. Three-channel
+  `R32G32B32_UINT` and `R32G32B32_SINT` views still require readback verification.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
-  undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
-  unsupported by this path.
+  undergo float-to-UNORM conversion. Compressed gfx1013 integer exports remain unsupported,
+  including when the destination is `R10G10B10A2_UINT`.
 - A colour export that leaves channels `off` does not write them, so the target keeps what it held
   there (#1674). `gfx2hlsl.py` records the written channels per target and writes
   `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw

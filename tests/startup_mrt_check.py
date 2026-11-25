@@ -15,7 +15,16 @@ FLOAT_WORDS = (1, 2, 0x7fc00001, 0x80000001)
 INTEGER_WORD = 0x80000001
 # Typed formats whose channels are all 32 bits: DXGI value -> (shader output type, channels).
 INTEGER_FORMATS = ((42, 'uint', 1), (43, 'int', 1), (17, 'uint', 2), (18, 'int', 2), (3, 'uint', 4), (4, 'int', 4))
-REFUSED_INTEGER_FORMATS = (12, 14, 57, 59, 62, 64)
+REFUSED_INTEGER_FORMATS = (7, 8)  # Three 32-bit channels have no verified RTV readback.
+# MRT0 bytes for export words (ffff7ffe, 21, 235, 104), ordered R to A in little-endian storage.
+NARROW_INTEGER_FORMATS = (
+    (12, 'uint', 'ffff210035020401'), (14, 'int', '0080210035020401'),  # RGBA16
+    (25, 'uint', 'ff8750e3'),  # RGB10A2: R=1023, G=33, B=565, A=3
+    (36, 'uint', 'ffff2100'), (38, 'int', '00802100'),  # RG16
+    (50, 'uint', 'ff21'), (52, 'int', '8021'),  # RG8
+    (57, 'uint', 'ffff'), (59, 'int', '0080'),  # R16
+    (62, 'uint', 'ff'), (64, 'int', '80'),  # R8
+)
 
 
 def pixel(values, unorm=False):
@@ -71,13 +80,17 @@ def check(work, consumer, backend, kind, dxc, fxc):
         assert result.returncode == 0 and actual_draw == wanted_draw, result.stderr
         return output.read_bytes(), result.stderr
 
-    def request(fmt, formats):
+    def queue_request(fmt, formats):
         pixels, log = draw(fmt, wanted_draw=False)
         assert 'no RTV translation' in log, log
         base = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
         line = 'rtv1 ' + ' '.join(map(str, (base, *formats)))
         key = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
         assert (cache / f'req_{key}.rtv').read_text() == line
+        return key, line, pixels
+
+    def request(fmt, formats):
+        key, line, pixels = queue_request(fmt, formats)
         subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
         assert (cache / f'{key}.txt').read_text().splitlines()[-1] == line
         return key, pixels
@@ -108,17 +121,17 @@ def check(work, consumer, backend, kind, dxc, fxc):
         assert pixels == struct.pack(f'<{channels}I4B', *words, 255, 0, 0, 255), pixels.hex()
         print(f'{kind} {backend} {expected_type} format {fmt} MRT0={pixels[:4 * channels].hex()}; UNORM MRT1=ff0000ff')
         if fmt == 42:
-            for narrow in REFUSED_INTEGER_FORMATS:
-                line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {narrow} 28'
+            for unverified in REFUSED_INTEGER_FORMATS:
+                line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {unverified} 28'
                 refused = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
                 marker = cache / f'req_{refused}.rtv'
                 marker.write_text(line)
                 result = gfx2hlsl.translate_request(cache, int(refused, 16))
-                assert re.fullmatch(rf'unsupported: unverified (UINT|SINT) RTV format {narrow}', result), result
+                assert re.fullmatch(rf'unsupported: unverified (UINT|SINT) RTV format {unverified}', result), result
                 assert not (cache / f'{refused}.txt').exists()
                 # Later --pending runs would retry this synthetic request on every valid format.
                 marker.unlink()
-            print(f'{kind} {backend} narrow integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
+            print(f'{kind} {backend} three-channel integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
             # A pre-existing base translation may lack its original request files.
             base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'
             compile_pair(base)
@@ -133,6 +146,17 @@ def check(work, consumer, backend, kind, dxc, fxc):
     assert pixels.hex() == '000000000000ffff', pixels.hex()
     print(f'{kind} {backend} stale signedness control: refused before PSO creation')
 
+    def low_bits_control(key, fmt, trunc, expected):
+        source = (cache / f'{key}.ps.hlsl').read_text()
+        end = '    return o;'
+        assert source.count(end) == 1
+        wrong = cache / f'{key}.low-bits.hlsl'
+        wrong.write_text(source.replace(end, f'    o.mrt0 = {trunc};\n{end}'))
+        compile_shader(compiler, kind, 'ps', wrong, cache / f'{key}.ps.cso', cache / f'{key}.low-bits.asm')
+        control, _ = draw(fmt)
+        assert control == bytes.fromhex(expected + 'ff0000ff'), control.hex()
+        return control[:-4].hex()
+
     # Distinguish signed and unsigned saturation from writing the low eight bits.
     ps.write_bytes(pixel((0xffffffff, 0xffffff7f, 0x80, 0x100), unorm=True))
     for fmt, expected_type, rgba in ((30, 'uint', 'ffff80ff'), (32, 'int', 'ff807f7f')):
@@ -142,16 +166,25 @@ def check(work, consumer, backend, kind, dxc, fxc):
         assert outputs == {'0': expected_type, '1': 'float'}, outputs
         pixels, _ = draw(fmt)
         assert pixels == bytes.fromhex(rgba + 'ff0000ff'), pixels.hex()
-        source = (cache / f'{key}.ps.hlsl').read_text()
-        end = '    return o;'
-        assert source.count(end) == 1
         trunc = 'o.mrt0 & 255u' if fmt == 30 else 'asint(asuint(o.mrt0) << 24u) >> 24u'
-        wrong = cache / f'{key}.low-byte.hlsl'
-        wrong.write_text(source.replace(end, f'    o.mrt0 = {trunc};\n{end}'))
-        compile_shader(compiler, kind, 'ps', wrong, cache / f'{key}.ps.cso', cache / f'{key}.low-byte.asm')
-        control, _ = draw(fmt)
-        assert control == bytes.fromhex('ff7f8000ff0000ff'), control.hex()
-        print(f'{kind} {backend} RGBA8 {expected_type} MRT0={rgba}; low-byte control={control[:4].hex()}')
+        control = low_bits_control(key, fmt, trunc, 'ff7f8000')
+        print(f'{kind} {backend} RGBA8 {expected_type} MRT0={rgba}; low-byte control={control}')
+
+    # All views share this shader, so one pending scan can publish their variants.
+    ps.write_bytes(pixel((0xffff7ffe, 0x21, 0x235, 0x104), unorm=True))
+    queued = {fmt: queue_request(fmt, (fmt, 28)) for fmt, _, _ in NARROW_INTEGER_FORMATS}
+    subprocess.run([sys.executable, '-B', gfx2hlsl.__file__, '--pending', cache], env=env, check=True)
+    for fmt, expected_type, rgba in NARROW_INTEGER_FORMATS:
+        key, record, _ = queued[fmt]
+        assert (cache / f'{key}.txt').read_text().splitlines()[-1] == record
+        assert compile_pair(key) == {'0': expected_type, '1': 'float'}
+        pixels, _ = draw(fmt)
+        assert pixels == bytes.fromhex(rgba + 'ff0000ff'), (fmt, pixels.hex())
+        if fmt == 14:
+            low_bits_control(key, fmt, 'asint(asuint(o.mrt0) << 16u) >> 16u', 'fe7f210035020401')
+        if fmt == 25:
+            low_bits_control(key, fmt, 'o.mrt0 & uint4(1023u, 1023u, 1023u, 3u)', 'fe875023')
+        print(f'{kind} {backend} narrow format {fmt} MRT0={rgba}; UNORM MRT1=ff0000ff')
 
     ps.write_bytes(pixel(FLOAT_WORDS))
     key, _ = request(2, (2,))

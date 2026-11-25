@@ -159,21 +159,27 @@ except G.Unsupported as reason:
 check('refused: partial compr export to param0', got == 'partial compressed export to param0', got)
 
 # 7. Typed colour targets (#1999 F): each verified format gets a matching shader output.
-typed = (('R32G32B32A32_UINT', 3, 'uint4 mrt0', 'uint4(v0'), ('R32G32B32A32_SINT', 4, 'int4 mrt0', 'asint(uint4'),
-         ('R32G32_UINT', 17, 'uint4 mrt0', 'uint4(v0'), ('R32G32_SINT', 18, 'int4 mrt0', 'asint(uint4'),
-         ('R8G8B8A8_UINT', 30, 'uint4 mrt0', 'uint4(v0'), ('R8G8B8A8_SINT', 32, 'int4 mrt0', 'asint(uint4'),
-         ('R32_UINT', 42, 'uint4 mrt0', 'uint4(v0'), ('R32_SINT', 43, 'int4 mrt0', 'asint(uint4'),
-         ('R32G32_FLOAT', 16, 'float4 mrt0', 'float4(F(('), ('R32_FLOAT', 41, 'float4 mrt0', 'float4(F(('))
-for name, fmt, signature, store in typed:
+typed = (
+    ('R32G32B32A32_UINT', 3), ('R32G32B32A32_SINT', 4), ('R16G16B16A16_UINT', 12), ('R16G16B16A16_SINT', 14),
+    ('R32G32_FLOAT', 16), ('R32G32_UINT', 17), ('R32G32_SINT', 18), ('R10G10B10A2_UINT', 25),
+    ('R8G8B8A8_UINT', 30), ('R8G8B8A8_SINT', 32), ('R16G16_UINT', 36), ('R16G16_SINT', 38),
+    ('R32_FLOAT', 41), ('R32_UINT', 42), ('R32_SINT', 43), ('R8G8_UINT', 50), ('R8G8_SINT', 52),
+    ('R16_UINT', 57), ('R16_SINT', 59), ('R8_UINT', 62), ('R8_SINT', 64),
+)
+expected_output = {'UINT': ('uint4 mrt0', 'uint4(v0'), 'SINT': ('int4 mrt0', 'asint(uint4'),
+                   'FLOAT': ('float4 mrt0', 'float4(F((')}
+for name, fmt in typed:
+    signature, store = expected_output[name.rsplit('_', 1)[1]]
     got = translate(exp(0, 0xf, (0, 1, 2, 3)), (fmt,))
     ok = isinstance(got, tuple) and signature in got[0] and store in assignment(got[0], 0).replace('uint4(U(v', 'uint4(v')
     check('typed target ' + name, ok, repr(got)[:300])
-for name, fmt in (('R16G16B16A16_UINT', 12), ('R16G16B16A16_SINT', 14), ('R8_UINT', 62),
-                  ('R16_SINT', 59), ('R8_SINT', 64)):
+for name, fmt in (('R32G32B32_UINT', 7), ('R32G32B32_SINT', 8)):
     got = translate(exp(0, 0xf, (0, 1, 2, 3)), (fmt,))
     want = 'unverified %s RTV format %d' % ('UINT' if fmt in G.UINT_RTVS else 'SINT', fmt)
     check('typed target %s refused' % name, got == want, repr(got)[:200])
-for fmt in (30, 32):
+for name, fmt in typed:
+    if name.endswith('_FLOAT'):
+        continue
     got = translate(exp(0, 0xf, (0, 1, 2, 3), compr=True), (fmt,))
     check('packed integer export refused for format %d' % fmt, got == 'packed integer export mrt0', repr(got)[:200])
 

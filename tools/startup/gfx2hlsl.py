@@ -6677,10 +6677,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 D16_FLOAT_EXACT_SRV_FORMATS = frozenset((2, 6, 16, 21, 28, 41, 49, 61, 65, 87, 88))
 D16_UNORM16_SRV_FORMATS = frozenset((11, 35, 56))
 D16_EXACT_SRV_FORMATS = D16_FLOAT_EXACT_SRV_FORMATS | D16_UNORM16_SRV_FORMATS
-# Uncompressed exports keep their 32-bit shader values. RGBA8 integer RTVs clamp each
-# channel to the destination range in the output merger.
-VERIFIED_UINT_RTVS = frozenset((3, 17, 30, 42))
-VERIFIED_SINT_RTVS = frozenset((4, 18, 32, 43))
+# Uncompressed exports keep their 32-bit shader values. Narrow integer RTVs clamp
+# each channel to the destination range in the output merger.
+VERIFIED_UINT_RTVS = frozenset((3, 12, 17, 25, 30, 36, 42, 50, 57, 62))
+VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 
 class Pipeline:
