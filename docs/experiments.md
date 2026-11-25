@@ -14707,3 +14707,14 @@ that names one value (a pointer only if no add touched it), is read at run time 
 read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.
+
+## Single-wave `TG_SIZE_EN` wave-ID folding in the startup compute translator
+
+[The startup translator](../tools/startup/gfx2hlsl.py) accepts `COMPUTE_PGM_RSRC2.TG_SIZE_EN` (bit 10) in `ComputePipeline` when the thread-group size is at most 32 threads (`x * y * z <= 32`, one wave per workgroup). The `TG_SIZE` entry SGPR sits immediately after `USER_SGPR` and any enabled `TGID_X/Y/Z` SGPRs (`user + len(groups)`) and is tagged `('tg_size',)`. Only `s_and_b32 R, TG, 0xfc0` (or `0xfc0, TG`) into an SGPR `R <= 105` is accepted for an untouched `TG_SIZE` register: because a single-wave group has wave index `TG_SIZE[11:6] == 0`, it lowers to `R = 0u; scc = false;` with `R` tracked as `('const', 0)` (feeding `v_mbcnt_lo_u32_b32` as a known zero base). Every other read of an untouched `('tg_size',)` register (other masks, moves, arithmetic, vector instructions, or direct `v_mbcnt_lo_u32_b32`) is refused, while overwriting `TG` restores ordinary scalar behavior. Larger groups (`> 32` threads) with `TG_SIZE_EN` remain refused in `ComputePipeline`, and `tools/compute_store_aot.py` continues to refuse `TG_SIZE_EN` unconditionally.
+
+[The `TG_SIZE_EN` check](../tests/startup_compute_tg_size_check.py) verifies SGPR placement, `s_and_b32` folding, `v_mbcnt_lo_u32_b32` lowering, overwrite/branch/refusal controls, and a two-group `4x2x2` WARP dispatch (`320` words compared, `0` mismatches on Microsoft Basic Render Driver `10.0.26100.9818`, with `dropped-base` rejected at word 5 and `swapped-mask` rejected at word 8).
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tests/startup_compute_tg_size_check.py
+ctest --preset dev --no-tests=error -R '^startup_compute_tg_size_' -V
+```

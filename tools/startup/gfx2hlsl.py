@@ -1148,9 +1148,10 @@ class Stage:
 
     def setup_compute_entry(self, root_end):
         """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
-        then one SGPR per enabled group-ID axis (SV_GroupID), and v0..v2 holding SV_GroupThreadID. Where the root
-        parameters sit inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not
-        place (s0-s3 and any past the root's span) have no known value, so any numeric read of them is refused."""
+        then one SGPR per enabled group-ID axis (SV_GroupID), optional TG_SIZE when TG_SIZE_EN is set (only accepted
+        for at most 32 threads per group, #2274), and v0..v2 holding SV_GroupThreadID. Where the root parameters sit
+        inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not place (s0-s3 and
+        any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
         if root_end > user:
             raise Unsupported('root signature needs s4-s%d, COMPUTE_PGM_RSRC2 gives %d user SGPRs' % (root_end - 1, user))
@@ -1162,6 +1163,9 @@ class Stage:
             self.used_s.add(n)
             self.entry_uniform_s.add(n)
             self.entry.append('s%d = gid.%s;' % (n, 'xyz'[axis]))
+        tg_size = getattr(self.pipe, 'tg_size_sgpr', None)
+        if tg_size is not None:
+            self.sym[tg_size] = ('tg_size',)
         for i in range(threads):
             self.used_v.add(i)
             self.entry.append('v%d = tid.%s;' % (i, 'xyz'[i]))
@@ -1178,6 +1182,8 @@ class Stage:
             if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
+            if s[0] == 'tg_size':
+                raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
         self.used_s.add(n)
         return 's%d' % n
@@ -2183,7 +2189,7 @@ class Stage:
                 args = [self.u(o) for o in ops[1:1 + arity]]
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
-            return self.scalar(base, ops)
+            return self.scalar(base, ops, mods) if mods else self.scalar(base, ops)
         raise Unsupported(base)
 
     # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
@@ -2352,7 +2358,7 @@ class Stage:
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
 
     # scalar ALU with descriptor-word bookkeeping
-    def scalar(self, base, ops):
+    def scalar(self, base, ops, mods=()):
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
@@ -2397,6 +2403,21 @@ class Stage:
             r = reg_range(t)
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
+        tg_srcs = [
+            reg for tok in ops[1:] for r in (reg_range(tok),) if r and r[0] == 's'
+            for reg in range(r[1], r[2] + 1) if self.sym.get(reg) == ('tg_size',)
+        ]
+        if tg_srcs:
+            # Wave-ID bits TG_SIZE[11:6] (mask 0xfc0) are identically 0 for <= 32 threads per group (1 wave).
+            if (base == 's_and_b32' and not mods and len(srcs) == 2
+                    and dst and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105):
+                other = (srcs[1] if syms[0] == ('tg_size',) and syms[1] != ('tg_size',)
+                         else srcs[0] if syms[1] == ('tg_size',) and syms[0] != ('tg_size',)
+                         else None)
+                if other is not None and self.const_u32(other) == 0xfc0:
+                    self.set_s(dst[1], '0u', ('const', 0), scc='false')
+                    return None
+            raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
@@ -5316,10 +5337,16 @@ class ComputePipeline(Pipeline):
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
         try:
-            self.entry = entry_registers(rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            tg_size_en = (isinstance(rsrc2, int) and not isinstance(rsrc2, bool)
+                          and 0 <= rsrc2 < (1 << 32) and bool((rsrc2 >> 10) & 1))
+            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg_size_en else rsrc2)
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
+        if tg_size_en and self.group[0] * self.group[1] * self.group[2] > 32:
+            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN requires at most 32 threads per group')
+        user, groups, _ = self.entry
+        self.tg_size_sgpr = (user + len(groups)) if tg_size_en else None
         self.root = parse_root(root_blob)
         self.vs_fetch, self.packed_position_vgpr, self.rtv_formats = None, None, ()
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
