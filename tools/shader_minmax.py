@@ -7,7 +7,7 @@
 # patterns gives the min result and the AND gives the max result, in either order. V_MIN3_F32,
 # V_MAX3_F32 and V_MED3_F32 are defined through nested V_MIN_F32/V_MAX_F32, so chaining this helper
 # applies the same rule. The emitted HLSL below is unchanged by this note.
-FLOAT_MINMAX ="""// RDNA 2 ISA section 12.7 orders -0 below +0 for min and max.
+FLOAT_MINMAX = """// RDNA 2 ISA section 12.7 orders -0 below +0 for min and max.
 float minmax_zero32(float a, float b, bool maximum) {
     uint a_bits = asuint(a), b_bits = asuint(b);
     uint either = a_bits | b_bits;
