@@ -2855,6 +2855,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The 64-bit vector shifts (#1815).
     add_test(NAME startup_gfx2hlsl_b64_shift COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_b64_shift_check.py")
+    # The 64-bit float ALU slice: v_add_f64, v_mul_f64, v_fma_f64 and the f32/f64 conversions (#1723).
+    add_test(NAME startup_gfx2hlsl_f64_alu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f64_alu_check.py")
     # The scalar shift-and-add forms s_lshl1..4_add_u32 (Run 20 census #16).
     add_test(NAME startup_gfx2hlsl_s_lshl_add COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py")
@@ -3263,6 +3266,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul24_align_draw_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_mul24_align_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl 64-bit float ALU (#1723): translation controls, then a desktop draw of each operation compared
+    # with an exact IEEE reference (FXC 5_1 and DXC 6_0), with a mutated lowering that must read other words.
+    add_test(NAME startup_gfx2hlsl_f64_alu_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f64_alu_warp_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f64_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f64_alu_warp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f64_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.

@@ -364,6 +364,11 @@ def check_encoding(code, off, n, name, asm):
         word0, word1 = struct.unpack_from('<2I', code, off)
         if word0 & 0x700 or word1 & 0xe0000000:
             raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
+    if name == 'v_cvt_f64_f32_e64':
+        # An inline integer is read as raw float bits; the printed -1 or -0 cannot tell NEG from a plain constant.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if 128 <= word1 & 0x1ff <= 208 and (word0 & (1 << 8) or word1 & (1 << 29)):
+            raise Unsupported('v_cvt_f64_f32_e64 NEG or ABS on an inline integer')
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -4949,6 +4954,79 @@ class Stage:
 
     def op_v_mad_i64_i32(self, ops, mods):
         self.mad64(ops, mods, True)
+
+    def f64_source(self, tok):
+        """double expression of a 64-bit float source: a VGPR/SGPR pair or an inline constant, with neg/abs."""
+        neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+        if neg:
+            tok = tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|') and len(tok) > 2
+        if absolute:
+            tok = tok[1:-1]
+        pair = reg_range(tok)
+        if pair:
+            low, high = self.i64_words(tok)
+            text = 'asdouble(%s, %s)' % (low, high)
+        elif tok in FLOATS and tok != '0.15915494':
+            text = repr(float(FLOATS[tok]))
+        elif tok == '0':
+            text = '0.0'
+        else:
+            raise Unsupported('64-bit float source %s' % tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def f64_pair_destination(self, name, tok):
+        dst = reg_range(tok)
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
+            raise Unsupported('%s destination %s' % (name, tok))
+        return dst[1], dst[2]
+
+    def f64_store(self, lo, hi, value):
+        # Evaluate into temporaries first, then write each half as its own `vN = ...` line so the vertex fetch guard sees both.
+        self.f64_temps = getattr(self, 'f64_temps', 0) + 1
+        tl, th = 'f64lo%d' % self.f64_temps, 'f64hi%d' % self.f64_temps
+        self.emit('uint %s, %s; asuint(%s, %s, %s);' % (tl, th, value, tl, th))
+        self.set_v(lo, tl)
+        self.set_v(hi, th)
+
+    def f64_op(self, name, ops, mods, arity, text):
+        if mods:
+            raise Unsupported('%s with %s' % (name, mods))
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (name, len(ops), arity + 1))
+        lo, hi = self.f64_pair_destination(name, ops[0])
+        value = text.format(*[self.f64_source(o) for o in ops[1:]])
+        self.f64_store(lo, hi, value)
+
+    def op_v_add_f64(self, ops, mods):
+        self.f64_op('v_add_f64', ops, mods, 2, '{0} + {1}')
+
+    def op_v_mul_f64(self, ops, mods):
+        self.f64_op('v_mul_f64', ops, mods, 2, '{0} * {1}')
+
+    def op_v_fma_f64(self, ops, mods):
+        self.f64_op('v_fma_f64', ops, mods, 3, 'fma({0}, {1}, {2})')
+
+    def op_v_cvt_f32_f64(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_f32_f64 with %s' % (mods,))
+        if len(ops) != 2:
+            raise Unsupported('v_cvt_f32_f64 with %d operands, expected 2' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('v_cvt_f32_f64 destination %s' % ops[0])
+        self.set_v(dst[1], 'asuint((float)%s)' % self.f64_source(ops[1]))
+
+    def op_v_cvt_f64_f32(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_f64_f32 with %s' % (mods,))
+        if len(ops) != 2:
+            raise Unsupported('v_cvt_f64_f32 with %d operands, expected 2' % len(ops))
+        lo, hi = self.f64_pair_destination('v_cvt_f64_f32', ops[0])
+        value = 'double(%s)' % self.f(ops[1])
+        self.f64_store(lo, hi, value)
 
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
