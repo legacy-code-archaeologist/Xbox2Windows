@@ -7217,6 +7217,7 @@ values compare equal. [AMD RDNA 2 ISA](https://docs.amd.com/api/khub/documents/E
 Both translators now resolve a pair of zeros from the sign bits. Maximum ANDs
 the signs and minimum ORs them. The startup shader cache revision advances to
 `x2w-startup-shader-9`, so translations cached before the change are not reused. The pixel translator applies the same rule to
+`x2w-startup-shader-15`, so translations cached before the change are not reused. The pixel translator applies the same rule to
 each widened half for packed binary16 min and max. It retains the packed NaN
 selection and the existing output modifiers. The startup translator retains
 its own median NaN behavior. Scalar binary16 min/max, three-input binary16
