@@ -14647,3 +14647,15 @@ that names one value (a pointer only if no add touched it), is read at run time 
 read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.
+
+## `src_scc` as a scalar source
+
+`s_mul_i32 s28, 1.0, src_scc` was refused as `operand 'src_scc'` (issue #1820), one of the refused shaders
+in the loading-screen cache (#870). Scalar source code 253 reads the SCC bit as the integer value 0 or 1
+(fitting in 16 bits, so `low16_only=True` returns the same expression), and the generated shader carries SCC
+as a `bool scc`, so `Stage.u()` lowers `src_scc` to `(scc ? 1u : 0u)` when a modeled writer has set SCC
+on every reaching path in the current block (`s_cmp_*` / `s_and_b32` etc. via `set_scc()`, `set_exec_scc()`,
+or `scalar_wide_op()`). Reads where incoming SCC is unverified are refused: at shader entry, across
+control-flow joins/branch targets, after descriptor-elided SCC writes, and after unmodeled SCC writers in
+`SCC_UNMODELLED` such as `s_add_u32` (after `s_add_u32` finishes reading its own sources). Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.

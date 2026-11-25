@@ -1190,6 +1190,12 @@ class Stage:
 
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
+        if tok == 'src_scc':
+            # Source code 253 reads SCC as 0 or 1 (fits in 16 bits, so low16_only=True needs no mask).
+            # Refuse unless a modeled writer set SCC on the reaching path in this block.
+            if not getattr(self, 'scc_verified', False):
+                raise Unsupported('src_scc with unverified SCC')
+            return '(scc ? 1u : 0u)'
         if tok in ('vcc_lo', 'vcc'):
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
@@ -1341,6 +1347,7 @@ class Stage:
         """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
         sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         if self.tracks_uniformity():
             self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
@@ -1675,6 +1682,7 @@ class Stage:
             self.uniform_v = set()
             self.varying_s = set()
             self.scc_uniform = True
+            self.scc_verified = False
             self.low16_only_v = set()   # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
             self.pinned_low16_v = set() # low16_only_v live across basic-block boundaries
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
@@ -1708,6 +1716,8 @@ class Stage:
                 self.pc = off
                 self.descriptor_instruction_index = instruction_index
                 self.scc_effect = None
+                if not falls:
+                    self.scc_verified = False
                 # Before the first branch target or terminator every path has run exactly the instructions above, so
                 # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
                 # branch-free program is past it too (dead code).
@@ -1749,6 +1759,7 @@ class Stage:
                     tentative_kept.update((kept_u & clobber) - blocked)
                     self.uniform_v.clear()
                     self.since_join, self.scc_uniform = kept_u, False
+                    self.scc_verified = False
                     # A constant is only known here if no other path into the join writes the register: a loop counter
                     # set before the loop and incremented in it reaches the loop head with a new value on every pass.
                     # set_s also assigns constants at run time, so the register reads its real value once it is dropped.
@@ -2050,6 +2061,7 @@ class Stage:
                 self.varying_s.add(reg)
             if base in ('s_add_u32', 's_addc_u32'):
                 self.scc_uniform = False
+                self.scc_verified = False
             return None
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
@@ -2068,6 +2080,7 @@ class Stage:
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
                 self.scc_uniform = False  # the hardware SCC result is not modelled
+            self.scc_verified = False
             return None
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
@@ -2401,8 +2414,11 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
+                raise Unsupported('src_scc with unverified SCC')
             if scc or base in SCC_UNMODELLED:
                 self.scc_effect = 'descriptor'
+                self.scc_verified = False
                 if self.tracks_uniformity():
                     self.scc_uniform = False
             if shift_add or word_complement:
@@ -2451,6 +2467,8 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if base in SCC_UNMODELLED:
+            self.scc_verified = False
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
@@ -2534,6 +2552,7 @@ class Stage:
     def set_exec_scc(self, expr):
         self.exec_known = False
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
@@ -2869,6 +2888,7 @@ class Stage:
             if self.tracks_uniformity():
                 (self.varying_s.discard if uniform else self.varying_s.add)(r)
         self.scc_effect = 'emitted'
+        self.scc_verified = True
         if self.tracks_uniformity():
             self.scc_uniform = uniform
         return None
