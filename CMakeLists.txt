@@ -3666,6 +3666,21 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "${CMAKE_SOURCE_DIR}/tests/startup_compute_lds_b128_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})
             set_tests_properties(startup_compute_lds_b128_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    endforeach()
+    endforeach()
+    # gfx2hlsl COMPUTE_PGM_RSRC2.TG_SIZE_EN wave-ID masking for single-wave groups <= 32 threads (Refs #2274).
+    add_test(NAME startup_compute_tg_size_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_tg_size_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_tg_size_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        foreach(control IN ITEMS dropped-base swapped-mask)
+            add_test(NAME startup_compute_tg_size_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/startup_compute_tg_size_check.py" control ${control} "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(startup_compute_tg_size_${control}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "control ${control}: rejected at word=[0-9]+ ")
         endforeach()
     endforeach()
