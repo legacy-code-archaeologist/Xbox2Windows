@@ -14947,6 +14947,28 @@ On an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`) and on in-bo
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_range_provenance' -V
+
+## Startup v_fract_f32 upper bound
+
+`v_fract_f32` in `tools/startup/gfx2hlsl.py` now lowers through a `fract32` helper in the common preamble
+instead of a bare D3D `frac`. The helper is `frac(value)` capped at `0x3f7fffff` by a comparison,
+`f >= 1.0f ? asfloat(0x3f7fffffu) : f`, which is the form and the rule `tools/pixel_aot.py` has always used:
+for an input such as -2^-30 (`0xb0800000`) the unclamped `x - floor(x)` rounds up to 1.0 in binary32, while the
+instruction returns at most `0x3f7fffff`. The cap is not written with `min`, because D3D `min` returns its other
+operand for a NaN and a NaN input has to stay a NaN. Two NVIDIA reports fail `startup_gfx2hlsl_float_round_hardware`
+on that very input with `expected=...3f7fffff... actual=...3f800000...`: an RTX 3070 Ti on driver 32.0.16.2101 and
+a Quadro M1000M (Maxwell) on driver 32.0.15.7371, both in #1741, while the same draw passes on WARP, on Intel HD
+Graphics 530 and on the RDNA 4 card used here. That agreement is the reason the D3D `frac` was the deviating side,
+not the fixture. No NVIDIA adapter is available on this machine, so the Maxwell and Turing results are **not**
+reproduced here: what the change is verified against is the emitted text, the pixel_aot rule it now matches, and
+the adapters that already returned `0x3f7fffff`. `tests/startup_gfx2hlsl_fract_check.py` asserts that the statement
+of the `_e32` and `_e64` forms is `U(fract32(...))`, that no bare `frac(` reaches it, that the preamble clamps at
+`0x3f7fffff` with the comparison form, and that the table entry is used by `v_fract_f32` alone. Two controls
+rewrite the lowering to the uncapped `frac` and to a `min`-form cap and require the checks to reject both. Only
+`v_fract_f32` changes in this patch.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fract$' -V
 ```
 
 ## Startup scalar bit counts and scans
