@@ -3747,7 +3747,9 @@ class Stage:
         if getattr(self, 'has_branches', True):
             return None
         if r and r[0] == 's' and r[1] == r[2] and r[1] <= 105:
-            value = self.is_const(r[1])
+            # A tagged constant (the ('const', 0, 'unassigned') default-sampler placeholder) is not a run-time value.
+            sym = self.sym.get(r[1])
+            value = self.is_const(r[1]) if sym and len(sym) == 2 else None
             if value is not None and 0 <= value <= 0xfffff:
                 return value
         return None

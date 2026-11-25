@@ -67,6 +67,17 @@ got = run({4: ('ptr', ('resheap',)), 9: ('const', 0xffff8000)}, 's_load_dwordx8'
 check('a negative movk offset is refused', got == "s_load with a register offset through ('resheap',)", repr(got))
 got = run({}, 's_movk_i32', 's9, 0x7fff')
 check('positive movk immediate unchanged', isinstance(got, dict) and got[9] == ('const', 0x7fff), repr(got))
+got = run({}, 's_mov_b32', 's9, 0x8000')
+check('s_mov_b32 0x8000 is not sign-extended', isinstance(got, dict) and got[9] == ('const', 0x8000), repr(got))
+
+got = run(HEAP, 's_load_dwordx8', 's[16:23], s[4:5], s9', ['offset:0xfffe0'])
+check('a constant plus modifier above 0xfffff is refused', got == 'SMEM register offset 0x100020', repr(got))
+got = run({4: ('ptr', ('resheap',)), 9: ('const', 0, 'unassigned')}, 's_load_dwordx8', 's[16:23], s[4:5], s9')
+check('the unassigned placeholder is not a constant offset',
+      got == "s_load with a register offset through ('resheap',)", repr(got))
+got = run({4: ('ptr', ('smpheap',)), 9: ('const', 0x40)}, 's_load_dwordx8', 's[16:23], s[4:5], s9')
+check('a sampler heap register offset keeps its old handling', not (isinstance(got, dict) and got.get(16, (None,))[0] == 'desc'
+      and got[16][2] == 0x40), repr(got))
 
 print('s_load constant offset checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

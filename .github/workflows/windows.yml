@@ -251,6 +251,7 @@ jobs:
             tests/startup_gfx2hlsl_watch_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
+            tests/startup_gfx2hlsl_sload_const_offset_check.py \
             tests/startup_archive_requests_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_compute_request_offline_check.py \
