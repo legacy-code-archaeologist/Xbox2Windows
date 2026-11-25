@@ -17,8 +17,13 @@ def check(label, condition, detail=''):
 class Pipe:
     """The single resource needed by the buffer-load probe."""
 
+    resources = {(('table', 0), 0): {'index': 0}}  # the formatted load reads the stride and FORMAT words by index
+
     def resource(self, key, kind):
         return 'r0'
+
+    def ud(self, key):
+        return 0
 
 
 REFUSAL = 'v_readfirstlane_b32 requires a proven uniform source'
@@ -240,6 +245,23 @@ try:
     check('control: load refused without tracking', got == REFUSAL, repr(got))
 finally:
     G.UNIFORM_LOADS = original
+
+# Every destination register of a multi-register load is uniform, and only the registers the opcode writes.
+for label, instructions, read in (
+        ('two-dword load, first word', ('buffer_load_dwordx2 v[7:8], off, s[4:7], s2',), 7),
+        ('two-dword load, second word', ('buffer_load_dwordx2 v[7:8], off, s[4:7], s2',), 8),
+        ('four-dword load, last word', ('buffer_load_dwordx4 v[6:9], off, s[4:7], s2',), 9),
+        ('load over a varying register', ('v_mov_b32_e32 v8, v0', 'buffer_load_dwordx2 v[7:8], off, s[4:7], s2'), 8),
+        ('formatted two-component load', ('buffer_load_format_xy v[7:8], off, s[4:7], s2',), 8)):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind='cs')
+    check(f'{label} accepted', got[-1] == 's9 = v%d;' % read, repr(got))
+for label, instructions, read in (
+        ('two-dword load into three registers', ('v_mov_b32_e32 v9, v0', 'buffer_load_dwordx2 v[7:9], off, s[4:7], s2'), 9),
+        ('two-dword load into one register', ('v_mov_b32_e32 v8, v0', 'buffer_load_dwordx2 v7, off, s[4:7], s2'), 8),
+        ('two-dword load with a varying offset', ('buffer_load_dwordx2 v[7:8], v0, s[4:7], 0 offen',), 8),
+        ('other register after a load', ('v_mov_b32_e32 v6, v0', 'buffer_load_dwordx2 v[7:8], off, s[4:7], s2'), 6)):
+    got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind='cs')
+    check(f'{label} refused', got == REFUSAL, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
 for present in ((), ('uniform_v',), ('uniform_v', 'varying_s')):

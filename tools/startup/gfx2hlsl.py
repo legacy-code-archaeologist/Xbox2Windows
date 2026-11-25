@@ -746,7 +746,10 @@ UNIFORM_VALU = frozenset((
     'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_med3_f32', 'v_mov_b32',
 ))
 
-UNIFORM_LOADS = frozenset(('buffer_load_dword', 'buffer_load_format_x'))
+UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_load_dwordx3': 3, 'buffer_load_dwordx4': 4,
+                      'buffer_load_format_x': 1, 'buffer_load_format_xy': 2, 'buffer_load_format_xyz': 3,
+                      'buffer_load_format_xyzw': 4}
+UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -2141,10 +2144,13 @@ class Stage:
                   all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
                   not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
                   (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
+        loaded_regs = ()
         if loaded:
             candidate = reg_range(ops[0])
-            if candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
-                dst = candidate[1]
+            # Exactly the registers the opcode writes, as many as its name says.
+            count = UNIFORM_LOAD_WORDS[base]
+            if candidate and candidate[0] == 'v' and candidate[2] <= 255 and candidate[2] - candidate[1] + 1 == count:
+                dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
                 loaded = False
         self.last_v = None
@@ -2162,7 +2168,9 @@ class Stage:
                         self.defined_uniform_s.discard(r)
                     self.bad_sgprs.add(r)
         if dst is not None:
-            self.uniform_v.add(dst)
+            self.uniform_v.update(loaded_regs or (dst,))
+            for reg in loaded_regs:
+                getattr(self, 'uniform_expr', {}).pop(reg, None)
             if hasattr(self, 'uniform_expr'):
                 # Proven sources are scalars, constants and VGPRs; each VGPR needs its own current expression.
                 expr = self.last_v[1] if self.last_v and self.last_v[0] == dst else None
