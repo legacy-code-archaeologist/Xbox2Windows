@@ -3846,6 +3846,38 @@ class Stage:
             pending.extend(self.descriptor_predecessors[earlier])
         return True
 
+    def formatted_pointer_copy(self, pointer, before):
+        """(source register, instruction index) of the one s_mov_b32 that is the last write to this pointer on
+        every path from the entry to this read, or None.
+
+        One writer found walking back, with no path that reaches the entry without a write, means that the copy is
+        on every path to the read and that no path from the copy to the read writes the pointer again."""
+        self.formatted_pointer_reaches(pointer, before)  # builds the predecessor tables
+        writers, seen, expand = set(), set(), [before]
+        while expand:
+            at = expand.pop()
+            if at == 0 or not self.descriptor_predecessors[at]:
+                return None  # the entry value of the register reaches the read
+            for earlier in self.descriptor_predecessors[at]:
+                if earlier in seen:
+                    continue
+                seen.add(earlier)
+                _, _, name, asm = self.ins[earlier]
+                wrote = self.descriptor_writes_by_instruction[earlier] | scalar_destinations(name, asm)
+                if pointer in wrote or 'any' in wrote:
+                    writers.add(earlier)
+                else:
+                    expand.append(earlier)
+        if len(writers) != 1:
+            return None
+        index, = writers
+        _, _, name, asm = self.ins[index]
+        _, args, _ = parse(asm)
+        source = reg_range(args[1]) if name == 's_mov_b32' and len(args) == 2 else None
+        if args[0] != 's%d' % pointer or not source or source[0] != 's' or source[1] != source[2]:
+            return None
+        return source[1], index
+
     def formatted_descriptor_from_block(self, reg, first):
         """Require one untouched local load and a table pointer that no incoming path can rewrite."""
         start, end = self.descriptor_block_first, self.descriptor_instruction_index
@@ -3876,6 +3908,10 @@ class Stage:
                 pointer = copied_from[1]
                 read = start + previous
                 break
+            else:
+                copy = getattr(self, 'kind', None) == 'cs' and self.formatted_pointer_copy(pointer, read)
+                if copy:
+                    pointer, read = copy
             return self.entry_table_pointers.get(pointer) == first[1] and self.formatted_pointer_reaches(pointer, read)
         return False
 

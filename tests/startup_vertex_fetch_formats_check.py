@@ -385,6 +385,13 @@ def controls():
         assert 'local table load' in str(error) or 'joined at a branch target' in str(error), error
     else:
         raise AssertionError('formatted load accepted after a possibly clobbered root pointer')
+    # A copy of the table pointer made in a block above the load is proven for compute stages only.
+    try:
+        stage((0xbe8a0308, 0xbf820000, 0xf4080405, 0xfa000000, *formatted_tail))
+    except gfx2hlsl.Unsupported as error:
+        assert 'local table load' in str(error), error
+    else:
+        raise AssertionError('graphics formatted load accepted through a pointer copy in another block')
     source = pipeline_mubuf(0).hlsl_vs()
     for label, old, new in DESC_MUTATIONS:
         assert old in source, label

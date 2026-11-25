@@ -743,6 +743,58 @@ def check_formatted_loads():
     refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end
     assert 'switch ((ud3 >> 12) & 127u)' in translate('L-uint', code=local_load).hlsl_cs()
+    check_formatted_pointer_copy()
+
+
+def check_formatted_pointer_copy():
+    """The descriptor load sits past the entry block and its pointer is a copy of the table pointer made in a
+    block above it. The copy must be the last write to the pointer on every path to the load."""
+    copy, high, load = (bytes.fromhex(h) for h in ('06038abe', '80038bbe', '05030cf4000000fa'))
+    assert WORDS_L.startswith(copy + high + load)
+    tail = WORDS_L[16:WORDS_L.index(LOAD_L)] + LOAD_L + bytes.fromhex('000081bf')
+    target = bytes.fromhex('000082bf')    # s_branch to the next instruction, which becomes a branch target
+    skip_one = bytes.fromhex('010084bf')  # s_cbranch_scc0 over one instruction
+    again = copy                          # s_mov_b32 s10, s6: a second write of the same pointer value
+    same_source = bytes.fromhex('060386be')  # s_mov_b32 s6, s6: a write to the copied register
+
+    def proof(code):
+        """The copy proof for the first table load of this program, without the rest of the translation."""
+        stage = G.Stage.__new__(G.Stage)
+        stage.ins, stage.calculated_pc = list(G.decode(code)), {}
+        at = next(i for i, ins in enumerate(stage.ins) if ins[2] == 's_load_dwordx8')
+        return stage.formatted_pointer_copy(10, at)
+
+    switch = 'switch ((ud3 >> 12) & 127u)'
+    # Copy in the entry block, load and formatted read in the next block.
+    assert proof(copy + high + target + load + tail) == (6, 0)
+    assert switch in translate('L-uint', code=copy + high + target + load + tail).hlsl_cs()
+    # Copy in a later block that every path to the load runs through.
+    assert proof(target + copy + high + target + load + tail) == (6, 1)
+    assert switch in translate('L-uint', code=target + copy + high + target + load + tail).hlsl_cs()
+    # A branch skips the copy: the entry value of s10 reaches the load.
+    assert proof(skip_one + copy + load + tail) is None
+    assert proof(load + tail) is None
+    refused('joined at a branch target', lambda: translate('L-uint', code=skip_one + copy + load + tail))
+    # One arm writes the pointer again. The value is the same, so only this proof can refuse it.
+    assert proof(copy + high + skip_one + again + load + tail) is None
+    refused('local table load', lambda: translate('L-uint', code=copy + high + skip_one + again + load + tail))
+    # A back edge from below the formatted read writes the pointer and re-enters at the load.
+    loop = copy + high + target + load + tail[:-4] + again + bytes.fromhex('f8ff84bf') + tail[-4:]
+    assert [ins[2] for ins in G.decode(loop)][-2:] == ['s_cbranch_scc0', 's_endpgm']
+    assert proof(loop) is None
+    refused('local table load', lambda: translate('L-uint', code=loop))
+    # One path writes descriptor word 3 between the table load and the formatted read.
+    word_write = (copy + high + target + load + WORDS_L[16:WORDS_L.index(LOAD_L)] + skip_one +
+                  bytes.fromhex('0f038fbe') + LOAD_L + bytes.fromhex('000081bf'))  # s_mov_b32 s15, s15
+    refused('local table load', lambda: translate('L-uint', code=word_write))
+    # The only writer is not a register copy.
+    assert proof(bytes.fromhex('80038abe') + high + target + load + tail) is None
+    # The copied register is written on one path into the block that copies it.
+    one_path = skip_one + same_source + copy + high + target + load + tail
+    assert proof(one_path) == (6, 2)
+    refused('local table load', lambda: translate('L-uint', code=one_path))
+    # The same program without that write translates.
+    assert switch in translate('L-uint', code=skip_one + bytes.fromhex('000080bf') + copy + high + target + load + tail).hlsl_cs()
 
 
 def check_controls():
