@@ -7371,6 +7371,28 @@ all 2,376 CPU evaluations and all 1,024 exported 32-bit words of the 16 x 16 pix
 reference, while five mutated HLSL controls fail against the reference and match their own models. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sdwa_cvt(_warp|_hardware)?$' -V`.
 
+The SDWA form of the VOP2 select, `v_cndmask_b32_sdwa vD, src0, src1, vcc_lo`, was refused as
+`SDWA form of v_cndmask_b32`. `sdwa()` now lowers it as a two-source integer operation: each source takes its
+`src0_sel`/`src1_sel` field, zero-extended or sign-extended under `sext()`, the select reads VCC the way the plain
+`v_cndmask_b32` does and picks `src1` where the lane's bit is set, and `dst_sel`/`dst_unused` place the result by
+the same rules as the other integer SDWA forms. The mask is always VCC, printed as the fourth operand; ` clamp`,
+float modifiers and `UNUSED_SEXT` stay refused. The semantics are the integer SDWA rules already used for the
+other forms with the select as the operation; they are not checked against the ISA document here and not measured
+on a console. `startup_gfx2hlsl_sdwa_cndmask` draws a constructed gfx1013 pixel stage with four selects over
+16 x 16 pixels: VCC is bit 31 of a per-pixel product clear (set in 160 of 256 pixels), and the selects cover byte
+and word sources from two registers, a sign-extended `BYTE_2` widened into `WORD_0`, and `WORD_0`, `BYTE_1` and
+`BYTE_2` destinations under `UNUSED_PRESERVE` over 1.0, which keeps every exported word a normal binary32 value
+(asserted, since the target is `R32G32B32A32_FLOAT`). All 1,024 exported words match a bit model, and six
+mutated selects (swapped operands, the mask ignored, the mask inverted, a dropped `sext()`, the neighbouring source
+byte and the wrong destination byte) each fail against the model and match their own; that is 26 draws per adapter
+with FXC (`ps_5_1`) and DXC (`ps_6_0`). Translating the fixture with the previous translator stops at the
+refusal. `startup_gfx2hlsl_sdwa_cndmask_check.py binary <llvm-mc>` requires LLVM 15 to assemble the fixture for
+gfx1013 to the same words and to print each select as written. Verified on commit base `0736f67c`, Windows 11
+(build `26200.9974`), D3D12 debug layer enabled (`debug_errors=0 debug_warnings=0`), on Microsoft Basic Render
+Driver (`1414:008c`, driver `10.0.26100.9818`) and NVIDIA GeForce RTX 5090 (`10de:2b85`, driver `32.0.16.1088`),
+with LLVM 15.0.7. This shows that the translated select computes the stated words on desktop GPUs, not that the
+console does. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sdwa_cndmask(_warp|_hardware)?$' -V`.
+
 **The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
 forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
 issue #1797). They now lower to a ten-class helper carried in the shader preamble (ported from

@@ -1656,7 +1656,9 @@ These are measured on one executable; treat them as hypotheses for others.
   integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
-  already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
+  already lowers the same forms. The VOP2 select `v_cndmask_b32_sdwa` lowers the same way, with VCC as
+  its mask (`startup_gfx2hlsl_sdwa_cndmask`, drawn on WARP and hardware). Float SDWA forms and a
+  `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
   The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
   too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and

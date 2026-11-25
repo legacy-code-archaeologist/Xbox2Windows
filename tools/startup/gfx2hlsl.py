@@ -2535,7 +2535,7 @@ class Stage:
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
-    # v_mov_b32 is the same path with the selected source as its result,
+    # v_mov_b32 is the same path with the selected source as its result, v_cndmask_b32 selects with VCC,
     # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
     # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
@@ -2560,6 +2560,11 @@ class Stage:
             # A lane mask is one bit per lane here, so a byte or word of it is not the hardware's field.
             if fields.get('src0_sel') != 'DWORD' and self.is_lane_mask(ops[1].removeprefix('sext(').removesuffix(')')):
                 raise Unsupported('v_mov_b32 SDWA %s of lane mask %s' % (fields.get('src0_sel'), ops[1]))
+        elif base == 'v_cndmask_b32' and len(ops) == 4 and ops[3] == 'vcc_lo':
+            # The VOP2 select: its lane mask is always VCC, printed as the fourth operand, and read like the
+            # plain select's mask (op_v_cndmask_b32).
+            mask = self.u(ops[3]).replace('{', '{{').replace('}', '}}')
+            arity, text = 2, '(%s & 1) ? {1} : {0}' % mask
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []

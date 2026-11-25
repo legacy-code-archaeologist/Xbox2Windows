@@ -86,6 +86,18 @@ check('dword select is the identity', emitted.replace(' ', '') == 'v9=v10^v11;')
 print('  emitted:', emitted)
 
 
+# 5b. The VOP2 select takes its lane mask from VCC (the fourth operand) and its sources through their selects.
+emitted = translate('v_cndmask_b32_sdwa v3, v1, v2, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD '
+                    'src0_sel:WORD_1 src1_sel:BYTE_0')
+check('SDWA select picks src1 under VCC',
+      emitted.replace(' ', '') == 'v3=(vcc&1)?((v2>>0u)&0xffu):((v1>>16u)&0xffffu);')
+print('  emitted:', emitted)
+emitted = translate('v_cndmask_b32_sdwa v3, v1, v2, vcc_lo dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE '
+                    'src0_sel:DWORD src1_sel:DWORD')
+check('SDWA select grouped before a word destination', '((vcc & 1) ? v2 : v1)' in emitted and 'v3' in emitted)
+print('  emitted:', emitted)
+
+
 # 6. Forms with no lowering are refused rather than mistranslated.
 def refused(assembly):
     try:
