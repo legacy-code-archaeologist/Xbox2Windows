@@ -3191,9 +3191,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: v_bfm_b32 bit-field mask.
     add_test(NAME startup_gfx2hlsl_v_bfm_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_v_bfm_check.py")
-    # Startup shader translator: v_{add,sub,subrev}_co_ci_u32 carry/borrow-in and out.
-    add_test(NAME startup_gfx2hlsl_add_sub_co_ci_controls COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_ci_check.py")
+    # local/intro-shaders: startup_gfx2hlsl_add_sub_co_ci_check.py (#2428) is not registered. Its handlers would
+    # shadow main's sub_co_ci (SGPR-pair borrow out) and #2033's add_co_ci, so this branch keeps those two.
     # Startup shader translator: s_*_saveexec with D == S0 reads S0 before writing D.
     add_test(NAME startup_gfx2hlsl_saveexec_same_reg_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_saveexec_same_reg_check.py")

@@ -5616,14 +5616,9 @@ class Stage:
             self.set_s(sdst[1], predicate, uniform=False)
             self.masks.add(sdst[1])
 
-    def op_v_add_co_ci_u32(self, ops, mods):
-        self.carry_in_out_op(ops, mods, 'add')
-
-    def op_v_sub_co_ci_u32(self, ops, mods):
-        self.carry_in_out_op(ops, mods, 'sub')
-
-    def op_v_subrev_co_ci_u32(self, ops, mods):
-        self.carry_in_out_op(ops, mods, 'subrev')
+    # Local merge: #2428's op_v_{add,sub,subrev}_co_ci_u32 would shadow main's borrow path (SGPR-pair borrow out,
+    # startup_gfx2hlsl_sub_co_ci_flbit_check) and #2033's add with its lane-mask source check, so they are not bound;
+    # carry_in_out_op stays for reference.
 
     def op_v_lshlrev_b64(self, ops, mods):
         self.shift64(ops, mods, 'shl64')
