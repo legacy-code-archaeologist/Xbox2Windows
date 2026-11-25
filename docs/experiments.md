@@ -7463,6 +7463,17 @@ refused by name. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_
 LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
 the same words.
 
+**`s_nand_b32` and `s_nor_b32` on a lane mask (#1723).** When every source is a lane mask (`exec_lo`, `vcc_lo` or an
+SGPR holding a compare result) and the destination is a mask, `exec_lo`, `vcc_lo` or an SGPR, the pair lowers to
+`~(a & b) & 1` and `~(a | b) & 1` on each lane's own bit, like `s_and_b32` and `s_or_b32`, and the destination is
+recorded as a mask. Limits: SCC is the per-lane bit, not the whole-wave 32-bit result, so a later SCC read on a lane
+mask result is not claimed to match the ISA; `s_xnor_b32` on a lane mask stays refused; `exec_hi` and `vcc_hi`
+operands are refused with `Unsupported`; a raw scalar word (inline constant or plain SGPR) mixed with a mask is
+refused, because `s_nor_b32 vcc_lo, 1, 0` is `0xfffffffe` in the ISA and one bit per lane cannot say that. The check
+runs the emitted lines on the CPU over every pair of lane bits and lists the refused forms; no GPU or WARP result is
+claimed. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_nor_nand$' -V` or
+`python3 -B tests/startup_gfx2hlsl_s_nor_nand_check.py`.
+
 **Scalar high-halfword packing.** The same check covers `s_pack_hh_b32_b16` for
 startup pixel translation. It combines the high halves of two numeric scalar
 sources, with source 0 in the low result half and source 1 in the high result

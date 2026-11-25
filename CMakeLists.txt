@@ -2915,6 +2915,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # s_bitset0_b32, s_bitset1_b32 and s_ff1_i32_b32 against an integer reference (#1723).
     add_test(NAME startup_gfx2hlsl_s_bitset_ff1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitset_ff1_check.py")
+    # s_nand_b32 and s_nor_b32 on a lane mask (exec, vcc, compare-result SGPRs), per-lane bit against a reference (#1723).
+    add_test(NAME startup_gfx2hlsl_s_nor_nand COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_nor_nand_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")

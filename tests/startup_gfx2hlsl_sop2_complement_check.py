@@ -16,7 +16,7 @@ write it fails. The value set gives SCC = 0 and SCC = 1 for every operation.
 
 The lowering text and SCC rule equal pixel_aot's SCALAR entries for the same operations (#561). Every numeric form
 (SGPR, inline, literal or m0 operands) emits the lines of its non-complement sibling (s_and_b32, s_or_b32, s_xor_b32)
-with the operation wrapped in ~( ). Lane-mask forms are refused: a vcc_lo or exec_lo operand or destination, or an
+with the operation wrapped in ~( ). s_xnor_b32 on a lane mask is refused: a vcc_lo or exec_lo operand or destination, or an
 SGPR holding a compare mask, is the whole wave's mask, and SCC is set when any bit of the complemented 32-bit result
 is; the translator's per-lane projection cannot show that, so no mask lowering is claimed.
 
@@ -501,8 +501,8 @@ def controls():
         check('%s: %d numeric forms emit the %s lines complemented, same mask and EXEC bookkeeping'
               % (name, len(VALUE_FORMS), sibling), not wrong, str(wrong[:2]))
 
-    # 5b. Lane-mask forms are refused: vcc_lo/exec_lo operands and destinations, and an SGPR holding a compare mask.
-    for name in OPS:
+    # 5b. s_xnor_b32 lane-mask forms are refused (s_nand_b32 and s_nor_b32 are lowered, see startup_gfx2hlsl_s_nor_nand_check.py).
+    for name in ('s_xnor_b32',):
         accepted = []
         for form in MASK_FORMS:
             asm, stage = attempt(code(name, form))

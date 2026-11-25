@@ -2431,13 +2431,22 @@ class Stage:
         if base in SCA_RMW_DEST:
             # The old destination is the first source of the expression.
             srcs = [dname] + srcs
-        if shift_add or word_complement or word_pack:
-            # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
-            # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
+        if shift_add or base == 's_xnor_b32' or word_pack:
+            # The per-lane mask cannot supply the full word needed by these operations. s_nand_b32 and
+            # s_nor_b32 on a lane mask act on each lane's own bit, like s_and_b32 and s_or_b32.
+            # s_mul_hi_u32 into an SGPR that held a mask replaces it with a plain word (set_s drops the
+            # mark), so only vcc/exec count as a mask destination there.
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
                          else self.is_lane_mask(dname))
             if mask_dest or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        elif word_complement:
+            operands = [dname] + srcs
+            if any(t in ('exec_hi', 'vcc_hi') for t in operands):
+                raise Unsupported('%s on the high half of a lane mask' % base)
+            # A raw scalar word (inline constant, plain SGPR) has no per-lane bit: keep it refused.
+            if any(self.is_lane_mask(t) for t in operands) and not all(self.is_lane_mask(t) for t in srcs):
+                raise Unsupported('%s mixes a lane mask with an unprojected scalar word' % base)
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
