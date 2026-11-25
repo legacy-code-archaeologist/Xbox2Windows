@@ -537,3 +537,435 @@ static inline int x87_prem(X87Value a, X87Value b, bool nearest, X87Value& out) 
     out = {sig, static_cast<uint16_t>(((a.se & 0x8000) ^ (flip ? 0x8000 : 0)) | biased)};
     return static_cast<int>(q & 7);
 }
+
+// 128-bit unsigned fixed-point helpers for the transcendental instructions (pure integer arithmetic).
+struct X87U128 { uint64_t hi, lo; };
+
+static inline int x87_u128_cmp(X87U128 a, X87U128 b) {
+    if (a.hi != b.hi) return a.hi < b.hi ? -1 : 1;
+    if (a.lo != b.lo) return a.lo < b.lo ? -1 : 1;
+    return 0;
+}
+
+static inline X87U128 x87_u128_add(X87U128 a, X87U128 b) {
+    X87U128 r;
+    const unsigned char c = _addcarry_u64(0, a.lo, b.lo, &r.lo);
+    _addcarry_u64(c, a.hi, b.hi, &r.hi);
+    return r;
+}
+
+static inline X87U128 x87_u128_sub(X87U128 a, X87U128 b) {
+    X87U128 r;
+    const unsigned char c = _subborrow_u64(0, a.lo, b.lo, &r.lo);
+    _subborrow_u64(c, a.hi, b.hi, &r.hi);
+    return r;
+}
+
+// Upper 128 bits of the 256-bit product a * b.
+static inline X87U128 x87_u128_mul_hi(X87U128 a, X87U128 b) {
+    uint64_t p0_hi;
+    _umul128(a.lo, b.lo, &p0_hi);
+    uint64_t p1_hi;
+    const uint64_t p1_lo = _umul128(a.hi, b.lo, &p1_hi);
+    uint64_t p2_hi;
+    const uint64_t p2_lo = _umul128(a.lo, b.hi, &p2_hi);
+    uint64_t p3_hi;
+    uint64_t p3_lo = _umul128(a.hi, b.hi, &p3_hi);
+    uint64_t s0 = p0_hi;
+    unsigned char c = _addcarry_u64(0, s0, p1_lo, &s0);
+    uint64_t c1 = c;
+    c = _addcarry_u64(0, s0, p2_lo, &s0);
+    c1 += c;
+    uint64_t s1 = p1_hi;
+    c = _addcarry_u64(0, s1, p2_hi, &s1);
+    uint64_t c2 = c;
+    c = _addcarry_u64(0, s1, c1, &s1);
+    c2 += c;
+    c = _addcarry_u64(0, p3_lo, s1, &p3_lo);
+    _addcarry_u64(c, p3_hi, c2, &p3_hi);
+    return {p3_hi, p3_lo};
+}
+
+static inline X87U128 x87_u128_div_u64(X87U128 a, uint64_t d) {
+    uint64_t rem = 0;
+    const uint64_t qhi = _udiv128(0, a.hi, d, &rem);
+    const uint64_t qlo = _udiv128(rem, a.lo, d, &rem);
+    return {qhi, qlo};
+}
+
+static inline X87U128 x87_u128_shr(X87U128 a, int n) {
+    if (n <= 0) return a;
+    if (n >= 128) return {0, 0};
+    if (n >= 64) return {0, a.hi >> (n - 64)};
+    return {a.hi >> n, (a.lo >> n) | (a.hi << (64 - n))};
+}
+
+static inline void x87_u128_norm(X87U128& v, int& e) {
+    if (v.hi == 0) {
+        if (v.lo == 0) return;
+        const int s = x87_clz(v.lo);
+        v.hi = v.lo << s;
+        v.lo = 0;
+        e -= 64 + s;
+    } else {
+        const int s = x87_clz(v.hi);
+        if (s != 0) {
+            v.hi = (v.hi << s) | (v.lo >> (64 - s));
+            v.lo <<= s;
+            e -= s;
+        }
+    }
+}
+
+// Normalized 128-bit quotient a / b for normalized nonzero operands, returning value = (q / 2^127) * 2^qe.
+static inline X87U128 x87_u128_div_norm(X87U128 a, int ea, X87U128 b, int eb, int& qe) {
+    int e = ea - eb;
+    X87U128 rem = a;
+    if (x87_u128_cmp(rem, b) >= 0) {
+        rem = x87_u128_sub(rem, b);
+    } else {
+        --e;
+        const bool top = (rem.hi >> 63) != 0;
+        rem.hi = (rem.hi << 1) | (rem.lo >> 63);
+        rem.lo <<= 1;
+        if (top || x87_u128_cmp(rem, b) >= 0) rem = x87_u128_sub(rem, b);
+    }
+    uint64_t qhi = x87_integer_bit, qlo = 0;
+    for (int bit = 126; bit >= 0; --bit) {
+        const bool top = (rem.hi >> 63) != 0;
+        rem.hi = (rem.hi << 1) | (rem.lo >> 63);
+        rem.lo <<= 1;
+        if (top || x87_u128_cmp(rem, b) >= 0) {
+            rem = x87_u128_sub(rem, b);
+            if (bit >= 64) qhi |= 1ull << (bit - 64);
+            else qlo |= 1ull << bit;
+        }
+    }
+    qe = e;
+    return {qhi, qlo};
+}
+
+static inline X87Value x87_round_u128(bool sign, int e, X87U128 v, uint16_t cw, bool force_inexact = true) {
+    if (v.hi == 0 && v.lo == 0) return {0, static_cast<uint16_t>(sign ? 0x8000 : 0)};
+    x87_u128_norm(v, e);
+    const uint64_t lo = v.lo | (force_inexact ? 1ull : 0ull);
+    const X87Rounded r = x87_round(sign, e, v.hi, lo, x87_arith64, x87_rounding(cw));
+    return {r.sig, static_cast<uint16_t>((sign ? 0x8000 : 0) | r.biased)};
+}
+
+// 2/pi to 256 bits (value * 2^256) and pi/2 to 128 bits (value * 2^127).
+static const uint64_t x87_inv_pi2[4] = {
+    0xa2f9836e4e441529ull, 0xfc2757d1f534ddc0ull, 0xdb6295993c439041ull, 0xfe5163abdebbc562ull
+};
+static const X87U128 x87_pi2{0xc90fdaa22168c234ull, 0xc4c6628b80dc1cd1ull};
+
+// Payne-Hanek range reduction of finite |x| = sig * 2^(e - 63) with e < 63 modulo pi/2.
+// Sets r_neg when |x| = k * (pi/2) - r, and normalizes r = (r_val / 2^127) * 2^re in [0, pi/4].
+static inline int x87_reduce_pi2(uint64_t sig, int e, X87U128& r_val, int& re, bool& r_neg) {
+    r_neg = false;
+    if (e <= -1 && (e < -1 || sig <= 0xc90fdaa22168c234ull)) {
+        r_val = {sig, 0};
+        re = e;
+        return 0;
+    }
+    uint64_t p[5]{};
+    for (int i = 0; i < 4; ++i) {
+        uint64_t hi;
+        const uint64_t lo = _umul128(sig, x87_inv_pi2[3 - i], &hi);
+        unsigned char c = _addcarry_u64(0, p[i], lo, &p[i]);
+        c = _addcarry_u64(c, p[i + 1], hi, &p[i + 1]);
+        for (int j = i + 2; c && j < 5; ++j) c = _addcarry_u64(c, p[j], 0, &p[j]);
+    }
+    const int s = 63 - e;
+    uint64_t k = 0;
+    uint64_t f[4]{};
+    if (s == 64) {
+        f[3] = p[4]; f[2] = p[3]; f[1] = p[2]; f[0] = p[1];
+    } else {
+        const int sh = 64 - s;
+        k = p[4] >> s;
+        f[3] = (p[4] << sh) | (p[3] >> s);
+        f[2] = (p[3] << sh) | (p[2] >> s);
+        f[1] = (p[2] << sh) | (p[1] >> s);
+        f[0] = (p[1] << sh) | (p[0] >> s);
+    }
+    if (f[3] & x87_integer_bit) {
+        ++k;
+        r_neg = true;
+        unsigned char b = _subborrow_u64(0, 0, f[0], &f[0]);
+        b = _subborrow_u64(b, 0, f[1], &f[1]);
+        b = _subborrow_u64(b, 0, f[2], &f[2]);
+        _subborrow_u64(b, 0, f[3], &f[3]);
+    }
+    int top_limb = 3;
+    while (top_limb >= 0 && f[top_limb] == 0) --top_limb;
+    if (top_limb < 0) { r_val = {0, 0}; re = 0; return static_cast<int>(k & 3); }
+    const int lz = x87_clz(f[top_limb]);
+    const int fe = -1 - (3 - top_limb) * 64 - lz;
+    uint64_t fhi = f[top_limb] << lz;
+    uint64_t flo = top_limb >= 1 ? f[top_limb - 1] : 0;
+    if (lz != 0 && top_limb >= 1) fhi |= f[top_limb - 1] >> (64 - lz);
+    if (lz != 0) {
+        flo <<= lz;
+        if (top_limb >= 2) flo |= f[top_limb - 2] >> (64 - lz);
+    }
+    r_val = x87_u128_mul_hi({fhi, flo}, x87_pi2);
+    re = fe + 1;
+    x87_u128_norm(r_val, re);
+    return static_cast<int>(k & 3);
+}
+
+// sin(r) and cos(r) for normalized r in [0, pi/4].
+static inline void x87_sincos_reduced(X87U128 r_val, int re, X87U128& sin_v, int& sin_e, X87U128& cos_v, int& cos_e) {
+    if (r_val.hi == 0 && r_val.lo == 0) {
+        sin_v = {0, 0}; sin_e = 0;
+        cos_v = {x87_integer_bit, 0}; cos_e = 0;
+        return;
+    }
+    if (re <= -65) {
+        sin_v = r_val; sin_e = re;
+        cos_v = {0xffffffffffffffffull, 0xffffffffffffffffull}; cos_e = -1;
+        return;
+    }
+    X87U128 r2 = x87_u128_mul_hi(r_val, r_val);
+    r2 = x87_u128_shr(r2, -2 * re - 2);
+    const X87U128 one_q126{1ull << 62, 0};
+    X87U128 s_sum = one_q126, s_term = one_q126;
+    X87U128 c_sum = one_q126, c_term = one_q126;
+    for (uint64_t n = 1; n <= 19; ++n) {
+        s_term = x87_u128_div_u64(x87_u128_mul_hi(s_term, r2), (2 * n) * (2 * n + 1));
+        c_term = x87_u128_div_u64(x87_u128_mul_hi(c_term, r2), (2 * n - 1) * (2 * n));
+        if (n & 1) {
+            s_sum = x87_u128_sub(s_sum, s_term);
+            c_sum = x87_u128_sub(c_sum, c_term);
+        } else {
+            s_sum = x87_u128_add(s_sum, s_term);
+            c_sum = x87_u128_add(c_sum, c_term);
+        }
+        if ((s_term.hi | s_term.lo | c_term.hi | c_term.lo) == 0) break;
+    }
+    sin_v = x87_u128_mul_hi(r_val, s_sum);
+    sin_e = re + 2;
+    x87_u128_norm(sin_v, sin_e);
+    cos_v = c_sum;
+    cos_e = 1;
+    x87_u128_norm(cos_v, cos_e);
+}
+
+// Trap when an instruction hits a case outside the static-depth profile (such as |ST(0)| >= 2^63 on FSINCOS/FPTAN).
+static inline void x87_trap() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    __ud2();
+#else
+    __builtin_trap();
+#endif
+}
+
+// FSIN, FCOS and FSINCOS: 64-bit extended precision (precision control does not apply), C2 set when |ST(0)| >= 2^63.
+static inline void x87_sincos_core(X87Value a, uint16_t cw, bool& c2, X87Value* sin_out, X87Value* cos_out) {
+    c2 = false;
+    if (x87_unsupported(a) || x87_is_inf(a)) {
+        if (sin_out) *sin_out = x87_indefinite;
+        if (cos_out) *cos_out = x87_indefinite;
+        return;
+    }
+    if (x87_is_nan(a)) {
+        const X87Value q = x87_quiet(a);
+        if (sin_out) *sin_out = q;
+        if (cos_out) *cos_out = q;
+        return;
+    }
+    if (x87_is_zero(a)) {
+        if (sin_out) *sin_out = a;  // trig zero
+        if (cos_out) *cos_out = {x87_integer_bit, 0x3fff};
+        return;
+    }
+    const X87Unpacked u = x87_unpack(a);
+    if (u.e >= 63) {  // trig range
+        c2 = true;
+        if (sin_out) *sin_out = a;
+        if (cos_out) *cos_out = sin_out ? x87_indefinite : a;
+        return;
+    }
+    if (u.e <= -65) {
+        if (sin_out) *sin_out = x87_round_u128(u.sign, u.e, {u.sig, 0}, cw, false);
+        if (cos_out) *cos_out = x87_round_u128(false, -1, {~0ull, ~0ull}, cw);
+        return;
+    }
+    X87U128 r_val, sv, cv;
+    int re, se, ce;
+    bool r_neg;
+    const int q = x87_reduce_pi2(u.sig, u.e, r_val, re, r_neg);
+    x87_sincos_reduced(r_val, re, sv, se, cv, ce);
+    if (sin_out) {
+        const bool neg = u.sign ^ (q >= 2) ^ ((q & 1) == 0 && r_neg);
+        *sin_out = (q & 1) ? x87_round_u128(neg, ce, cv, cw) : x87_round_u128(neg, se, sv, cw);
+    }
+    if (cos_out) {
+        const int qc = (q + 1) & 3;
+        const bool neg = (qc >= 2) ^ ((qc & 1) == 0 && r_neg);
+        *cos_out = (qc & 1) ? x87_round_u128(neg, ce, cv, cw) : x87_round_u128(neg, se, sv, cw);
+    }
+}
+
+static inline X87Value x87_sin(X87Value a, uint16_t cw, bool& c2) {
+    X87Value s{};
+    x87_sincos_core(a, cw, c2, &s, nullptr);
+    return s;
+}
+
+static inline X87Value x87_cos(X87Value a, uint16_t cw, bool& c2) {
+    X87Value c{};
+    x87_sincos_core(a, cw, c2, nullptr, &c);
+    return c;
+}
+
+static inline X87Value x87_sincos(X87Value a, X87Value& cos_out, uint16_t cw, bool& c2) {
+    X87Value s{};
+    x87_sincos_core(a, cw, c2, &s, &cos_out);
+    return s;
+}
+
+// FPTAN: replaces ST(0) by tan(ST(0)) and pushes 1.0 (or quiet NaN / indefinite on NaN/Inf/unsupported).
+static inline X87Value x87_ptan(X87Value a, X87Value& one_out, uint16_t cw, bool& c2) {
+    c2 = false;
+    if (x87_unsupported(a) || x87_is_inf(a)) { one_out = x87_indefinite; return x87_indefinite; }
+    if (x87_is_nan(a)) { one_out = x87_quiet(a); return one_out; }
+    one_out = {x87_integer_bit, 0x3fff};  // ptan one
+    if (x87_is_zero(a)) return a;
+    const X87Unpacked u = x87_unpack(a);
+    if (u.e >= 63) { c2 = true; one_out = x87_indefinite; return a; }  // trig range
+    if (u.e <= -65) return x87_round_u128(u.sign, u.e, {u.sig, 0}, cw, false);
+    X87U128 r_val, sv, cv;
+    int re, se, ce;
+    bool r_neg;
+    const int q = x87_reduce_pi2(u.sig, u.e, r_val, re, r_neg);
+    x87_sincos_reduced(r_val, re, sv, se, cv, ce);
+    const bool neg = u.sign ^ ((q & 1) != 0) ^ r_neg;
+    int te;
+    const X87U128 tv = (q & 1) ? x87_u128_div_norm(cv, ce, sv, se, te)
+                               : x87_u128_div_norm(sv, se, cv, ce, te);
+    return x87_round_u128(neg, te, tv, cw);
+}
+
+// tan(k * pi / 16) in Q0.128 for k = 1, 2, 3, and Q0.64 midpoint thresholds for atan reduction.
+static const X87U128 x87_tan_k[3] = {
+    {0x32ebebc0aa62b00full, 0x7ae9b3a20ca321fbull},
+    {0x6a09e667f3bcc908ull, 0xb2fb1366ea957d3eull},
+    {0xab0dc155bfcc82f5ull, 0x18a42e56cea7698cull},
+};
+static const uint64_t x87_atan_thresh[4] = {
+    0x1936bb8c5b2da262ull, 0x4da820d5718f6f14ull, 0x88d5b8c841a75c35ull, 0xd218015721427e59ull
+};
+
+static inline void x87_atan_unit(X87U128 t_val, int te, X87U128& res, int& re) {
+    if (te <= -65) { res = t_val; re = te; return; }
+    const uint64_t t_q64 = te == 0 ? ~0ull : (te >= -64 ? (t_val.hi >> (-te - 1)) : 0);
+    int k = 0;
+    while (k < 4 && t_q64 > x87_atan_thresh[k]) ++k;
+    X87U128 u_val;
+    int ue;
+    bool u_neg = false;
+    if (k == 0) {
+        u_val = t_val;
+        ue = te;
+    } else if (k == 4) {
+        const X87U128 one_q126{1ull << 62, 0};
+        const X87U128 t_q126 = x87_u128_shr(t_val, 1 - te);
+        X87U128 num = x87_u128_sub(one_q126, t_q126);
+        X87U128 den = x87_u128_add(one_q126, t_q126);
+        if (num.hi == 0 && num.lo == 0) { res = x87_pi2; re = -1; return; }
+        int ne = 1, de = 1;
+        x87_u128_norm(num, ne);
+        x87_u128_norm(den, de);
+        u_val = x87_u128_div_norm(num, ne, den, de, ue);
+        u_neg = true;
+    } else {
+        const X87U128 t_q128 = x87_u128_shr(t_val, -1 - te);
+        const X87U128 c_q128 = x87_tan_k[k - 1];
+        X87U128 num;
+        if (x87_u128_cmp(t_q128, c_q128) >= 0) {
+            num = x87_u128_sub(t_q128, c_q128);
+            u_neg = false;
+        } else {
+            num = x87_u128_sub(c_q128, t_q128);
+            u_neg = true;
+        }
+        if (num.hi == 0 && num.lo == 0) {
+            res = x87_pi2;
+            re = (k == 1) ? -3 : (k == 2) ? -2 : -1;
+            if (k == 3) {
+                res = x87_u128_add(x87_u128_shr(x87_pi2, 1), x87_u128_shr(x87_pi2, 2));
+                re = -1;
+                x87_u128_norm(res, re);
+            }
+            return;
+        }
+        const X87U128 tc_q128 = x87_u128_mul_hi(t_q128, c_q128);
+        X87U128 den = x87_u128_add({1ull << 62, 0}, x87_u128_shr(tc_q128, 2));
+        int ne = -1, de = 1;
+        x87_u128_norm(num, ne);
+        x87_u128_norm(den, de);
+        u_val = x87_u128_div_norm(num, ne, den, de, ue);
+    }
+    X87U128 u_atan;
+    int ua_e;
+    if (ue <= -65) {
+        u_atan = u_val; ua_e = ue;
+    } else {
+        X87U128 u2 = x87_u128_mul_hi(u_val, u_val);
+        u2 = x87_u128_shr(u2, -2 * ue - 2);
+        const X87U128 one_q126{1ull << 62, 0};
+        X87U128 sum = one_q126, pow = one_q126;
+        for (uint64_t n = 1; n <= 19; ++n) {
+            pow = x87_u128_mul_hi(pow, u2);
+            const X87U128 term = x87_u128_div_u64(pow, 2 * n + 1);
+            if (n & 1) sum = x87_u128_sub(sum, term);
+            else sum = x87_u128_add(sum, term);
+            if ((term.hi | term.lo) == 0) break;
+        }
+        u_atan = x87_u128_mul_hi(u_val, sum);
+        ua_e = ue + 2;
+        x87_u128_norm(u_atan, ua_e);
+    }
+    if (k == 0) { res = u_atan; re = ua_e; return; }
+    const X87U128 pi16 = x87_u128_shr(x87_pi2, 2);
+    X87U128 base{0, 0};
+    for (int i = 0; i < k; ++i) base = x87_u128_add(base, pi16);
+    const X87U128 u_q128 = x87_u128_shr(u_atan, -1 - ua_e);
+    res = u_neg ? x87_u128_sub(base, u_q128) : x87_u128_add(base, u_q128);
+    re = -1;
+    x87_u128_norm(res, re);
+}
+
+// FPATAN: atan2(y, x) = atan2(ST(1), ST(0)) rounded to 64 significand bits (precision control does not apply).
+static inline X87Value x87_patan(X87Value y, X87Value x, uint16_t cw) {
+    X87Value out;
+    if (x87_special_operands(y, x, &out)) return out;
+    const bool sy = x87_sign(y), sx = x87_sign(x);
+    if (x87_is_zero(y)) return sx ? x87_round_u128(sy, 1, x87_pi2, cw) : X87Value{0, static_cast<uint16_t>(sy ? 0x8000 : 0)};
+    if (x87_is_inf(y)) {
+        if (x87_is_inf(x)) {
+            if (!sx) return x87_round_u128(sy, -1, x87_pi2, cw);
+            const X87U128 three = x87_u128_add(x87_u128_shr(x87_pi2, 1), x87_u128_shr(x87_pi2, 2));
+            return x87_round_u128(sy, 1, three, cw);
+        }
+        return x87_round_u128(sy, 0, x87_pi2, cw);
+    }
+    if (x87_is_inf(x)) return sx ? x87_round_u128(sy, 1, x87_pi2, cw) : X87Value{0, static_cast<uint16_t>(sy ? 0x8000 : 0)};
+    if (x87_is_zero(x)) return x87_round_u128(sy, 0, x87_pi2, cw);
+    const X87Unpacked uy = x87_unpack(y), ux = x87_unpack(x);
+    const bool swapped = uy.e > ux.e || (uy.e == ux.e && uy.sig > ux.sig);
+    const X87Unpacked num = swapped ? ux : uy, den = swapped ? uy : ux;
+    int te;
+    const X87U128 t_val = x87_u128_div_norm({num.sig, 0}, num.e, {den.sig, 0}, den.e, te);
+    X87U128 av;
+    int ae;
+    x87_atan_unit(t_val, te, av, ae);
+    if (!swapped && !sx) return x87_round_u128(sy, ae, av, cw);
+    const X87U128 base = swapped ? x87_u128_shr(x87_pi2, 1) : x87_pi2;
+    const X87U128 av_q126 = x87_u128_shr(av, 1 - ae);
+    const bool sub = !swapped || !sx;
+    const X87U128 res = sub ? x87_u128_sub(base, av_q126) : x87_u128_add(base, av_q126);
+    return x87_round_u128(sy, 1, res, cw);
+}

@@ -351,7 +351,7 @@ def check_rejections():
         "fcom st(1) as DC D1": (attempt(f"{fld} {fld} dc d1 {pop2}"), "unsupported x87 encoding"),
         "fucompp with one value": (attempt(f"{fld} da e9 c3"), "x87 stack underflow"),
         "f2xm1": (attempt(f"{fld} d9 f0 dd d8 c3"), "unsupported x87 operation"),
-        "fptan": (attempt(f"{fld} d9 f2 dd d8 c3"), "unsupported x87 operation"),
+        "fyl2x": (attempt(f"{fld} d9 f1 dd d8 c3"), "unsupported x87 operation"),
         "frstor m108": (attempt(f"{fld} dd 21 dd d8 c3"), "unsupported x87 operation"),
         "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "stores status-word bits"),
     }

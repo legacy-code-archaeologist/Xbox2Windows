@@ -219,13 +219,17 @@ def main(argv=None):
     missing = sorted(payload - sizes.keys())
     wrong_size = [row | {"disk_bytes": sizes[row["path"]]} for row in entries
                   if row["path"] in sizes and sizes[row["path"]] != row["bytes"]]
+    try:
+        layout_report = compare_layout(layout, payload, sizes.keys())
+    except (OSError, ET.ParseError, KeyError) as exc:
+        parser.error(f"{layout.name!a} is not a readable layout: {type(exc).__name__}: {exc!a}")
     report = {
         "started_utc": start.isoformat(), "directory": root.name, "torrent": torrent.name,
         "torrent_sha256": hashlib.sha256(raw).hexdigest(),
         "payload_bytes": sum(row["bytes"] for row in entries), "payload_count": len(entries),
         "disk_file_count": len(sizes), "missing": missing, "size_mismatches": wrong_size,
         "extra_disk_files": sorted(sizes.keys() - payload),
-        "layout": compare_layout(layout, payload, sizes.keys()), "torrent_order": entries,
+        "layout": layout_report, "torrent_order": entries,
     }
     print(json.dumps({k: report[k] for k in ("payload_count", "payload_bytes", "missing", "size_mismatches", "layout")}), flush=True)
     try:

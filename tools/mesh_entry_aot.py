@@ -8,9 +8,12 @@ remain GPU inputs. Only forward control flow decided by static values is accepte
 
 import argparse
 import json
+import os
+from pathlib import Path
 import re
 import struct
-from pathlib import Path
+import tempfile
+import zlib
 
 from mesh_clip_cull import decode_vs_out_cntl, hlsl_fields, hlsl_writes, vertex_distances
 from pixel_aot import MESH_WAVE64, container_code, disassemble
@@ -1127,7 +1130,13 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
                  vs_out_cntl=vs_out_cntl)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("container", type=Path)
     p.add_argument(
@@ -1148,19 +1157,31 @@ if __name__ == "__main__":
         help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2",
     )
     p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
-        a.container.resolve(),
-        a.geometry_words.resolve(),
-    ):
-        p.error("Expected a separate HLSL output")
-    src = translate(
-        a.container.read_bytes(),
-        json.loads(a.geometry_words.read_text()),
-        a.llvm,
-        a.vertex_header,
-        compute_fallback=a.compute_fallback,
-        vs_out_cntl=a.pa_cl_vs_out_cntl,
-    )
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(src, encoding="ascii")
+    a = p.parse_args(argv)
+    try:
+        if a.output.exists() and a.output.is_dir():
+            raise ValueError(f"Output path is an existing directory: {a.output}")
+        if a.output.suffix.lower() != ".hlsl":
+            raise ValueError("Expected a separate HLSL output")
+        if _same_path(a.output, a.container) or _same_path(a.output, a.geometry_words):
+            raise ValueError("Expected a separate HLSL output")
+        src = translate(
+            a.container.read_bytes(),
+            json.loads(a.geometry_words.read_text(encoding="utf-8")),
+            a.llvm,
+            a.vertex_header,
+            compute_fallback=a.compute_fallback,
+            vs_out_cntl=a.pa_cl_vs_out_cntl,
+        )
+        a.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=a.output.parent) as staging_dir:
+            staged = Path(staging_dir) / a.output.name
+            staged.write_text(src, encoding="ascii")
+            os.replace(staged, a.output)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, struct.error, zlib.error) as exc:
+        p.exit(1, f"{type(exc).__name__}: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,8 +1,10 @@
 // Checks src/startup_stubs/packed_target_format.h without a device, against adapters described
 // by their format-support bits.
-// --mutate stand-in | array | b565 | view | tag: the helper's answer perturbed the way a wrong helper
-// would answer (a stand-in in another format, arrays left alone as before, B5G6R5_UNORM left alone
-// as before, the view format of the stand-in kept packed, the stand-in's tag read back as no tag);
+// --mutate stand-in | array | b565 | sharedexp | sharedexp-uav | view | tag: the helper's answer
+// perturbed the way a wrong helper would answer (a stand-in in another format, arrays left alone as
+// before, B5G6R5_UNORM left alone as before, R9G9B9E5_SHAREDEXP left alone as before, a UAV-only
+// R9G9B9E5_SHAREDEXP texture left alone as under a render-target-only trigger, the view format of the
+// stand-in kept packed, the stand-in's tag read back as no tag);
 // each must fail on the rows it concerns.
 #include "startup_stubs/packed_target_format.h"
 
@@ -18,8 +20,11 @@ constexpr UINT rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET, uav = D3D12_FORMAT_SUPP
 
 struct Adapter {
     UINT b5g5r5a1, b4g4r4a4, rgba8, b5g6r5;
+    UINT sharedexp = 0, hdr = 0;
     UINT operator()(DXGI_FORMAT format) const
     {
+        if (format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) return sharedexp;
+        if (format == DXGI_FORMAT_R11G11B10_FLOAT) return hdr;
         return format == DXGI_FORMAT_B5G5R5A1_UNORM ? b5g5r5a1 : format == DXGI_FORMAT_B4G4R4A4_UNORM ? b4g4r4a4
              : format == DXGI_FORMAT_B5G6R5_UNORM ? b5g6r5 : format == DXGI_FORMAT_R8G8B8A8_UNORM ? rgba8 : rt | uav;
     }
@@ -32,6 +37,10 @@ DXGI_FORMAT stand_in(const D3D12_RESOURCE_DESC& desc, const Adapter& adapter)
     if (!std::strcmp(mutation, "stand-in") && got == DXGI_FORMAT_R8G8B8A8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM;
     if (!std::strcmp(mutation, "array") && desc.DepthOrArraySize != 1) return desc.Format;
     if (!std::strcmp(mutation, "b565") && desc.Format == DXGI_FORMAT_B5G6R5_UNORM) return desc.Format;
+    if (!std::strcmp(mutation, "sharedexp") && desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) return desc.Format;
+    if (!std::strcmp(mutation, "sharedexp-uav") && desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        return desc.Format;
     return got;
 }
 
@@ -162,7 +171,7 @@ int main(int argc, char** argv)
 {
     if (argc == 3 && !std::strcmp(argv[1], "--mutate")) mutation = argv[2];
     else if (argc != 1) {
-        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|view|tag]\n");
+        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|sharedexp|sharedexp-uav|view|tag]\n");
         return 2;
     }
     const auto packed_target_stand_in = stand_in;
@@ -245,6 +254,35 @@ int main(int argc, char** argv)
     shaped.DepthOrArraySize = 6;
     expect("rgba8 RT array", packed_target_stand_in(shaped, none), rgba);
 
+    constexpr auto sharedexp = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    constexpr auto hdr = DXGI_FORMAT_R11G11B10_FLOAT;
+    constexpr UINT sample = D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+    const Adapter sharedexp_missing{0, 0, rt | uav, 0, sample, rt | uav};
+    const Adapter sharedexp_rt_only{0, 0, rt | uav, 0, sample | rt, rt | uav};
+    const Adapter sharedexp_supported{0, 0, rt | uav, 0, sample | rt | uav, rt | uav};
+    const Adapter hdr_no_rt{0, 0, rt | uav, 0, sample, uav};
+    const Adapter hdr_no_uav{0, 0, rt | uav, 0, sample, rt};
+    expect("shared exponent RT only", packed_target_stand_in(texture(sharedexp, RT), hdr_no_uav), hdr);
+    expect("shared exponent UAV only", packed_target_stand_in(texture(sharedexp, UA), hdr_no_rt), hdr);
+    expect("shared exponent RT|UAV", packed_target_stand_in(texture(sharedexp, RT | UA), sharedexp_missing), hdr);
+    expect("shared exponent RT supported", packed_target_stand_in(texture(sharedexp, RT), sharedexp_rt_only), sharedexp);
+    expect("shared exponent RT supported, UAV missing",
+        packed_target_stand_in(texture(sharedexp, RT | UA), sharedexp_rt_only), hdr);
+    expect("shared exponent RT|UAV supported",
+        packed_target_stand_in(texture(sharedexp, RT | UA), sharedexp_supported), sharedexp);
+    expect("shared exponent RT|UAV replacement missing RT", packed_target_stand_in(texture(sharedexp, RT | UA), hdr_no_rt), sharedexp);
+    expect("shared exponent RT|UAV replacement missing UAV", packed_target_stand_in(texture(sharedexp, RT | UA), hdr_no_uav), sharedexp);
+    expect("shared exponent sampled only", packed_target_stand_in(texture(sharedexp, 0), sharedexp_missing), sharedexp);
+    expect("shared exponent depth stencil",
+        packed_target_stand_in(texture(sharedexp, RT | UA | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), sharedexp_missing), sharedexp);
+    expect("shared exponent 3D", packed_target_stand_in(texture(sharedexp, RT | UA, D3D12_RESOURCE_DIMENSION_TEXTURE3D),
+        sharedexp_missing), sharedexp);
+    shaped = texture(sharedexp, RT | UA);
+    shaped.DepthOrArraySize = 6;
+    expect("shared exponent RT|UAV array", packed_target_stand_in(shaped, sharedexp_missing), hdr);
+    shaped.SampleDesc.Count = 4;
+    expect("shared exponent multisampled", packed_target_stand_in(shaped, sharedexp_missing), sharedexp);
+
     // Views: a packed view becomes RGBA8 only on the stand-in for that very format.
     using x2w_startup::PackedView;
     constexpr DXGI_FORMAT plain = DXGI_FORMAT_UNKNOWN;
@@ -269,9 +307,12 @@ int main(int argc, char** argv)
     // back that packed format and its packed view becomes the stand-in; a texture created in the
     // packed format itself carries no tag, so its own view is unchanged; an untagged R8G8B8A8_UNORM
     // texture refuses the packed view.
-    for (const DXGI_FORMAT packed : {b5, b4, b565}) {
+    view("shared exponent view of a tagged rgba8 texture", packed_view(sharedexp, rgba, sharedexp), PackedView::refused);
+    view("shared exponent view of another stand-in", packed_view(sharedexp, rgba, b5), PackedView::refused);
+    for (const DXGI_FORMAT packed : {b5, b4, b565, sharedexp}) {
+        const auto replacement = packed == sharedexp ? hdr : rgba;
         char name[64];
-        Texture stand_in_texture(rgba);
+        Texture stand_in_texture(replacement);
         x2w_startup::mark_packed_stand_in(&stand_in_texture, packed);
         std::snprintf(name, sizeof(name), "format %d stand-in tag", packed);
         expect(name, packed_stand_in_of(&stand_in_texture), packed);
@@ -283,8 +324,8 @@ int main(int argc, char** argv)
         expect(name, packed_stand_in_of(&described), plain);
         std::snprintf(name, sizeof(name), "format %d view of a texture created as described", packed);
         view(name, packed_view(packed, described.GetDesc().Format, packed_stand_in_of(&described)), PackedView::unchanged);
-        Texture untagged(rgba);
-        std::snprintf(name, sizeof(name), "format %d view of an untagged rgba8 texture", packed);
+        Texture untagged(replacement);
+        std::snprintf(name, sizeof(name), "format %d view of an untagged replacement texture", packed);
         view(name, packed_view(packed, untagged.GetDesc().Format, packed_stand_in_of(&untagged)), PackedView::refused);
     }
     Texture b4_stand_in(rgba);

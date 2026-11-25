@@ -46,9 +46,11 @@ src/era_heap.h and classified with era_heap::allocate's desktop rules for a non-
 import argparse
 import bisect
 import json
+import os
 import re
 import struct
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -138,44 +140,48 @@ class Region:
 class Image:
     def __init__(self, path):
         self.pe = pefile.PE(str(path), fast_load=True)
-        d = pefile.DIRECTORY_ENTRY
-        self.pe.parse_data_directories(directories=[
-            d["IMAGE_DIRECTORY_ENTRY_IMPORT"], d["IMAGE_DIRECTORY_ENTRY_EXPORT"],
-            d["IMAGE_DIRECTORY_ENTRY_EXCEPTION"], d["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
-        if self.pe.FILE_HEADER.Machine != pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-            raise ValueError("Expected an x64 image")
-        self.base = self.pe.OPTIONAL_HEADER.ImageBase
-        self.info = InstructionInfoFactory()
-        self.slots = {}  # IAT slot RVA -> (name, "import" or "delay")
-        self.ordinals = []  # xmem.dll imports by ordinal, which have no name to match
-        for desc in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []):
-            self._add_imports(desc, "import")
-        for desc in getattr(self.pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
-            self._add_imports(desc, "delay")
-        self.sections = [(s.VirtualAddress, s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData),
-                          s.Characteristics) for s in self.pe.sections]
-        self.code = []
-        for s in self.pe.sections:
-            if s.Characteristics & SCN_EXECUTE:
-                data = s.get_data()
-                if s.Misc_VirtualSize:
-                    data = data[:s.Misc_VirtualSize]
-                self.code.append((s.VirtualAddress, data))
-        self.functions = []  # (begin, end, chained)
-        for entry in getattr(self.pe, "DIRECTORY_ENTRY_EXCEPTION", []):
-            unwind = self.pe.get_data(entry.struct.UnwindData, 1)
-            chained = bool(unwind and (unwind[0] >> 3) & UNW_FLAG_CHAININFO)
-            self.functions.append((entry.struct.BeginAddress, entry.struct.EndAddress, chained))
-        self.functions.sort()
-        self.begins = [f[0] for f in self.functions]
-        self.exports = {sym.address for sym in
-                        getattr(getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []) if sym.address}
-        # Function entries: exports, unchained .pdata starts, and (added while streaming) call targets.
-        self.entries = set(self.exports) | {b for b, _, chained in self.functions if not chained}
-        self.thunks = self._find_thunks()
-        self.regions = {}
-        self.decoded = 0
-        self.passes = 0
+        try:
+            d = pefile.DIRECTORY_ENTRY
+            self.pe.parse_data_directories(directories=[
+                d["IMAGE_DIRECTORY_ENTRY_IMPORT"], d["IMAGE_DIRECTORY_ENTRY_EXPORT"],
+                d["IMAGE_DIRECTORY_ENTRY_EXCEPTION"], d["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
+            if self.pe.FILE_HEADER.Machine != pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
+                raise ValueError("Expected an x64 image")
+            self.base = self.pe.OPTIONAL_HEADER.ImageBase
+            self.info = InstructionInfoFactory()
+            self.slots = {}  # IAT slot RVA -> (name, "import" or "delay")
+            self.ordinals = []  # xmem.dll imports by ordinal, which have no name to match
+            for desc in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []):
+                self._add_imports(desc, "import")
+            for desc in getattr(self.pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
+                self._add_imports(desc, "delay")
+            self.sections = [(s.VirtualAddress, s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData),
+                              s.Characteristics) for s in self.pe.sections]
+            self.code = []
+            for s in self.pe.sections:
+                if s.Characteristics & SCN_EXECUTE:
+                    data = s.get_data()
+                    if s.Misc_VirtualSize:
+                        data = data[:s.Misc_VirtualSize]
+                    self.code.append((s.VirtualAddress, data))
+            self.functions = []  # (begin, end, chained)
+            for entry in getattr(self.pe, "DIRECTORY_ENTRY_EXCEPTION", []):
+                unwind = self.pe.get_data(entry.struct.UnwindData, 1)
+                chained = bool(unwind and (unwind[0] >> 3) & UNW_FLAG_CHAININFO)
+                self.functions.append((entry.struct.BeginAddress, entry.struct.EndAddress, chained))
+            self.functions.sort()
+            self.begins = [f[0] for f in self.functions]
+            self.exports = {sym.address for sym in
+                            getattr(getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []) if sym.address}
+            # Function entries: exports, unchained .pdata starts, and (added while streaming) call targets.
+            self.entries = set(self.exports) | {b for b, _, chained in self.functions if not chained}
+            self.thunks = self._find_thunks()
+            self.regions = {}
+            self.decoded = 0
+            self.passes = 0
+        except Exception:
+            self.pe.close()
+            raise
 
     def _add_imports(self, desc, kind):
         name = desc.dll.decode(errors="replace").lower()
@@ -505,85 +511,103 @@ def constants(result):
 def scan(path):
     started = time.perf_counter()
     image = Image(path)
-    work = Scan(image)
-    found = []
-    loads = []
-    for instruction in image.stream() if image.slots else ():
-        op = instruction.mnemonic
-        if op == M.CALL and instruction.op0_kind == K.NEAR_BRANCH64:
-            image.entries.add(instruction.near_branch_target)
-        if op in (M.CALL, M.JMP):
-            if instruction.is_ip_rel_memory_operand and instruction.ip_rel_memory_address in image.slots \
-                    and instruction.ip not in image.thunks:
-                found.append((instruction.ip, image.slots[instruction.ip_rel_memory_address], "slot"))
-            elif instruction.op0_kind == K.NEAR_BRANCH64 and instruction.near_branch_target in image.thunks:
-                found.append((instruction.ip, image.thunks[instruction.near_branch_target], "thunk"))
-        elif op == M.MOV and instruction.op0_kind == K.REGISTER and instruction.is_ip_rel_memory_operand \
-                and instruction.ip_rel_memory_address in image.slots:
-            loads.append((instruction.ip, image.slots[instruction.ip_rel_memory_address]))
-    # Calls through a register loaded from a slot, before the register changes.
-    for ip, target in loads:
-        region = image.region(ip)
-        n = region.index.get(ip)
-        if n is None:
-            continue
-        register = full(region.ins[n].op0_register)
-        for instruction in region.ins[n + 1:]:
-            if instruction.mnemonic in (M.CALL, M.JMP) and instruction.op0_kind == K.REGISTER \
-                    and full(instruction.op0_register) == register:
-                found.append((instruction.ip, target, "register"))
-                break
-            if instruction.flow_control in STOPS or image.writes(instruction, register):
-                break
-    sites = []
-    for ip, (name, kind), route in sorted(found):
-        region = image.region(ip)
-        n = region.index.get(ip)
-        attributes = work.resolve(region, n) if n is not None else {
-            "source": "unknown", "detail": "site not on an instruction boundary of its region"}
-        transfer = "jmp" if n is not None and region.ins[n].mnemonic == M.JMP else "call"
-        sites.append({"site": hex(ip), "import": name, "import_kind": kind, "route": route, "transfer": transfer,
-                      "region": f"{region.kind} {hex(region.lo)}", "attributes": attributes})
-    # Writer and caller passes; resolving callers can add data queries of their own.
-    while work.run_queries():
+    try:
+        work = Scan(image)
+        found = []
+        loads = []
+        for instruction in image.stream() if image.slots else ():
+            op = instruction.mnemonic
+            if op == M.CALL and instruction.op0_kind == K.NEAR_BRANCH64:
+                image.entries.add(instruction.near_branch_target)
+            if op in (M.CALL, M.JMP):
+                if instruction.is_ip_rel_memory_operand and instruction.ip_rel_memory_address in image.slots \
+                        and instruction.ip not in image.thunks:
+                    found.append((instruction.ip, image.slots[instruction.ip_rel_memory_address], "slot"))
+                elif instruction.op0_kind == K.NEAR_BRANCH64 and instruction.near_branch_target in image.thunks:
+                    found.append((instruction.ip, image.thunks[instruction.near_branch_target], "thunk"))
+            elif op == M.MOV and instruction.op0_kind == K.REGISTER and instruction.is_ip_rel_memory_operand \
+                    and instruction.ip_rel_memory_address in image.slots:
+                loads.append((instruction.ip, image.slots[instruction.ip_rel_memory_address]))
+        # Calls through a register loaded from a slot, before the register changes.
+        for ip, target in loads:
+            region = image.region(ip)
+            n = region.index.get(ip)
+            if n is None:
+                continue
+            register = full(region.ins[n].op0_register)
+            for instruction in region.ins[n + 1:]:
+                if instruction.mnemonic in (M.CALL, M.JMP) and instruction.op0_kind == K.REGISTER \
+                        and full(instruction.op0_register) == register:
+                    found.append((instruction.ip, target, "register"))
+                    break
+                if instruction.flow_control in STOPS or image.writes(instruction, register):
+                    break
+        sites = []
+        for ip, (name, kind), route in sorted(found):
+            region = image.region(ip)
+            n = region.index.get(ip)
+            attributes = work.resolve(region, n) if n is not None else {
+                "source": "unknown", "detail": "site not on an instruction boundary of its region"}
+            transfer = "jmp" if n is not None and region.ins[n].mnemonic == M.JMP else "call"
+            sites.append({"site": hex(ip), "import": name, "import_kind": kind, "route": route, "transfer": transfer,
+                          "region": f"{region.kind} {hex(region.lo)}", "attributes": attributes})
+        # Writer and caller passes; resolving callers can add data queries of their own.
+        while work.run_queries():
+            for site in sites:
+                work.finish(site["attributes"])
+        words = {}
+        by_source = Counter()
+        unresolved = []
         for site in sites:
-            work.finish(site["attributes"])
-    words = {}
-    by_source = Counter()
-    unresolved = []
-    for site in sites:
-        annotate(site["attributes"])
-        by_source[site["attributes"]["source"]] += 1
-        site_words, complete = constants(site["attributes"])
-        if not complete:
-            unresolved.append(site["site"])
-        for word in site_words:
-            entry = words.setdefault(word, {"word_hex": f"0x{word:x}", "desktop": desktop(word),
-                                            "fields": decode(word), "sites": []})
-            if site["site"] not in entry["sites"]:
-                entry["sites"].append(site["site"])
-    word_list = [words[w] for w in sorted(words)]
-    return {
-        "format": FORMAT,
-        "image": Path(path).name,
-        "imports": [{"import": n, "kind": k} for n, k in sorted(set(image.slots.values()))],
-        "unmatched_xmem_ordinals": image.ordinals,
-        "thunks": [{"thunk": hex(ip), "import": name, "exported": ip in image.exports}
-                   for ip, (name, _) in sorted(image.thunks.items())],
-        "sites": sites,
-        "summary": {
-            "sites": len(sites),
-            "by_source": dict(sorted(by_source.items())),
-            "words": word_list,
-            "null_words": [w["word_hex"] for w in word_list if w["desktop"].startswith("null")],
-            "sites_not_fully_constant": unresolved,
-        },
-        "stats": {"pdata_functions": len(image.functions), "instructions_decoded": image.decoded,
-                  "passes": image.passes, "seconds": round(time.perf_counter() - started, 3)},
-    }
+            annotate(site["attributes"])
+            by_source[site["attributes"]["source"]] += 1
+            site_words, complete = constants(site["attributes"])
+            if not complete:
+                unresolved.append(site["site"])
+            for word in site_words:
+                entry = words.setdefault(word, {"word_hex": f"0x{word:x}", "desktop": desktop(word),
+                                                "fields": decode(word), "sites": []})
+                if site["site"] not in entry["sites"]:
+                    entry["sites"].append(site["site"])
+        word_list = [words[w] for w in sorted(words)]
+        return {
+            "format": FORMAT,
+            "image": Path(path).name,
+            "imports": [{"import": n, "kind": k} for n, k in sorted(set(image.slots.values()))],
+            "unmatched_xmem_ordinals": image.ordinals,
+            "thunks": [{"thunk": hex(ip), "import": name, "exported": ip in image.exports}
+                       for ip, (name, _) in sorted(image.thunks.items())],
+            "sites": sites,
+            "summary": {
+                "sites": len(sites),
+                "by_source": dict(sorted(by_source.items())),
+                "words": word_list,
+                "null_words": [w["word_hex"] for w in word_list if w["desktop"].startswith("null")],
+                "sites_not_fully_constant": unresolved,
+            },
+            "stats": {"pdata_functions": len(image.functions), "instructions_decoded": image.decoded,
+                      "passes": image.passes, "seconds": round(time.perf_counter() - started, 3)},
+        }
+    finally:
+        image.pe.close()
 
 
-def main():
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _atomic_write_text(destination: Path, payload: str) -> None:
+    """Stage JSON output in a sibling temp dir and atomically replace destination."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=destination.parent) as staging_dir:
+        staged = Path(staging_dir) / destination.name
+        staged.write_text(payload, encoding="utf-8")
+        os.replace(staged, destination)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("image", type=Path)
     parser.add_argument("--output", type=Path)
@@ -591,17 +615,24 @@ def main():
                         help="exit 1 when a constant word would make era_heap return null")
     parser.add_argument("--fail-on-unresolved", action="store_true",
                         help="exit 1 when a site has a path that does not end in a constant")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.output is not None:
+            if args.output.exists() and args.output.is_dir():
+                raise ValueError(f"Output path is an existing directory: {args.output}")
+            if _same_path(args.image, args.output):
+                raise ValueError(f"Output path collides with image: {args.output}")
+        if args.image.is_dir():
+            raise ValueError(f"Image path is a directory: {args.image}")
         report = scan(args.image)
+        text = json.dumps(report, indent=2)
+        if args.output is not None:
+            _atomic_write_text(args.output, text + "\n")
+        else:
+            print(text)
     except (OSError, ValueError, pefile.PEFormatError) as exc:
         # Status 1 is reserved for the --fail-on-* gates.
-        parser.exit(2, f"{args.image}: {exc}\n")
-    text = json.dumps(report, indent=2)
-    if args.output:
-        args.output.write_text(text + "\n", encoding="utf-8")
-    else:
-        print(text)
+        parser.exit(2, f"{type(exc).__name__}: {args.image}: {exc}\n")
     summary = report["summary"]
     print(f"{report['image']}: {summary['sites']} sites, {len(summary['words'])} distinct words, "
           f"{len(summary['null_words'])} null, {len(summary['sites_not_fully_constant'])} not fully constant, "
@@ -615,4 +646,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

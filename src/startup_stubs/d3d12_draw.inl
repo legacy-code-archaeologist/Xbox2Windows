@@ -714,6 +714,27 @@ void request_translation(Wrapper* pipeline)
             known ? "already known" : "new");
 }
 
+// Side-effect-free pipeline key lookup for ExecuteIndirect refusal attribution: never writes
+// translation request files and returns 0 when the pipeline has no known console shader key.
+u64 known_pipeline_key(Wrapper* pipeline)
+{
+    if (!pipeline) return 0;
+    if (pipeline->own().mesh86_key) return pipeline->own().mesh86_key;
+    if (pipeline->own().compute_trace_key) return pipeline->own().compute_trace_key;
+    if (pipeline->own().real) return 0;
+    AcquireSRWLockShared(&draw_lock);
+    const auto& by_pipeline = translation_by_pipeline();
+    const auto known = by_pipeline.find(pipeline);
+    u64 key = known != by_pipeline.end() && known->second && known->second->translation
+        ? known->second->translation->key : 0;
+    ReleaseSRWLockShared(&draw_lock);
+    if (!key) {
+        const PipelineInfo* info = pipeline_info(pipeline);
+        if (info && info->path == 86 && info->stream_translation) key = info->stream_translation->key;
+    }
+    return key;
+}
+
 bool needs_rtv_variant(DXGI_FORMAT format)
 {
     switch (format) {
@@ -2019,13 +2040,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,
                 // and bind nothing for a texture the view does not fit (packed_target_format.h).
-                const auto verdict = x2w_startup::packed_view(desc.Format, texture->GetDesc().Format, x2w_startup::packed_stand_in_of(texture));
-                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                const auto actual = texture->GetDesc().Format;
+                const auto verdict = x2w_startup::packed_view(desc.Format, actual, x2w_startup::packed_stand_in_of(texture));
+                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = actual;
                 if (verdict == x2w_startup::PackedView::refused) {
                     static LONG refused;
                     if (first_calls(refused, 6))
                         log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
-                            tr->key, i, desc.Format, texture->GetDesc().Format);
+                            tr->key, i, desc.Format, actual);
                     texture = nullptr;
                     desc = {};
                     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2042,7 +2064,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 return false;
             }
             if (texture && !upload_texture(self, resource, texture)) texture = nullptr;
-            if (texture) require_state(self, texture, sampled_state(self, texture));
+            if (texture) {
+                require_state(self, texture, sampled_state(self, texture));
+                if (resource && !resource->own().tiled_address_srv) retire_hold(self, resource);
+            }
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;

@@ -1438,8 +1438,8 @@ def check_dpp_f16_arith_round_forms():
             ("DPP16", "v_min_f16_dpp"), ("DPP8", "v_min_f16_dpp"),
             ("DPP16", "v_max_f16_dpp"), ("DPP8", "v_max_f16_dpp"),
             ("DPP16", "v_fract_f16_dpp"), ("DPP8", "v_fract_f16_dpp"),
-            ("DPP16", "v_fmac_f16_dpp"), ("DPP8", "v_fmac_f16_dpp"),
-            ("DPP16", "v_ldexp_f16_dpp"), ("DPP8", "v_ldexp_f16_dpp"),
+            ("DPP16", "v_rcp_f16_dpp"), ("DPP8", "v_rcp_f16_dpp"),
+            ("DPP16", "v_cvt_norm_i16_f16_dpp"), ("DPP8", "v_cvt_norm_i16_f16_dpp"),
             ("SDWA", "v_add_f16_sdwa"), ("SDWA", "v_floor_f16_sdwa"),
         }
         for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -1452,6 +1452,43 @@ def check_dpp_f16_arith_round_forms():
         # Control: removing one opcode removes both its DPP16 and DPP8 forms from the count.
         stripped = pixel.ACCEPTED - {"v_add_f16_dpp"}
         assert not {("DPP16", "v_add_f16_dpp"), ("DPP8", "v_add_f16_dpp")} & fc.gfx_forms(
+            stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
+def check_dpp_f16_cvt_fmac_ldexp_forms():
+    """The 12 quad-local DPP16/DPP8 binary16 fmac, ldexp and int16 conversion forms count as covered
+    once the translator accepts their fixtures; unlowered f16 DPP/SDWA neighbours stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.DPP_F16_CVT_FMAC_LDEXP_PROGRAMS.values():
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        ops = ("v_fmac_f16_dpp", "v_ldexp_f16_dpp", "v_cvt_f16_i16_dpp",
+               "v_cvt_f16_u16_dpp", "v_cvt_i16_f16_dpp", "v_cvt_u16_f16_dpp")
+        forms = {(group, op) for group in ("DPP16", "DPP8") for op in ops}
+        assert len(forms) == 12
+        neighbours = {
+            ("DPP16", "v_cvt_norm_i16_f16_dpp"), ("DPP8", "v_cvt_norm_i16_f16_dpp"),
+            ("DPP16", "v_cvt_norm_u16_f16_dpp"), ("DPP8", "v_cvt_norm_u16_f16_dpp"),
+            ("DPP16", "v_frexp_mant_f16_dpp"), ("DPP8", "v_frexp_mant_f16_dpp"),
+            ("DPP16", "v_frexp_exp_i16_f16_dpp"), ("DPP8", "v_frexp_exp_i16_f16_dpp"),
+            ("DPP16", "v_rcp_f16_dpp"), ("DPP8", "v_rcp_f16_dpp"),
+            ("SDWA", "v_ldexp_f16_sdwa"), ("SDWA", "v_cvt_f16_i16_sdwa"), ("SDWA", "v_cvt_i16_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        # Control: removing one opcode removes both its DPP16 and DPP8 forms from the count.
+        stripped = pixel.ACCEPTED - {"v_fmac_f16_dpp"}
+        assert not {("DPP16", "v_fmac_f16_dpp"), ("DPP8", "v_fmac_f16_dpp")} & fc.gfx_forms(
             stripped, fc.load_reference("gfx1013.tsv"))
     finally:
         pixel.ACCEPTED.clear()
@@ -1479,6 +1516,7 @@ if __name__ == "__main__":
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
     check_dpp_f16_arith_round_forms()
+    check_dpp_f16_cvt_fmac_ldexp_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()

@@ -1363,6 +1363,15 @@ OperationResult run_startup_image_store(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
+
+OperationResult run_startup_sharedexp_target(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_sharedexp_target(ctx.device, ctx.messages))
+        return {OutcomeKind::skip, reason};
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_startup_packed_position(const OperationContext& ctx)
 {
     constexpr UINT width = 13, height = 7;
@@ -1588,6 +1597,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-image-cube-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
+    {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},

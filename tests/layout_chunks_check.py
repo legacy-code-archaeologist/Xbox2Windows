@@ -51,6 +51,7 @@ def main():
     assert chunks["3009"]["absent_from_disk"] == [], chunks
     check_layout_destination_paths()
     check_unreadable_torrent_is_a_usage_error()
+    check_unreadable_layout_is_a_usage_error()
     check_decode_torrent()
     check_manifest_selection()
     check_inventory_layout_selection()
@@ -113,6 +114,27 @@ def check_unreadable_torrent_is_a_usage_error() -> None:
             capture_output=True, text=True,
         )
         assert run.returncode == 2 and "Traceback" not in run.stderr, run.stderr
+
+
+def check_unreadable_layout_is_a_usage_error() -> None:
+    torrent = (b"d4:infod5:filesld6:lengthi0e4:pathl1:aeee"
+               b"12:piece lengthi16384e6:pieces0:ee")
+    for layout in ("<Package>", "<Package><Chunk/></Package>",
+                   '<Package><Chunk Id="1"><FileGroup/></Chunk></Package>'):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package"
+            package.mkdir()
+            (package / "layout.xml").write_text(layout, encoding="utf-8")
+            (package / "payload.torrent").write_bytes(torrent)
+            report = Path(directory) / "report.json"
+            run = subprocess.run(
+                [sys.executable, "-B", str(PROJECT / "tools/verify_build.py"),
+                 str(package), "--output", str(report)],
+                capture_output=True, text=True,
+            )
+            assert run.returncode == 2, (layout, run.returncode, run.stderr)
+            assert "layout.xml" in run.stderr and "Traceback" not in run.stderr, run.stderr
+            assert not report.exists(), layout
 
 
 def check_manifest_selection() -> None:

@@ -243,9 +243,33 @@ MUBUF_ATOMIC_METHODS = {
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
     "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
+    "fmin": "CompareExchange", "fmax": "CompareExchange",
 }
 
 IMAGE_FLOAT_ATOMIC_OPS = ("fcmpswap", "fmin", "fmax")
+
+def float_min_max_cas(cas_prefix, value, op):
+    """Raw-word finite-normal binary32 min/max as an InterlockedCompareExchange loop.
+
+    Shared by the image (texel) and MUBUF (byte-address) atomic profiles; cas_prefix is the
+    call up to the opening parenthesis: the free intrinsic `InterlockedCompareExchange(dest)`
+    for a texel destination and the raw UAV method `outputData.InterlockedCompareExchange(off)`
+    for the byte-address destination. The caller guarantees every stored word and the operand
+    are finite-normal binary32, never NaN, subnormal or signed zero. The sign-dependent key
+    orders those values exactly as unsigned integers, so integer CAS reproduces the fmin/fmax
+    result bit-for-bit. The zero seed is outside the caller's domain and can only fetch the
+    observed word; it never writes.
+    """
+    comparison = "<" if op == "fmin" else ">"
+    return (f"    uint value = {value};",
+            "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+            "    uint observed = 0u;", "    uint expected;",
+            "    [allow_uav_condition] do {", "        expected = observed;",
+            "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+            f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
+            f"        {cas_prefix}, expected, next, observed);",
+            "    } while (observed != expected);")
+
 IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec|" + "|".join(IMAGE_FLOAT_ATOMIC_OPS)
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int", "R32_FLOAT": "uint"}
 
@@ -747,7 +771,7 @@ def heap_store_view_hlsl(table_offset, view_count, output_bytes, *, components=4
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
+          image_uav_mip=None, image_float_domain=None, buffer_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
           descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None,
           heap_store_view=None, gather_mips=None):
@@ -788,6 +812,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
     in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
     and operand VGPRs by setting image_float_domain="finite-normal".
+    A raw fixed-address buffer_atomic_fmin/fmax also requires the caller's
+    buffer_float_domain="finite-normal" statement: every stored word and the operand VGPR
+    hold finite-normal binary32, never NaN, subnormal or signed zero.
     gather_mips declares the visible mip count of matching gfx1013 RGBA32 FLOAT native and desktop 2D views at t0
     for one image_gather4_l (see GATHER_HLSL).
     """
@@ -810,6 +837,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if (image_float and (not image_output or image_float_domain != "finite-normal")
             or (not image_float and image_float_domain is not None)):
         raise ValueError("The finite-normal image domain requires an R32_FLOAT atomic UAV and vice versa")
+    if buffer_float_domain is not None and buffer_float_domain != "finite-normal":
+        raise ValueError("Invalid buffer float domain")
     image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
@@ -948,6 +977,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     heap_store_components = 4
     format_store_index = 0
     atomic_update = False
+    buffer_float_update = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
     ds_step_count = 0
@@ -2112,6 +2142,36 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  "    GroupMemoryBarrierWithGroupSync();\n"
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
+        elif m := re.fullmatch(r"v_(or_b32|add_nc_u32)_dpp v(\d+), v(\d+), v(\d+) row_shr:(\d+) "
+                               r"row_mask:0xf bank_mask:0xf( bound_ctrl:[01])?", line):
+            op, dst, src0, src1, shift = m[1], *map(int, m.groups()[1:5])
+            # LLVM 15 assembles bound_ctrl:0 and bound_ctrl:1 to the same set BOUND_CTRL bit and prints :1.
+            bound = m[6] is not None
+            # Rows are 16 of the guest's logical 1D lanes, indexed through group-shared memory.
+            if (cpu != "gfx1013" or max(dst, src0, src1) > 255 or not 1 <= shift <= 15
+                    or guard_span is not None or dims[1] != 1 or dims[2] != 1 or dims[0] % 16):
+                raise ValueError("Unsupported or masked DPP16 row shift")
+            # Without BOUND_CTRL a lane whose source is before its row start keeps its old destination.
+            values = [vector.get(reg) for reg in (src0, src1) + (() if bound else (dst,))]
+            if not all(is_word(value) for value in values):
+                raise ValueError("Unverified DPP16 operand")
+            step = dpp_step_count
+            dpp_step_count += 1
+            row_lane, inside = f"dpp{step}_row_lane", f"dpp{step}_inside"
+            source_thread = f"dpp{step}_source_thread"
+            source, value = f"dpp{step}_source", f"dpp{step}_value"
+            result = f"({source} {'|' if op == 'or_b32' else '+'} ({hlsl_word(values[1])}))"
+            slot = "dpp_stage"
+            staged_steps.append((slot, f"    uint {row_lane} = local.x & 15u;\n"
+                                 f"    bool {inside} = {row_lane} >= {shift}u;\n"
+                                 f"    {slot}[local.x] = {hlsl_word(values[0])};\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {source_thread} = {inside} ? local.x - {shift}u : local.x;\n"
+                                 f"    uint {source} = {inside} ? {slot}[{source_thread}] : 0u;\n"
+                                 "    GroupMemoryBarrierWithGroupSync();\n"
+                                 f"    uint {value} = "
+                                 + (f"{result};" if bound else f"{inside} ? {result} : ({hlsl_word(values[2])});")))
+            vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
@@ -2442,17 +2502,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        InterlockedCompareExchange({destination}, expected, next, observed);",
                                "    } while (observed != expected);"))
             elif op in ("fmin", "fmax"):
-                comparison = "<" if op == "fmin" else ">"
-                # The sign-dependent key orders finite-normal binary32 as unsigned integers.
-                # The zero seed is outside the caller's domain and can only fetch the old word.
-                stores.extend((f"    uint value = {value};",
-                               "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-                               "    uint observed = 0u;", "    uint expected;",
-                               "    [allow_uav_condition] do {", "        expected = observed;",
-                               "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
-                               f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
-                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
-                               "    } while (observed != expected);"))
+                stores.extend(float_min_max_cas(f"InterlockedCompareExchange({destination}", value, op))
             elif compare_swap:
                 # RDNA stores VDATA on a match against VDATA+1. HLSL takes the comparison first.
                 # Numeric equality and bit equality agree for finite-normal binary32.
@@ -2656,6 +2706,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
             op, wide = m[1], bool(m[2])
+            if op in ("fmin", "fmax") and (buffer_float_domain != "finite-normal" or wide or m[7]):
+                raise ValueError("buffer_atomic fmin/fmax require a finite-normal domain, "
+                                 "a single 32-bit operand and no glc")
             if op == "csub" and (wide or not m[7]):
                 raise ValueError("Conditional subtract requires 32-bit glc")
             if op != "csub" and m[7]:
@@ -2690,7 +2743,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if op == "cmpswap":
                 # The ISA places replacement before compare, unlike the HLSL argument order.
                 word = f"{operands[1]}, {word}"
-            if op in ("inc", "dec", "csub"):
+            if op in ("fmin", "fmax"):
+                # Raw-word finite-normal binary32 min/max on the raw UAV, under the caller's
+                # finite-normal domain statement. Reuses the image ordering.
+                stores.extend(float_min_max_cas(f"outputData.InterlockedCompareExchange({offset}u", word, op))
+            elif op in ("inc", "dec", "csub"):
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
                     desired = f"expected >= limit ? {zero} : expected + {one}"
@@ -2712,6 +2769,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 stores.extend((f"    {kind} ignoredAtomic;",
                                f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
             atomic_update = True
+            if op in ("fmin", "fmax"):
+                buffer_float_update = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
@@ -2901,6 +2960,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unused buffer descriptor format constant")
     if load_format_words is not None and format_load_index != len(load_format_words):
         raise ValueError("Unused buffer load format constant")
+    if buffer_float_domain is not None and not buffer_float_update:
+        raise ValueError("Unused buffer float domain")
     if heap_view is not None and not format_load_index:
         raise ValueError("Unused heap view binding")
     if heap_store_view is not None and (not layout or layout[0] != "heap_index" or len(stores) != 1):
@@ -3027,6 +3088,9 @@ def main():
                              "R16G16B16A16_FLOAT for gfx1013 D16 image stores)")
     parser.add_argument("--image-float-domain", choices=("finite-normal",),
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
+    parser.add_argument("--buffer-float-domain", choices=("finite-normal",),
+                        help="Required for raw fixed-address buffer_atomic_fmin/fmax. Every stored word "
+                             "and the operand is finite-normal binary32, never NaN, subnormal or signed zero.")
     parser.add_argument("--wave-size", type=int, choices=(32,),
                         help="Caller's statement that the program runs as wave32, for lane indices in larger groups")
     parser.add_argument("--gather-mips", type=int,
@@ -3049,6 +3113,7 @@ def main():
                    source_stride=args.source_stride, source_format=args.source_format,
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
+                   buffer_float_domain=args.buffer_float_domain,
                    image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,

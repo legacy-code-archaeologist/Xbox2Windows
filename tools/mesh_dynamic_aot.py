@@ -16,7 +16,11 @@ is the host's fallback, which a proven offset never reaches.
 """
 
 import argparse
+import os
 import re
+import struct
+import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -452,7 +456,14 @@ def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out
     return lower(decoded, geometry_word_count, limits, sampler_heap_sgpr, vs_out_cntl)
 
 
-if __name__ == "__main__":
+def _same_path(left: Path, right: Path) -> bool:
+    # resolve() handles a not-yet-existing output path; samefile() handles case/link aliases on Windows.
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("container", type=Path)
     parser.add_argument("--geometry-word-count", type=int, required=True)
@@ -462,16 +473,28 @@ if __name__ == "__main__":
     parser.add_argument("--pa-cl-vs-out-cntl", type=lambda s: int(s, 0),
                         help="PA_CL_VS_OUT_CNTL word that places clip and cull distances in pos1/pos2")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
-        parser.error("Expected a separate HLSL output")
+    args = parser.parse_args(argv)
     if args.sampler_heap_sgpr is not None and (
             not 0 <= args.sampler_heap_sgpr <= 105 or args.sampler_heap_sgpr in ENTRY_SGPRS):
         parser.error("--sampler-heap-sgpr must name a free SGPR (s0-s105, not s3, s17, s20 or s21)")
     try:
+        if args.output.exists() and args.output.is_dir():
+            raise ValueError(f"Output path is an existing directory: {args.output}")
+        if args.output.suffix.lower() != ".hlsl":
+            raise ValueError("Expected a separate HLSL output")
+        if _same_path(args.output, args.container):
+            raise ValueError("Expected a separate HLSL output")
         hlsl = translate(args.container.read_bytes(), args.geometry_word_count, args.llvm,
                          args.sampler_heap_sgpr, args.pa_cl_vs_out_cntl)
-    except (ValueError, KeyError) as error:
-        parser.exit(1, f"mesh_dynamic_aot: {error}\n")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(hlsl, encoding="ascii")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=args.output.parent) as staging_dir:
+            staged = Path(staging_dir) / args.output.name
+            staged.write_text(hlsl, encoding="ascii")
+            os.replace(staged, args.output)
+    except (OSError, ValueError, KeyError, struct.error, zlib.error) as error:
+        parser.exit(1, f"{type(error).__name__}: {error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

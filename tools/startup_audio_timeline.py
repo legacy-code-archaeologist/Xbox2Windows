@@ -94,7 +94,7 @@ def window(packets, start, end):
     }
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("packets", type=Path, help="CSV with seconds relative to process creation")
     parser.add_argument("inputs", type=Path, help="JSONL with QPC seconds and action names")
@@ -103,19 +103,24 @@ def main():
     parser.add_argument("--action", required=True, action="append", help="action to include, repeatable")
     parser.add_argument("--before", type=finite, default=0.44, help="seconds before the event")
     parser.add_argument("--after", type=finite, default=0.30, help="seconds after the event")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.sample_rate < 1 or min(args.before, args.after) < 0 or args.before + args.after == 0:
         parser.error("sample rate and total window length must be positive, and endpoints nonnegative")
     try:
+        if args.packets.is_dir():
+            raise ValueError(f"Packets path is a directory: {args.packets}")
+        if args.inputs.is_dir():
+            raise ValueError(f"Inputs path is a directory: {args.inputs}")
         packets = read_packets(args.packets, args.process_origin_qpc, args.sample_rate)
         events = [
             {"action": name, "qpc": at, **window(packets, at - args.before, at + args.after)}
             for name, at in read_events(args.inputs, set(args.action))
         ]
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, csv.Error) as error:
         parser.error(str(error))
     print(json.dumps({"events": events}, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

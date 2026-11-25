@@ -268,6 +268,7 @@ class Expr:
         if name in ('asuint', 'uint'):
             return v, False
         if name == 'abs':
+            assert s, 'abs of an unsigned value'  # HLSL abs of a uint is the identity
             return (-v if v & 0x80000000 else v) & MASK, True
         if name == 'min':
             assert not s and not rest[0][1]

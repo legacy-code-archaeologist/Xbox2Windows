@@ -1,0 +1,16 @@
+EXPORTS
+    op_sha256rnds2_reg
+    op_sha256rnds2_mem
+    op_sha256rnds2_mem_r8
+    op_sha256rnds2_self_src
+    op_sha256rnds2_dst_xmm0
+    op_sha256rnds2_src_xmm0
+    op_sha256rnds2_all_xmm0
+    op_sha256msg1_reg
+    op_sha256msg1_mem
+    op_sha256msg1_self
+    op_sha256msg2_reg
+    op_sha256msg2_mem
+    op_sha256msg2_self
+    op_sha256_pipeline
+    op_sha256_discarded_read

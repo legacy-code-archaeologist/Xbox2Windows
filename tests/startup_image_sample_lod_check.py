@@ -1,6 +1,7 @@
 """Constant-sampler LOD limits for image_sample, image_sample_l and image_sample_lz in tools/startup/gfx2hlsl.py (#2177).
 
-  controls [form]                      translation controls, pure Python (the default)
+  controls [form]                      translation controls, pure Python (the default); without a form, also the
+                                       compute manifest sampler lines
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                        translate, compile (DXC ps_6_0, and FXC ps_5_1 when given) and draw each form
@@ -40,6 +41,7 @@ sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 import startup_sampler_heap_check as H  # noqa: E402
+from startup_compute_gather_l_check import COMPUTE_TAIL, compute_prefix, cs_pipe, gather_insn  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
 from startup_image_sample_b_check import texel_cell  # noqa: E402
 
@@ -278,10 +280,30 @@ def controls(only=None):
     print('translate_to logs the unvalidated heap sampler once, and nothing for a constant sampler')
     if only:
         return
+    check_compute_manifest()
     # The three forms differ from each other and from the ordinary line, and the model has distinct mips per form.
     assert len({texel_cell(m, s) for m in range(3) for s in range(2)}) == 6
     assert len({tuple(FORMS[f][3:5]) for f in FORMS}) == 3
     print('draw model: every form reads its limit mip and its control reads another')
+
+
+def check_compute_manifest():
+    """The compute manifest names the same three sampler lines as the graphics one (#2463).
+
+    The programs reuse the helpers of startup_compute_gather_l_check: its compute prefix (sampler words in s24-s27,
+    s24 = 0x12), and gather_insn with a 2D sample opcode in place of the gather one. The binary mode of this check
+    does not reassemble them with llvm-mc; each case asserts the sample call the translator decodes."""
+    for form, opcode in (('lz', 0x27), ('l', 0x24)):
+        for variant, w2, tag in (('limits', 0x4500000, 'smpl'), ('mip filter none', 0x500000, 'smp')):
+            pipe = cs_pipe(compute_prefix(w2=w2) + gather_insn(0xf, 1, opcode) + COMPUTE_TAIL)
+            assert '.SampleLevel(q0,' in pipe.hlsl_cs(), (form, variant)
+            lines = [line for line in pipe.manifest().splitlines() if line.startswith('smp')]
+            assert lines == ['%s 0 0x12 0xfff000 0x%x 0x0' % (tag, w2)], (form, variant, lines)
+    pipe = cs_pipe(compute_prefix() + gather_insn(1, 1, 0x2f) + COMPUTE_TAIL)
+    assert '.SampleCmpLevelZero(q0,' in pipe.hlsl_cs()
+    lines = [line for line in pipe.manifest().splitlines() if line.startswith('smp')]
+    assert lines == ['smpc 0 0x12 0xfff000 0x4500000 0x0'], lines
+    print('compute manifest: smpl with LOD limits (lz, l); controls: smp with mip filter 0, smpc for comparison')
 
 
 def check_binary(llvm_mc):

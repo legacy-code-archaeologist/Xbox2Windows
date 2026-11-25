@@ -1,0 +1,23 @@
+EXPORTS
+    op_sgdt
+    op_sgdt_disp
+    op_sidt
+    op_sidt_disp
+    op_sldt_r16
+    op_sldt_r32
+    op_sldt_r64
+    op_sldt_m16
+    op_sldt_m16_disp
+    op_str_r16
+    op_str_r32
+    op_str_r64
+    op_str_m16
+    op_str_m16_disp
+    op_smsw_r16
+    op_smsw_r32
+    op_smsw_r64
+    op_smsw_m16
+    op_smsw_m16_disp
+    op_sysdesc_flags_preserve
+    op_sysdesc_discarded_stores
+    op_sysdesc_unused_reg

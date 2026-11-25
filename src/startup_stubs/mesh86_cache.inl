@@ -204,7 +204,7 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
         const auto& parameter = (*params)[i];
         if (parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
             parameter.constants_count && parameter.constants_count <= 8) continue;
-        if (mesh_xmem_handoff() && srv_root == UINT_MAX && parameter.type == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+        if ((mesh_xmem_handoff() || mesh_xmem_loose_srv()) && srv_root == UINT_MAX && parameter.type == D3D12_ROOT_PARAMETER_TYPE_SRV &&
             parameter.shader_register == 0 && parameter.space == 0 && !request.ps.empty()) {
             srv_root = i;
             continue;

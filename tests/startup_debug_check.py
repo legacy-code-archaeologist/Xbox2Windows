@@ -130,6 +130,13 @@ def main(probe, calls_dll):
         assert "process exited with 0x00000000" in out, out
         assert "debug-probe heap flags 0x70\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
 
+        out, _ = run(probe, work, "unlimited", {}, options=("--timeout", "0", "--continue-asserts", "-1"))
+        assert "process exited with 0x00000000" in out and "timeout after" not in out, out
+        out, _ = run(probe, work, "assert-cap", {}, options=("--timeout", "0", "--continue-asserts", "1"))
+        assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out, out
+        out, _ = run(probe, work, "finite", {}, options=("--timeout", "1", "--continue-asserts", "-1"))
+        assert "timeout after" in out and "process exited with" not in out, out
+
         # X2W_STOP_AT on the second site: the first is still stepped over, the run stops at the second.
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})
         assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out and "first chance" in out, out

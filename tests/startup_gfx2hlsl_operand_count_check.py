@@ -52,6 +52,16 @@ def outcome(module, op, sources):
     return 'ok'
 
 
+def refusal(module, op, sources):
+    """The Unsupported text for op with the given number of sources, or None when it is not refused."""
+    line = '%s v1, %s' % (op, ', '.join('v%d' % (2 + i) for i in range(sources))) if sources else '%s v1' % op
+    try:
+        probe(module)().one(op, line)
+    except module.Unsupported as error:
+        return str(error)
+    return None
+
+
 def table_counts(module, table):
     wrong = []
     for op, (arity, _) in getattr(module, table).items():
@@ -87,6 +97,40 @@ check('control: without the guard v_add_f32 with one source raises IndexError',
 check('control: without the guard v_med3_f32 with four sources translates',
       outcome(unguarded, 'v_med3_f32', 4) == 'ok', outcome(unguarded, 'v_med3_f32', 4))
 check('control: without the guard the VEC_F table check fails', bool(table_counts(unguarded, 'VEC_F')))
+
+# Handlers outside the tables keep their operands in method bodies, so the same rule is asserted here: the
+# destination plus exactly its sources, and a short list refused rather than indexed.
+BODY_HANDLERS = (('v_mov_b32', 1, 2, 'expected 2'), ('v_cvt_i32_f32', 1, 2, 'expected 2'),
+                     ('v_cndmask_b32', 2, 3, 'expected 3 or 4'), ('s_bfm_b32', 2, 2, 'expected 3'),
+                     ('v_cvt_pkrtz_f16_f32', 2, 3, 'expected 3'))
+for op, sources, operands, expected in BODY_HANDLERS:
+    got = [outcome(G, op, n) for n in (sources - 1, sources)]
+    check('%s: translates with %d operands and refuses %d' % (op, operands, operands - 1),
+          got == ['refused', 'ok'], repr(got))
+    # The count in the message is a literal in these bodies, so it can drift from the condition that raises it.
+    # The census prints this text, so a wrong number would be reported to the reader as the requirement.
+    # The short list always refuses; the long one refuses only where the handler has no extra form
+    # (v_cndmask_b32 takes a fourth operand), so only an actual refusal is checked for its text.
+    for length in (sources - 1, sources + 1):
+        message = refusal(G, op, length)
+        if message is not None:
+            check('%s with %d operands names %r' % (op, length, expected), message.endswith(expected),
+                  repr(message))
+    check('%s: the short form is the one the message is checked on' % op,
+          refusal(G, op, sources - 1) is not None, op)
+
+# Negative control: with each guard disabled, the short form raises IndexError again instead of refusing.
+stripped = source
+for condition in ('if len(ops) != 2:', 'if len(ops) != 3:', 'if len(ops) not in (3, 4):'):
+    stripped = stripped.replace('        ' + condition, '        if False:')
+spec = importlib.util.spec_from_loader('gfx2hlsl_no_body_guards', loader=None)
+no_guards = importlib.util.module_from_spec(spec)
+no_guards.__dict__['__file__'] = G.__file__
+exec(compile(stripped, G.__file__, 'exec'), no_guards.__dict__)
+for op, sources, operands, _ in BODY_HANDLERS:
+    got = outcome(no_guards, op, sources - 1)
+    check('control: without its guard %s with %d operands raises IndexError' % (op, operands - 1),
+          got == 'IndexError', got)
 
 print('operand count checks: %d failed' % len(failures))
 sys.exit(1 if failures else 0)

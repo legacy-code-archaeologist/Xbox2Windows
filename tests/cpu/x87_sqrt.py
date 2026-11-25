@@ -273,8 +273,8 @@ def check_rejections():
     rejected = {
         "fsqrt on an empty stack": (attempt("d9 fa c3"), "x87 stack underflow"),
         "fsqrt without a store": (attempt(f"{fld} d9 fa c3"), "x87 stack not empty at return"),
-        "fsin": (attempt(f"{fld} d9 fe {fstp} c3"), "unsupported x87 operation"),
-        "fsincos": (attempt(f"{fld} d9 fb {fstp} {fstp} c3"), "unsupported x87 operation"),
+        "f2xm1": (attempt(f"{fld} d9 f0 {fstp} c3"), "unsupported x87 operation"),
+        "fyl2x": (attempt(f"{fld} d9 f1 {fstp} {fstp} c3"), "unsupported x87 operation"),
         "fnsave": (attempt(f"{fld} dd 31 {fstp} c3"), "unsupported x87 operation"),
         "frstor": (attempt(f"dd 21 {fld} {fstp} c3"), "unsupported x87 operation"),
     }

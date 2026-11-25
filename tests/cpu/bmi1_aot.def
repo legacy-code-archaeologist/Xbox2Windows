@@ -1,0 +1,22 @@
+EXPORTS
+    op_blsi32
+    op_blsi64
+    op_blsmsk32
+    op_blsmsk64
+    op_blsr32
+    op_blsr64
+    op_blsi32_mem
+    op_blsi64_mem
+    op_blsmsk32_mem
+    op_blsmsk64_mem
+    op_blsr32_mem
+    op_blsr64_mem
+    op_blsi32_flags
+    op_blsi64_flags
+    op_blsmsk32_flags
+    op_blsmsk64_flags
+    op_blsr32_flags
+    op_blsr64_flags
+    op_blsr64_mem_flags
+    op_r8_source_then_store
+    op_bmi1_discarded_read

@@ -172,22 +172,29 @@ def integer(text: str) -> int:
     return int(text, 0)
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--offset", type=integer, required=True, help="Byte offset of the ADAT or TADA header")
     parser.add_argument("--size", type=integer, required=True, help="Bytes in the caller-supplied bank range")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.offset < 0:
+            raise ValueError(f"Expected non-negative --offset, got {args.offset}")
+        if args.size <= 0:
+            raise ValueError(f"Expected positive --size, got {args.size}")
+        if args.archive.is_dir():
+            raise ValueError(f"Archive path is a directory: {args.archive}")
         with args.archive.open("rb") as stream:
             bank = read_bank(stream, args.offset, args.size)
-    except (OSError, ValueError) as error:
-        parser.exit(1, f"{args.archive}: {error}\n")
+    except (OSError, ValueError, struct.error) as exc:
+        parser.exit(1, f"{type(exc).__name__}: {exc}\n")
     result: dict = {"stream_count": bank.stream_count}
     if bank.music:
         result |= {"layout": bank.layout, "music": asdict(bank.music)}
     print(json.dumps(result | {"formats": [asdict(g) for g in bank.formats]}))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

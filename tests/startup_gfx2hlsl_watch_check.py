@@ -103,11 +103,53 @@ endpgm = 0xbf810000
 mesh = struct.pack('<6I', 0xbf900009, *position, *primitive, endpgm)
 pixel = struct.pack('<3I', 0xf800080f, 0x03020100, endpgm)
 vertex = struct.pack('<3I', *position, endpgm)
-mesh57_fixture(mesh, pixel, 'slot 57 mesh code emission is unavailable')
-mesh57_fixture(mesh, b'', 'slot 57 mesh code emission is unavailable')
+mesh57_fixture(mesh, pixel, 'slot 57 mesh group-index exchange: instruction 1 of the accepted shape (s_mov_b64) is absent')
+mesh57_fixture(mesh, b'', 'slot 57 mesh without a pixel stage is not covered')
 mesh57_fixture(vertex, pixel, 'slot 57 mesh stage has no verified allocation and primitive export')
+# A pixel stage whose only export is the null target (done, vm, no channels) is a depth-only stage and passes the role check.
+null_export = struct.pack('<3I', 0xf8001890, 0, endpgm)
+mesh57_fixture(mesh, null_export, 'slot 57 mesh with a depth-only pixel stage is not covered')
+# Controls: a position export, or a null export mixed with one, stays refused.
+mesh57_fixture(mesh, struct.pack('<3I', *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
+mesh57_fixture(mesh, struct.pack('<5I', 0xf8001890, 0, *position, endpgm), 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, vertex, 'slot 57 pixel stage has an incompatible export or termination')
 mesh57_fixture(mesh, pixel, 'slot 57 mesh request key mismatch', tamper=True)
+
+
+def mesh57_resume_controls():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        key = 0x57
+        touch(d / 'req_0000000000000057.m57')
+        stem = d / f'{key:016x}'
+        touch(stem.with_suffix('.ms57.txt'))
+        ms, ps = (stem.with_suffix(suffix) for suffix in ('.ms57.cso', '.ps57.cso'))
+        # A container envelope is sufficient for an on-disk completeness check.
+        part = struct.pack('<4sI4s', b'DXIL', 4, b'test')
+        bytecode = struct.pack('<4s16sHHIII', b'DXBC', bytes(16), 1, 0, 36 + len(part), 1, 36) + part
+        prior = os.environ.pop('X2W_FXC', None)
+        try:
+            expect('slot 57 manifest alone is pending for bytecode', scan(d, False), [key])
+            touch(ms, bytecode)
+            expect('slot 57 with only mesh bytecode is pending', scan(d, False), [key])
+            touch(ps, bytecode)
+            expect('slot 57 with both complete containers is done', scan(d, False), [])
+            for stage in (ms, ps):
+                touch(stage, bytecode[:-1])
+                expect(f'{stage.suffixes[0]} with truncated bytecode is pending', scan(d, True), [key])
+                touch(stage, b'bad!' + bytecode[4:])
+                expect(f'{stage.suffixes[0]} with a bad container header is pending', scan(d, False), [key])
+                touch(stage, bytecode)
+            os.environ['X2W_FXC'] = ''
+            ps.unlink()
+            expect('slot 57 manifest-only mode finishes without pixel bytecode', scan(d, False), [])
+        finally:
+            os.environ.pop('X2W_FXC', None)
+            if prior is not None:
+                os.environ['X2W_FXC'] = prior
+
+
+mesh57_resume_controls()
 
 # Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
 # different missing base request, so each failure names its own base and a result reported against

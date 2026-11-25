@@ -67,6 +67,25 @@ DSTORAGE_FAIL_OUTCOMES = {
     "zlib failed",
 }
 TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
+INDIRECT_PREFIX = "x2w-render indirect: "
+# Ordered fields emitted by the slot-61 census in d3d12_xs_device.cpp.
+INDIRECT_OUTCOMES = (
+    "forwarded", "refused graphics-pipeline", "compute-pipeline", "placeholder-signature", "other",
+)
+INDIRECT_KINDS = ("other", "dispatch", "draw", "drawindexed", "dispatchmesh")
+RE_INDIRECT_COUNT = re.compile(r"[0-9]{1,19}\Z")
+# The budget heartbeat is produced by report_budget() in d3d12_xs_device.cpp.
+BUDGET_DECIMAL = r"[0-9]{1,20}"
+BUDGET_SEGMENT = rf"(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
+BUDGET_CATEGORY = rf"{BUDGET_DECIMAL}/{BUDGET_DECIMAL}\+{BUDGET_DECIMAL}/{BUDGET_DECIMAL}"
+RE_GPU_BUDGET = re.compile(
+    rf"x2w-budget local=(?:(?P<usage>{BUDGET_DECIMAL})/(?P<budget>{BUDGET_DECIMAL})|n/a)"
+    rf" nonlocal={BUDGET_SEGMENT} placed={BUDGET_CATEGORY}"
+    rf" texture=(?P<live>{BUDGET_DECIMAL})/{BUDGET_DECIMAL}"
+    rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
+    + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
+    + rf" unmeasured={BUDGET_DECIMAL}"
+)
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")
 RE_HEX = re.compile(r"0x[0-9a-fA-F]{1,8}\Z")
@@ -283,11 +302,67 @@ def iter_log_files(log_target: Path) -> list[Path]:
     return files
 
 
+def parse_indirect_snapshot(payload: str) -> dict[tuple[str, str], int] | None:
+    groups = payload.split("; ")
+    if len(groups) != len(INDIRECT_OUTCOMES):
+        return None
+    snapshot: dict[tuple[str, str], int] = {}
+    for expected, group in zip(INDIRECT_OUTCOMES, groups):
+        outcome, _, counts = group.partition(": ")
+        if outcome != expected:
+            return None
+        if counts == "0":
+            continue
+        fields = counts.split()
+        if not fields or len(fields) % 2:
+            return None
+        for kind, count in zip(fields[::2], fields[1::2]):
+            key = (outcome, kind)
+            if kind not in INDIRECT_KINDS or key in snapshot or not RE_INDIRECT_COUNT.fullmatch(count):
+                return None
+            snapshot[key] = int(count)
+    return snapshot
+
+
+@dataclass(frozen=True)
+class GpuBudgetSample:
+    local: tuple[int, int] | None
+    live_texture_bytes: int
+    retained_texture_bytes: int
+    retained_textures: int
+
+
+@dataclass
+class GpuBudgetSummary:
+    samples: int = 0
+    known_local_budget: int = 0
+    above_local_budget: int = 0
+    local_peak: GpuBudgetSample | None = None
+    texture_peak: GpuBudgetSample | None = None
+
+    def observe(self, match: re.Match[str]) -> None:
+        local = (int(match["usage"]), int(match["budget"])) if match["usage"] is not None else None
+        sample = GpuBudgetSample(local, int(match["live"]), int(match["retained"]), int(match["objects"]))
+        self.samples += 1
+        if self.texture_peak is None or sample.retained_texture_bytes > self.texture_peak.retained_texture_bytes:
+            self.texture_peak = sample
+        if local is None or local[1] == 0:
+            return
+        usage, budget = local
+        self.known_local_budget += 1
+        self.above_local_budget += usage > budget
+        peak = self.local_peak.local if self.local_peak else None
+        if peak is None or usage * peak[1] > peak[0] * budget:
+            self.local_peak = sample
+
+
 def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
     """Aggregate startup telemetry counters from an iterable of log lines."""
     slot70_refusals: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
     d3d12_unhandled: Counter[str] = Counter()
     slot133_outcomes: Counter[str] = Counter()
+    indirect_peaks: Counter[tuple[str, str]] | None = None
+    gpu_budget = GpuBudgetSummary()
     d3d12_debug: Counter[tuple[str, str]] = Counter()
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
@@ -299,6 +374,20 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
         if not line:
             continue
         endpoint.observe(line)  # reads only; the line is still classified below
+
+        budget_match = RE_GPU_BUDGET.fullmatch(line)
+        if budget_match:
+            gpu_budget.observe(budget_match)
+            continue
+
+        if line.startswith(INDIRECT_PREFIX):
+            snapshot = parse_indirect_snapshot(line.removeprefix(INDIRECT_PREFIX))
+            if snapshot is not None:
+                if indirect_peaks is None:
+                    indirect_peaks = Counter()
+                # The runtime emits cumulative snapshots. Counter union takes each bucket's maximum.
+                indirect_peaks |= Counter(snapshot)
+            continue
 
         # 1. slot70 memory SRV refusals
         m = RE_SLOT70.search(line)
@@ -429,6 +518,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
         "slot70_refusals": slot70_refusals,
         "d3d12_unhandled": d3d12_unhandled,
         "slot133_outcomes": slot133_outcomes,
+        "indirect_peaks": indirect_peaks,
+        "gpu_budget": gpu_budget,
         "d3d12_debug": d3d12_debug,
         "dstorage_failures": dstorage_failures,
         "dstorage_hresults": dstorage_hresults,
@@ -586,6 +677,41 @@ def format_markdown(
         out.extend(["### `Device::slot133` Placed Resources", ""])
         s133_rows = [[s133[name], name] for name in SLOT133_OUTCOMES if s133[name]]
         out.extend(_format_table(["Count", "Outcome"], s133_rows, len(s133_rows), sum(s133.values()), max_items))
+
+    indirect = summary["indirect_peaks"]
+    if indirect is not None:
+        out.extend([
+            "### `ExecuteIndirect` Outcomes",
+            "",
+            "Peak sampled cumulative count per cell. Rows and columns can peak in different samples.",
+            "",
+        ])
+        rows = [[outcome, *(indirect[outcome, kind] for kind in INDIRECT_KINDS)] for outcome in INDIRECT_OUTCOMES]
+        out.extend(_format_table(["Outcome", *INDIRECT_KINDS], rows, len(rows), 0, len(rows)))
+
+    gpu_budget = summary["gpu_budget"]
+    if gpu_budget.samples:
+        out.extend([
+            "### GPU Memory Budget",
+            "",
+            f"- Complete samples: `{gpu_budget.samples}`",
+            f"- Samples above local budget: `{gpu_budget.above_local_budget}` of `{gpu_budget.known_local_budget}` "
+            "with a positive reported local budget",
+            "",
+        ])
+        rows = []
+        for label, sample in (
+            ("Highest local usage-to-budget ratio", gpu_budget.local_peak),
+            ("Most retained texture bytes", gpu_budget.texture_peak),
+        ):
+            if sample is not None:
+                rows.append([
+                    label, *(sample.local if sample.local is not None else ("n/a", "n/a")),
+                    sample.live_texture_bytes, sample.retained_texture_bytes, sample.retained_textures,
+                ])
+        headers = ["Sample", "Local usage bytes", "Local budget bytes", "Live texture bytes",
+                   "Retained texture bytes", "Retained textures"]
+        out.extend(_format_table(headers, rows, len(rows), 0, len(rows)))
 
     # 3. x2w-d3d12-debug
     dbg = summary["d3d12_debug"]

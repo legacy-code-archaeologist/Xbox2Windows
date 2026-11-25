@@ -3,6 +3,10 @@
 The profile accepts:
 - FLD and FSTP with an m32, m64 or m80 operand, and FST with an m32 or m64 operand;
 - FLD, FST, FSTP and FXCH with ST(i), FCHS and FABS, FSQRT and FRNDINT;
+- FSIN, FCOS, FSINCOS, FPTAN and FPATAN (64-bit precision; FSIN, FCOS, FSINCOS and FPTAN set C2 when
+  |ST(0)| >= 2^63 and leave C0, C1 and C3 undefined; FPATAN leaves C0 to C3 undefined; finite |ST(0)| >= 2^63
+  for FSINCOS and FPTAN is outside the static-depth profile because hardware leaves the stack unchanged
+  without pushing, so lowered FSINCOS and FPTAN trap via x87_trap() when |ST(0)| >= 2^63);
 - FXTRACT, which replaces ST(0) by its exponent and pushes its significand, and FSCALE;
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
@@ -123,7 +127,8 @@ FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMO
          M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero", M.FCMOVU: "parity", M.FCMOVNU: "!parity"}
 # 8087/287 interrupt-mask and protected-mode controls; the 80387 and later execute them as FNOP.
 LEGACY_CONTROLS = {M.FNENI: "fneni", M.FNDISI: "fndisi", M.FNSETPM: "fnsetpm"}
-X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
+X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FSIN, M.FCOS, M.FSINCOS,
+                     M.FPTAN, M.FPATAN, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM, M.FINCSTP,
@@ -140,6 +145,7 @@ STATUS_WRITERS = STATUS_COMPARES | {M.FTST, M.FXAM, *ICOMPARES}
 COMPARE_SW = "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 : r == 3 ? 0x4500 : 0);"
 # Status-word bits: C0, C2 and C3 (the comparison result), C1 (bit 0 of an FPREM quotient), and TOP.
 C_BITS = 0x4500
+C2_BIT = 0x0400
 C1_BIT = 0x0200
 TOP_BITS = 0x3800
 # IE, DE, ZE, OE, UE, PE, SF and ES (bits 0 to 7) and the busy bit (bit 15): the bits that FNINIT clears and that
@@ -157,6 +163,8 @@ CHECKED_DECLARATION = "X87Value x87_slot[8]{}; uint16_t x87_cw = 0x027f;"
 STATUS = {"unmasked": 1, "precision": 2, "unrestored": 3, "partial": 4, "nanremainder": 5, "bcddigit": 6}
 # The checked entry's partial remainders.
 REMAINDERS = frozenset({M.FPREM, M.FPREM1})
+# Transcendental instructions that leave C2 known (1 when |ST(0)| >= 2^63, 0 otherwise) and C0, C1, C3 undefined.
+TRIG_C2 = frozenset({M.FSIN, M.FCOS, M.FSINCOS, M.FPTAN})
 # FNSTENV and FNSAVE store the 32-bit protected-mode environment (28 bytes: control word, status word, tag word,
 # instruction and data pointers); FNSAVE follows it with the eight registers (108 bytes) and then initializes.
 ENVIRONMENT = {M.FNSTENV: S.FPU_ENV28, M.FNSAVE: S.FPU_STATE108}
@@ -166,7 +174,8 @@ def declaration(body, checked=None):
     """The x87 locals of a lowered function: the slots, the control word and, in a function that compares
     into the status word or stores it, the condition bits of the status word."""
     text = DECLARATION if checked is None else CHECKED_DECLARATION
-    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic in REMAINDERS or i.mnemonic in (M.FNSTSW, M.FNINIT, *ENVIRONMENT) for i in body):
+    if any(i.mnemonic in STATUS_WRITERS or i.mnemonic in REMAINDERS or i.mnemonic in TRIG_C2
+           or i.mnemonic in (M.FNSTSW, M.FNINIT, *ENVIRONMENT) for i in body):
         text += " uint16_t x87_sw = 0; (void)x87_sw;"
     return text
 
@@ -344,17 +353,21 @@ def _effect(i, depth, checked=None, paired=False):
         if depth < 2:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth
-    if op == M.FXTRACT:
+    if op == M.FXTRACT or op in (M.FSINCOS, M.FPTAN):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         if depth == 8:
             raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
         return depth + 1
+    if op == M.FPATAN:
+        if depth < 2:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth - 1
     if op in CONSTANTS:
         if depth == 8:
             raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
         return depth + 1
-    if op in (M.FCHS, M.FABS, M.FSQRT, M.FRNDINT):
+    if op in (M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FSIN, M.FCOS):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth
@@ -592,6 +605,8 @@ def _after(i, s):
         c = STATUS_BITS
     elif op in REMAINDERS:  # quotient bits and C2 = 0; the exception flags may be raised
         c = C_BITS | C1_BIT
+    elif op in TRIG_C2:  # C2 is known; C0, C1, C3 and exception flags are undefined
+        c = C2_BIT
     elif op in COMPARES:  # FCOMI leaves C0, C2 and C3, but may raise an exception flag
         c = s.c & ~EXCEPTION_BITS
     elif not (is_x87(i) or call):  # integer instructions change none of it
@@ -821,6 +836,18 @@ def _statement(i, depth, address, checked, parity, status_word=False):
         return f"x87_slot[{depth}] = X87Value{{{sig:#018x}ull, {se:#06x}}};  // {name}"
     if op in (M.FSQRT, M.FRNDINT):
         return f"x87_slot[{top}] = {'x87_sqrt' if op == M.FSQRT else 'x87_rndint'}(x87_slot[{top}], x87_cw);"
+    if op in (M.FSIN, M.FCOS):
+        fn, name = ("x87_sin", "fsin") if op == M.FSIN else ("x87_cos", "fcos")
+        return (f"{{ bool c2 = false; x87_slot[{top}] = {fn}(x87_slot[{top}], x87_cw, c2); "
+                f"x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // {name}")
+    if op == M.FSINCOS:
+        return (f"{{ bool c2 = false; X87Value c; x87_slot[{top}] = x87_sincos(x87_slot[{top}], c, x87_cw, c2); "
+                f"if (c2) x87_trap(); x87_slot[{depth}] = c; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fsincos")
+    if op == M.FPTAN:
+        return (f"{{ bool c2 = false; X87Value one; x87_slot[{top}] = x87_ptan(x87_slot[{top}], one, x87_cw, c2); "
+                f"if (c2) x87_trap(); x87_slot[{depth}] = one; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fptan")
+    if op == M.FPATAN:
+        return f"x87_slot[{top - 1}] = x87_patan(x87_slot[{top - 1}], x87_slot[{top}], x87_cw);  // fpatan"
     if op in (M.FCHS, M.FABS):
         return f"x87_slot[{top}] = {'x87_chs' if op == M.FCHS else 'x87_abs'}(x87_slot[{top}]);"
     if op == M.FLD:

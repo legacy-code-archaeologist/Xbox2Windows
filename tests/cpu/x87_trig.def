@@ -1,0 +1,19 @@
+EXPORTS
+    sin_m80
+    sin_to_m64
+    sin_to_m32
+    cos_m80
+    cos_to_m64
+    cos_to_m32
+    sin_c2_readers
+    sincos_m80
+    sincos_sum
+    sincos_depth7
+    ptan_m80
+    ptan_c2_reset
+    ptan_to_m64
+    ptan_depth7
+    patan_m80
+    patan_to_m64
+    patan_to_m32
+    patan_depth8

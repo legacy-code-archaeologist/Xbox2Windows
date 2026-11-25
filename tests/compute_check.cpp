@@ -58,8 +58,10 @@ UINT texture_words_per_texel(DXGI_FORMAT format)
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
-// source replaces the generated t0 words when a store case supplies its own.
-static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>* source = nullptr)
+// source replaces the generated t0 words when a store case supplies its own, and initial
+// replaces the sentinel words that seed the output buffer.
+static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>* source = nullptr,
+                        const std::array<UINT, capacity>* initial = nullptr)
 {
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
@@ -67,7 +69,7 @@ static void fill_upload(ID3D12Resource* upload, const std::array<UINT, capacity>
     auto* words = static_cast<UINT*>(mapped);
     for (UINT i = 0; i < capacity; ++i) {
         words[i] = source ? (*source)[i] : input_word(i);
-        words[capacity + i] = sentinel;
+        words[capacity + i] = initial ? (*initial)[i] : sentinel;
     }
     auto* cb = static_cast<unsigned char*>(mapped) + constants_offset;
     std::memset(cb, 0, 4 * alignment);
@@ -193,12 +195,17 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
 
 struct StoreCase {
     // Group counts: X in bits 0-7, Y in bits 8-15 and Z in bits 16-23; zero Y or Z means one.
+    // Bit 31 declares that the case file carries 320 initial output words right after the
+    // expected words, so the output buffer starts at a caller-chosen nonzero state.
     UINT groups;
     std::array<UINT, capacity> expected;
     std::array<UINT, constants.size()> root_constants = constants;
     // Optional t0 words after the constants; otherwise t0 holds input_word(i).
     std::array<UINT, capacity> source{};
     bool has_source = false;
+    // The flagged case's output words; otherwise every output word starts at the sentinel.
+    std::array<UINT, capacity> initial{};
+    bool has_initial = false;
     UINT axis(UINT index) const
     {
         const UINT n = (groups >> (8 * index)) & 0xff;
@@ -226,7 +233,8 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     auto output = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr);
+    fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr,
+                store && store->has_initial ? &store->initial : nullptr);
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
@@ -325,11 +333,21 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
         std::ifstream file(reference, std::ios::binary);
         file.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
         file.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+        // Bit 31 declares the trailing initial output segment; no other bit above the
+        // group counts is known, so an unflagged case keeps its historic bounds check.
+        constexpr UINT initial_data_flag = 1u << 31;
+        store.has_initial = (store.groups & initial_data_flag) != 0;
+        store.groups &= ~initial_data_flag;
         if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
             store.axis(2) > 5)
             throw std::runtime_error("Invalid compute store reference");
         if (dpp_case && store.groups != 1)
             throw std::runtime_error("Invalid compute DPP reference dispatch");
+        if (store.has_initial) {
+            file.read(reinterpret_cast<char*>(store.initial.data()), sizeof(store.initial));
+            if (!file)
+                throw std::runtime_error("Invalid compute store initial words");
+        }
         if (file.peek() != std::char_traits<char>::eof()) {
             file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
             if (!file)
