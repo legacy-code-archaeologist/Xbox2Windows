@@ -2802,6 +2802,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_desc_ptr_prop COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_desc_ptr_prop_check.py")
     set_tests_properties(startup_gfx2hlsl_desc_ptr_prop PROPERTIES TIMEOUT 60)
+    # v_cubeid/sc/tc/ma_f32 and image dim:SQ_RSRC_IMG_CUBE lower in tools/startup/gfx2hlsl.py (#1723).
+    add_test(NAME startup_gfx2hlsl_cube COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py")
+    set_tests_properties(startup_gfx2hlsl_cube PROPERTIES TIMEOUT 60)
     # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
     add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")
@@ -3004,6 +3008,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_cmp16_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl cube-face operations (#1723): translation controls, then a draw on WARP or hardware against ISA references.
+    add_test(NAME startup_gfx2hlsl_cube_alu_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_alu_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_cube_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_alu_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_cube_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
     add_test(NAME startup_vertex_fetch_formats_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -3072,6 +3085,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_image_2d_array_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_2d_array_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl cube image_sample (#1723): layer * 8 + face slice remapped to the six-slice array view, drawn on WARP or hardware.
+    add_test(NAME startup_image_cube_array_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_cube_array_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_cube_array_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_cube_array_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_cube_array_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl packed 2D A16 image_sample / image_sample_lz coordinates and modifier validation.
     add_test(NAME startup_image_sample_a16_controls COMMAND "${INTAKE_PYTHON}" -B

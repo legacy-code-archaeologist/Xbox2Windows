@@ -105,7 +105,7 @@ def controls():
     assert 'Texture1D<float4> r0' in pipe.hlsl_ps()
     assert 'r0.Sample(q0, F(v0))' in pipe.hlsl_ps()
     assert 'srv 0 tex1d table 0 0' in pipe.manifest()
-    unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0'))
+    unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('200f80f0'))
     try:
         translate(unsupported)
     except G.Unsupported:

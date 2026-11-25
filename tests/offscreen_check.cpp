@@ -1264,8 +1264,9 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // mip levels whose cells all differ (tests/startup_image_3d.cpp).
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
+    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube-array") == 0;
     const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
-    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const bool array = cube || mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
@@ -1283,7 +1284,7 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1,
-                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional);
+                           std::strcmp(ctx.argv[2], "--startup-image-1d") == 0, two_dimensional, cube ? 12 : 2);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1302,7 +1303,7 @@ OperationResult run_startup_image_2d_view(const OperationContext& ctx)
         window[2] < '1' || window[2] > '3')
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true, 2,
                            UINT(window[0] - '0'), UINT(window[2] - '0'));
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
@@ -1575,6 +1576,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
+    {"--startup-image-cube-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},

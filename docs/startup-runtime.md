@@ -1951,7 +1951,7 @@ These are measured on one executable; treat them as hypotheses for others.
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
-  gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
+  gather, clamp, 1D and `unorm` forms are refused; cube is accepted (see below). Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
   first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a
@@ -2660,3 +2660,12 @@ only the resolve path with valid addresses on a device, so it does not cover the
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`
+
+- Cube images (#1723). `tools/startup/gfx2hlsl.py` lowers `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32` and
+  `v_cubema_f32` to HLSL helpers, and `image_sample`, `image_sample_lz`, `image_sample_l`, `image_load` and
+  `image_load_mip` with `dim:SQ_RSRC_IMG_CUBE` to a `Texture2DArray` (manifest kind `tex2da`) addressed as
+  `float3(s - 1.0, t - 1.0, face)`: the ISA's s and t are `sc / |ma| + 1.5` and lie in [1, 2], so the bias is
+  removed. The draw path binds the title's `TEXTURECUBE` or `TEXTURECUBEARRAY` view as the equivalent
+  `TEXTURE2DARRAY` view (six slices per cube). Limitation: filtering is not seamless across face edges, because
+  a 2D array clamps within one face. Reproduce: `python -B tests/startup_gfx2hlsl_cube_check.py` and
+  `python -B tests/startup_gfx2hlsl_cube_alu_check.py` (add `draw <dxc> <offscreen_check> warp` on Windows). The cube-array slice mapping is drawn with `python -B tests/startup_image_cube_array_check.py draw <dxc> <offscreen_check> warp`.

@@ -29,6 +29,8 @@ constexpr UINT side = 2;
 // The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
 constexpr UINT mip_base = 4;
 constexpr UINT max_levels = 3;
+// The cube-array fixture: two cubes of six faces as twelve slices of a 2x2 array (levels == 1).
+constexpr UINT max_slices = 12;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
@@ -68,10 +70,12 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT slices, UINT first_mip, UINT view_levels)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
+    if (slices != side && (!array || levels != 1 || slices > max_slices))
+        throw std::runtime_error("Unsupported image slice count");
     if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");
     const UINT base = levels > 1 ? mip_base : side;
@@ -105,15 +109,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                  : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = base;
     td.Height = one_dimensional ? 1 : base;
-    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : side;
+    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : slices;
     td.MipLevels = levels;
     td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
     // The subresource of slice s and mip m is m + s * levels.
-    const UINT subresources = (array ? side : 1) * levels;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
+    const UINT subresources = (array ? slices : 1) * levels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[max_slices * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];

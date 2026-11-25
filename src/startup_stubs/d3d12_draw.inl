@@ -1934,6 +1934,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
+                // A cube shader (gfx2hlsl lowers image dim CUBE to a Texture2DArray, six slices per cube)
+                // binds the title's cube view as the equivalent array view over the same faces.
+                if (srv.kind == 2 && desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) {
+                    const UINT most_detailed = desc.TextureCube.MostDetailedMip, levels = desc.TextureCube.MipLevels;
+                    const float clamp = desc.TextureCube.ResourceMinLODClamp;
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Texture2DArray = {most_detailed, levels, 0, 6, 0, clamp};
+                } else if (srv.kind == 2 && desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) {
+                    const UINT most_detailed = desc.TextureCubeArray.MostDetailedMip, levels = desc.TextureCubeArray.MipLevels;
+                    const UINT first = desc.TextureCubeArray.First2DArrayFace, cubes = desc.TextureCubeArray.NumCubes;
+                    const float clamp = desc.TextureCubeArray.ResourceMinLODClamp;
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Texture2DArray = {most_detailed, levels, first, cubes * 6, 0, clamp};
+                }
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,

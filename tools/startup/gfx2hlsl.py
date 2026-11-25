@@ -3418,13 +3418,18 @@ class Stage:
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da',
+                 'SQ_RSRC_IMG_CUBE': 'tex2da'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
+        if dim == 'SQ_RSRC_IMG_CUBE' and how in ('load', 'load_mip'):
+            # Only the sample path converts the cube s/t/face address; a load has no such address form.
+            raise Unsupported('image dimension %s for image_%s' % (dim, how))
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
-        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
+        # A cube is addressed as six 2D slices: the cube instructions already produce s, t and the face id.
+        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY', 'SQ_RSRC_IMG_CUBE')
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -3552,6 +3557,12 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
+            elif dim == 'SQ_RSRC_IMG_CUBE':
+                # The ISA's s and t are sc / |ma| + 1.5 with ma twice the major axis, so they sit in [1, 2];
+                # Texture2DArray wants [0, 1]. Remove the integer bias and keep the face id as the slice.
+                # The third component is layer * 8 + face (eight face slots per cube layer); the array view has
+                # six slices per cube, so cubeslice() maps it to layer * 6 + face. A plain cube is layer 0.
+                uv = 'float3(%s - 1.0, %s - 1.0, cubeslice(%s))' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             elif three:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
@@ -4980,6 +4991,8 @@ VEC_F = {
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
+    'v_cubeid_f32': (3, 'cubeid({0}, {1}, {2})'), 'v_cubesc_f32': (3, 'cubesc({0}, {1}, {2})'),
+    'v_cubetc_f32': (3, 'cubetc({0}, {1}, {2})'), 'v_cubema_f32': (3, 'cubema({0}, {1}, {2})'),
     'v_med3_f32': (3, 'med3({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
@@ -5313,6 +5326,14 @@ class Pipeline:
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
                '}',
+               # Cube-face helpers: the major axis is z when |z| >= max(|x|, |y|), else y when |y| >= |x|, else x.
+               # Face ids run +x, -x, +y, -y, +z, -z; sc and tc are the in-face coordinates, ma is twice the major axis.
+               'uint cubeaxis(float x, float y, float z) { return (abs(z) >= abs(x) && abs(z) >= abs(y)) ? 2u : (abs(y) >= abs(x)) ? 1u : 0u; }',
+               'float cubeid(float x, float y, float z) { uint a = cubeaxis(x, y, z); float m = a == 2u ? z : (a == 1u ? y : x); return float(a * 2u + (m < 0.0 ? 1u : 0u)); }',
+               'float cubesc(float x, float y, float z) { uint a = cubeaxis(x, y, z); return a == 2u ? (z < 0.0 ? -x : x) : (a == 1u ? x : (x < 0.0 ? z : -z)); }',
+               'float cubetc(float x, float y, float z) { uint a = cubeaxis(x, y, z); return a == 1u ? (y < 0.0 ? -z : z) : -y; }',
+               'float cubeslice(float z) { float r = max(round(z), 0.0); float layer = floor(r / 8.0); return layer * 6.0 + (r - layer * 8.0); }',
+               'float cubema(float x, float y, float z) { uint a = cubeaxis(x, y, z); return 2.0 * (a == 2u ? z : (a == 1u ? y : x)); }',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'

@@ -108,7 +108,7 @@ FIXTURES = {
     'r128': ('image_sample_b v[4:7], v[0:2], ' + TAIL + 'SQ_RSRC_IMG_2D r128', '1.0', SAMPLER),
     'dmask0': ('image_sample_b v4, v[0:2], s[16:23], s[24:27] dmask:0x0 dim:SQ_RSRC_IMG_2D', '1.0', SAMPLER),
     'dim1d': ('image_sample_b v[4:7], v[0:1], ' + TAIL + 'SQ_RSRC_IMG_1D', '1.0', SAMPLER),
-    'cube': ('image_sample_b v[4:7], v[0:3], ' + TAIL + 'SQ_RSRC_IMG_CUBE', '1.0', SAMPLER),
+    '1darray': ('image_sample_b v[4:7], v[0:2], ' + TAIL + 'SQ_RSRC_IMG_1D_ARRAY', '1.0', SAMPLER),
     'msaa': ('image_sample_b v[4:7], v[0:3], ' + TAIL + 'SQ_RSRC_IMG_2D_MSAA', '1.0', SAMPLER),
     # The sampler is loaded from the sampler heap at a run-time offset (no constant words): see HEAP_FIXTURES.
     'sampler heap': (ARRAY, None, None),
@@ -250,9 +250,9 @@ WORDS = {
         'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf000f94f0'
         '0004c400703f8cbf0f1800f804050607000081bf'
     ),
-    'cube': (
+    '1darray': (
         '04040cf4000000fa800398beff0399be00002000ff039abe0000000480039bbe'
-        'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf180f94f0'
+        'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf200f94f0'
         '0004c400703f8cbf0f1800f804050607000081bf'
     ),
     'msaa': (
@@ -451,7 +451,7 @@ def controls():
     refused('c_b', 'image_sample_c_b')
     refused('offset', 'image_sample_b_o')
     refused('gather', 'image_gather4_b')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    refused('1darray', 'image dimension SQ_RSRC_IMG_1D_ARRAY')
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     refused('dim1d', 'unverified 1D image sample address or modifiers')
     refused('unorm', 'image_sample_b modifier unorm')
@@ -465,7 +465,7 @@ def controls():
         refused(name, 'image_sample_b modifier reserved')
     refused('sampler bias', 'image_sample_b with a sampler LOD bias (word 2 0x4000001)')
     refused('sampler bias sec', 'image_sample_b with a sampler LOD bias (word 2 0x4004000)')
-    print('refused: b_cl, c_b, offset, gather4_b, cube, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
+    print('refused: b_cl, c_b, offset, gather4_b, 1D array, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
           'reserved bits, sampler LOD bias')
 
     # Guest sampler limits: carried over for a constant descriptor, refused where they cannot be shown irrelevant.

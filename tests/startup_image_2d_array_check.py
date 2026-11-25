@@ -24,7 +24,7 @@ translated to Load(int4(x, y, slice, mip)). Its fixtures are source-built stages
 of a slice (root constant 1) at a constant mip level. They are drawn with --startup-image-2d-array-mips: a
 4x4 texture of two slices with three mip levels whose cells all differ, texel (x, y) of slice s at mip m
 holding ((1 + x + 4y + 16s + 32m) / 128, x, y, s + 2m). The expected colours come from mip_cell() below.
-Cube maps stay refused. The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
+1D arrays stay refused. The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
 accept them, so 'binary <llvm-mc> mip' is opt-in and CI does not pass it.
 """
 import re
@@ -251,21 +251,21 @@ def mip_controls():
         G.D.MIMG_DIMS[5] = original
     assert G.D.MIMG_DIMS[5] == original
 
-    # Cube maps are refused as before. 2D and 3D keep their forms (same words, dim field changed).
-    cube = bytearray(MIP_IMAGE)
-    cube[0] = 0x18
+    # A 1D array is still refused. 2D and 3D keep their forms (same words, dim field changed).
+    arr = bytearray(MIP_IMAGE)
+    arr[0] = 0x20
     try:
-        translate(mip_words(1, 0, bytes(cube)))
+        translate(mip_words(1, 0, bytes(arr)))
     except G.Unsupported as error:
-        assert 'image dimension SQ_RSRC_IMG_CUBE' in str(error), error
+        assert 'image dimension SQ_RSRC_IMG_1D_ARRAY' in str(error), error
     else:
-        raise AssertionError('image_load_mip on a cube accepted')
+        raise AssertionError('image_load_mip on a 1D array accepted')
     for dim_code, call, kind in ((0x08, 'int3(v0, v1, v2)', 'tex2d'), (0x10, 'int4(v0, v1, v2, v3)', 'tex3d')):
         other = bytearray(MIP_IMAGE)
         other[0] = dim_code
         pipe = translate(mip_words(1, 0, bytes(other)))
         assert 't = r0.Load(%s);' % call in pipe.hlsl_ps() and 'srv 0 %s table 0 0' % kind in pipe.manifest(), pipe.hlsl_ps()
-    print('image_load_mip: d16, a16, tfe and a three-register address refused; cube refused; 2D and 3D unchanged')
+    print('image_load_mip: d16, a16, tfe and a three-register address refused; 1D array refused; 2D and 3D unchanged')
 
     # The expected colours tell every swapped axis apart: all cells differ, and each mutant reads another one.
     cells = {mip_cell(x, y, s, m) for m in range(3) for s in range(2) for y in range(4 >> m) for x in range(4 >> m)}

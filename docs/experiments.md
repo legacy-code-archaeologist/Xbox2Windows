@@ -14627,6 +14627,8 @@ The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequenc
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
 
+Cube sampling in `tools/startup/gfx2hlsl.py` (#1723): cube `image_sample_l` and the other image forms are no longer refused. They lower to a `Texture2DArray` at `float3(s - 1.0, t - 1.0, face)`; filtering is not seamless across faces. The title's cube SRV is rebound as a 2D-array view in `src/startup_stubs/d3d12_draw.inl`. Reproduce: `python -B tests/startup_gfx2hlsl_cube_check.py`. The binding change needs a Windows build and has not been run on Linux.
+
 ## Non-constant scalar symbols at branch targets in the startup translator
 
 Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between

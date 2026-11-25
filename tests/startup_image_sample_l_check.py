@@ -47,7 +47,7 @@ IMAGE = {
     'offset': 'image_sample_l_o v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D',
     'compare': 'image_sample_c_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D',
     'gather': 'image_gather4_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
-    'cube': 'image_sample_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_CUBE',
+    '1darray': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY',
     'a16': 'image_sample_l v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D a16',
     'tfe': 'image_sample_l v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D unorm',
@@ -144,9 +144,9 @@ WORDS = {
         '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
         '0000803ef202047ef402067e7fc08cbf080110f10004c400703f8cbf0f1800f8'
         '04050607000081bf'),
-    'cube': bytes.fromhex(
+    '1darray': bytes.fromhex(
         '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
-        '0000803ef202047ef402067e7fc08cbf180f90f00004c400703f8cbf0f1800f8'
+        '0000803ef202047ef402067e7fc08cbf200f90f00004c400703f8cbf0f1800f8'
         '04050607000081bf'),
     'unorm': bytes.fromhex(
         '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
@@ -243,7 +243,7 @@ def controls():
     refused('offset', 'image_sample_l_o')
     refused('compare', 'image_sample_c_l')
     refused('gather', 'image_gather4_l')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    refused('1darray', 'image dimension SQ_RSRC_IMG_1D_ARRAY')
     refused('unorm', 'image_sample_l modifier unorm')
     refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
@@ -255,7 +255,7 @@ def controls():
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, 1D array, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):
