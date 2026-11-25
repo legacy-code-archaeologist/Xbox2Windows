@@ -1240,7 +1240,12 @@ class Stage:
         # pattern a float negation produces. Only handlers that model it ask for this; other integer
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
         neg, tok = self.split_neg(tok)
-        return '(%s ^ 0x80000000u)' % self.u(tok) if neg else self.u(tok)
+        # `|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
+        if len(tok) > 2 and tok.startswith('|') and tok.endswith('|'):
+            text = '(%s & 0x7fffffffu)' % self.u(tok[1:-1])
+        else:
+            text = self.u(tok)
+        return '(%s ^ 0x80000000u)' % text if neg else text
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
