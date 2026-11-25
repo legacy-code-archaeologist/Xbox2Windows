@@ -1,9 +1,11 @@
 """Mixed-precision VOP3P FMA (`v_fma_mix_f32`, `v_fma_mix{lo,hi}_f16`) in tools/startup/gfx2hlsl.py.
 
-usage: startup_gfx2hlsl_fma_mix_check.py [fxc <path to fxc.exe>]
+usage: startup_gfx2hlsl_fma_mix_check.py [fxc <path to fxc.exe> | dispatch <dxc> <offscreen_check> warp|hardware]
 
 With `fxc`, every translated line is also compiled for ps_5_1 (the profile the startup tools use),
-so emitted text that is not valid HLSL fails here and not only in a later draw.
+so emitted text that is not valid HLSL fails here and not only in a later draw. With `dispatch`, every
+translated line runs in a DXC cs_6_0 shader on WARP or a hardware adapter, and each result word is
+compared with a CPU reference that decodes the VOP3P word itself. Exit code 77 is a capability skip.
 
 `v_fma_mix_f32` was refused outright (58 code pairs in the #1723 refusal snapshot). It now shares
 `Stage.mix()` with the two binary16-destination forms.
@@ -34,6 +36,7 @@ import gfx2hlsl as G  # noqa: E402
 
 failures = []
 translated = []   # every emitted line, compiled together in fxc mode
+cases = []        # (label, encoding, emitted line), run in dispatch mode
 
 MIX_F32, MIXLO_F16, MIXHI_F16 = 0x20, 0x21, 0x22
 V = 0x100            # VGPR source base
@@ -95,6 +98,7 @@ def translate(code, low16_only_v=()):
 def expect(label, code, asm, hlsl, low16_only_v=()):
     got_asm, got = translate(code, low16_only_v)
     translated.append(got)
+    cases.append((label, code, got))
     check(label + ' (decode)', got_asm == asm, f'got {got_asm!r}')
     check(label, got == hlsl, f'got {got!r}\n  want {hlsl!r}')
     return got
@@ -261,9 +265,183 @@ def compile_translated(fxc):
     return run.returncode, (run.stdout + run.stderr).strip()
 
 
+# --- dispatch mode: run the translated lines on a D3D12 device and compare with a CPU reference ----
+#
+# The reference decodes each VOP3P word itself (layout in the module docstring), without
+# tools/disasm_rdna2.py or gfx2hlsl, and applies the LLVM 15 reading: op_sel_hi = binary16 source,
+# op_sel = its high half, abs then neg after widening, clamp = saturate. Inputs have short mantissas,
+# so the product and sum are exact in binary32 and binary16, and a fused and an unfused multiply-add
+# give the same word.
+
+INLINE_F32 = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0}
+F32_INPUT = {'v2': 1.25, 'v3': -0.75, 'v4': 3.0, 's5': 0.5}                                # binary32 reads
+F16_INPUT = {'v2': (1.5, -2.5), 'v3': (0.75, 4.0), 'v4': (-1.25, 0.5), 's5': (2.0, -3.0)}  # (low, high)
+V1_BEFORE = 0x13579bdf  # mixlo/mixhi keep one half of the destination
+# The -0 case needs a zero product: a +0 addend would give +0, the -0 addend keeps -0.
+OVERRIDES = {'negated inline 0 addend keeps a -0 product': {'v2': 0x80000000}}
+
+
+def f32_word(value):
+    return struct.unpack('<I', struct.pack('<f', value))[0]
+
+
+def f16_word(value):
+    return struct.unpack('<H', struct.pack('<e', value))[0]
+
+
+def decode_mix(code):
+    w0, w1 = struct.unpack_from('<II', code)
+    literal = struct.unpack_from('<I', code, 8)[0] if len(code) >= 12 else None
+    return {
+        'op': (w0 >> 16) & 0x7f, 'clamp': (w0 >> 15) & 1,
+        'srcs': [w1 & 0x1ff, (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff],
+        'op_sel': [(w0 >> (11 + i)) & 1 for i in range(3)],
+        'op_sel_hi': [(w1 >> 27) & 1, (w1 >> 28) & 1, (w0 >> 14) & 1],
+        'abs': [(w0 >> (8 + i)) & 1 for i in range(3)],
+        'neg': [(w1 >> (29 + i)) & 1 for i in range(3)],
+        'literal': literal,
+    }
+
+
+def is_register(src):
+    return src >= V or src < 106
+
+
+def register_name(src):
+    return 'v%d' % (src - V) if src >= V else 's%d' % src
+
+
+def case_inputs(label, fields):
+    """Register words for one case: each source register gets a value in the format it is read as."""
+    words = {'v1': V1_BEFORE}
+    for src, half in zip(fields['srcs'], fields['op_sel_hi']):
+        if is_register(src):
+            name = register_name(src)
+            if half:
+                low, high = F16_INPUT[name]
+                words[name] = f16_word(low) | (f16_word(high) << 16)
+            else:
+                words[name] = f32_word(F32_INPUT[name])
+    words.update(OVERRIDES.get(label, {}))
+    return words
+
+
+def source_value(src, half, high, words, literal):
+    if is_register(src):
+        word = words[register_name(src)]
+    elif src == 255:
+        word = literal
+    elif src == 128:
+        return 0.0
+    elif src in INLINE_F32:
+        assert not high, 'the translator refuses the high half of an inline constant'
+        return INLINE_F32[src]
+    else:
+        raise ValueError('source %d has no reference' % src)
+    if half:
+        return struct.unpack('<e', struct.pack('<H', (word >> (16 * high)) & 0xffff))[0]
+    return struct.unpack('<f', struct.pack('<I', word))[0]
+
+
+def reference(fields, words):
+    args = []
+    for i in range(3):
+        value = source_value(fields['srcs'][i], fields['op_sel_hi'][i], fields['op_sel'][i], words,
+                             fields['literal'])
+        if fields['abs'][i]:
+            value = abs(value)
+        if fields['neg'][i]:
+            value = -value
+        args.append(value)
+    result = args[0] * args[1] + args[2]
+    if fields['clamp']:
+        result = min(max(result, 0.0), 1.0)
+    if fields['op'] == MIX_F32:
+        return f32_word(result)
+    half = f16_word(result)
+    before = words['v1']
+    if fields['op'] == MIXLO_F16:
+        return (before & 0xffff0000) | half
+    return (before & 0xffff) | (half << 16)
+
+
+def raw_fill(index):
+    # Keep in step with raw_uav_fill_word in tests/spirv_window/raw_uav_dump.cpp.
+    return ((index + 1) * 0x9E3779B1 & 0xffffffff) | 1
+
+
+def dispatch_source(rows, lines):
+    """One thread: per case, load opaque inputs, run the translated line, store v1."""
+    body = ['#define F asfloat', '#define U asuint', 'RWByteAddressBuffer data : register(u0);',
+            '[numthreads(1, 1, 1)]', 'void main() {']
+    for index, ((_label, words), line) in enumerate(zip(rows, lines)):
+        base = index * 6
+        decls = []
+        for slot, name in enumerate(('v1', 'v2', 'v3', 'v4', 's5')):
+            opaque = raw_fill(base + slot) ^ words.get(name, 0)
+            decls.append('uint %s = data.Load(%d) ^ 0x%08xu;' % (name, (base + slot) * 4, opaque))
+        body.append('    { ' + ' '.join(decls) + ' ' + line + ' data.Store(%d, v1); }' % ((base + 5) * 4))
+    body.append('}')
+    return '\n'.join(body) + '\n'
+
+
+def run_dispatch(dxc, runner, adapter, source, words_total, directory, tag):
+    src, cso, out = (os.path.join(directory, tag + ext) for ext in ('.hlsl', '.cso', '.bin'))
+    with open(src, 'w') as fh:
+        fh.write(source)
+    subprocess.run([dxc, '-T', 'cs_6_0', '-E', 'main', '-Fo', cso, src], check=True)
+    size = (words_total * 4 + 15) // 16 * 16
+    run = subprocess.run([runner, adapter, '--raw-uav-dump', cso, '1', str(size), out],
+                         capture_output=True, text=True)
+    print(run.stdout, end='')
+    if run.returncode == 77:
+        sys.exit(77)
+    if run.returncode or run.stderr:
+        raise AssertionError(run.stderr or 'raw UAV dump exited with %d' % run.returncode)
+    with open(out, 'rb') as fh:
+        data = fh.read()
+    return struct.unpack('<%dI' % (len(data) // 4), data)
+
+
+def check_dispatch(dxc, runner, adapter):
+    runner = os.path.abspath(runner)
+    rows = [(label, case_inputs(label, decode_mix(code))) for label, code, _line in cases]
+    expected = [reference(decode_mix(code), words) for (_l, code, _), (_, words) in zip(cases, rows)]
+    lines = [line for _l, _c, line in cases]
+    out_dir = os.path.join(here, '..', 'out')
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out_dir) as directory:
+        words = run_dispatch(dxc, runner, adapter, dispatch_source(rows, lines), len(rows) * 6, directory,
+                             'fma_mix')
+        for index, (label, _c, _l) in enumerate(cases):
+            got = words[index * 6 + 5]
+            check('%s: %s readback' % (adapter, label), got == expected[index],
+                  'expected %08x, got %08x' % (expected[index], got))
+        # Negative control: drop the high-half shift, so the device reads the low half. The readback must
+        # then match a reference with op_sel cleared, and differ from the correct result somewhere.
+        # (A zero product, as in the -0 case, hides the half it reads.)
+        mutated = [line.replace(' >> 16)', ')') for line in lines]
+        changed = [i for i, (a, b) in enumerate(zip(lines, mutated)) if a != b]
+        control = run_dispatch(dxc, runner, adapter, dispatch_source(rows, mutated), len(rows) * 6, directory,
+                               'fma_mix_control')
+        low_reads = []
+        for i in changed:
+            fields = decode_mix(cases[i][1])
+            fields['op_sel'] = [0, 0, 0]
+            low_reads.append(reference(fields, rows[i][1]))
+        follows = all(control[i * 6 + 5] == want for i, want in zip(changed, low_reads))
+        caught = [i for i in changed if control[i * 6 + 5] != expected[i]]
+        check('%s: control without the high-half shift reads the low half in all %d high-half cases'
+              % (adapter, len(changed)), bool(changed) and follows)
+        check('%s: control changes %d of %d high-half results' % (adapter, len(caught), len(changed)),
+              len(caught) > 0)
+
+
 if len(sys.argv) == 3 and sys.argv[1] == 'fxc':
     status, output = compile_translated(sys.argv[2])
     check(f'fxc ps_5_1 compiles all {len(translated)} translated lines', status == 0, output)
+elif len(sys.argv) == 5 and sys.argv[1] == 'dispatch':
+    check_dispatch(*sys.argv[2:])
 elif len(sys.argv) != 1:
     print(__doc__)
     sys.exit(2)
