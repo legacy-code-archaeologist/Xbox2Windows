@@ -220,13 +220,13 @@ def check_controls():
     refused('straight-line', lambda: translate_case('P', code=patch(WORDS_P, store, '020084bf' + store)))
     refused('1D group', lambda: translate_case('P', group=(32, 2, 1)))
 
-    # Mixed width refusals: b32 fill + b64 read, b64 fill + b32 read, and b64 fill + ds_read2_b32.
-    refused('does not match initialized fill',
-            lambda: translate_case('P', code=patch(WORDS_P, read_p, '1000d8d808000008')))  # ds_read_b32 after ds_write_b64
-    refused('does not match initialized fill',
-            lambda: translate_case('P', code=patch(WORDS_P, read_p, '0408dcd808000008')))  # ds_read2_b32 after ds_write_b64
-    refused('does not match initialized fill',
-            lambda: translate_case('P', code=patch(WORDS_P, '83000834' + store, '82000834' + '100034d804050000')))  # ds_write_b32 + ds_read_b64
+    # Mixed-width interoperability: in-span b32 after b64 succeeds, while out-of-span b32/read2_b32/b64 stay refused.
+    mixed_b32 = translate_case('P', code=patch(WORDS_P, read_p, '1000d8d808000008')).hlsl_cs()
+    assert 'v8 = lds[(v8 + 16u) >> 2];' in mixed_b32, mixed_b32
+    refused('initialized span',
+            lambda: translate_case('P', code=patch(WORDS_P, read_p, '0408dcd808000008')))  # ds_read2_b32 offset1:8 past 528
+    refused('initialized span',
+            lambda: translate_case('P', code=patch(WORDS_P, '83000834' + store, '82000834' + '100034d804050000')))  # ds_write_b32 + ds_read_b64 past 272
 
     # Register-range validation: reject 1-VGPR, 3-VGPR, >v255, and SGPR operands on ds_write_b64 / ds_read_b64.
     assert G._lds_pair('v[5:6]') == 5

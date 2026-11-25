@@ -14348,7 +14348,7 @@ python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 [The startup translator](../tools/startup/gfx2hlsl.py) (`check_lds_exchange`, refs `#2274`, `#1541`) extends the bounded group-shared LDS exchange to 64-bit contiguous pairs (`ds_write_b64` and `ds_read_b64`, RDNA 2 DS `0x4d` and `0x76`):
 
 - `ds_write_b64 addr, v[d0:d1] [offset:k]` requires a single VGPR byte address from `v_lshlrev_b32 addr, 3, v0`, a contiguous `v[d0:d1]` pair in `v0..v255`, 4-byte aligned `offset`, and `offset + group[0] * 8 <= lds_words * 4`.
-- `ds_read_b64 v[r0:r1], addr [offset:k]` requires matching 64-bit fill width (mixed `b32`/`b64` exchanges stay refused), a completed `s_waitcnt lgkmcnt(0)` before `s_barrier` and after each read, an exact `v[r0:r1]` pair, and literal or literal-masked (`v_and_b32`) byte addresses proving `[a + offset, a + offset + 8)` lies 4-byte aligned inside `[first, first + group[0] * 8)`. It computes `a = (addr + offset) >> 2` before assigning `r0 = lds[a]` and `r1 = lds[a + 1u]` (alias-safe when `addr` overlaps `v[r0:r1]`).
+- `ds_read_b64 v[r0:r1], addr [offset:k]` requires a completed `s_waitcnt lgkmcnt(0)` before `s_barrier` and after each read, an exact `v[r0:r1]` pair, and literal or literal-masked (`v_and_b32`) byte addresses proving `[a + offset, a + offset + 8)` lies 4-byte aligned inside `[fill_start, fill_end)`. It computes `a = (addr + offset) >> 2` before assigning `r0 = lds[a]` and `r1 = lds[a + 1u]` (alias-safe when `addr` overlaps `v[r0:r1]`).
 
 [The 64-bit LDS check](../tests/startup_compute_lds_b64_check.py) verifies offline sizing/mask/pair/mixed-width/overflow/refusal controls and runs two `gfx1013` programs on D3D12 (`cs_6_0`, `debug_layer=enabled`): `P` (`[numthreads(64,1,1)]`, `groups=(2,1,1)`, `LDS_SIZE=2`, `offset:16`, cross-wave `X ^ 32` peer swap with `v[8:9], v8` aliasing) and `B` (`[numthreads(64,1,1)]`, `groups=(1,1,1)`, `LDS_SIZE=1`, peer `v[8:9]` plus lane-37 broadcast `v[10:11]` at `offset:296`). On both WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`) and `NVIDIA GeForce RTX 4070 SUPER` (`10de:2783`, driver `32.0.16.2114`), both cases matched all `320` words (`mismatches=0`, `debug_errors=0 debug_warnings=0`), and all five shader mutants rejected cleanly (`p-same-lane`: `word=0`, 256 mismatches; `p-swap-dwords`: `word=0`, 256 mismatches; `p-drop-high`: `word=1`, 128 mismatches; `b-wrong-mask`: `word=0`, 64 mismatches; `b-wrong-lane`: `word=2`, 128 mismatches).
 
@@ -14360,7 +14360,26 @@ ctest --preset release --no-tests=error -j 1 -R "^startup_compute_lds_b64" -V
 python -B tests/startup_compute_lds_b64_check.py binary llvm-mc-15
 ```
 
-Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), sub-dword or mixed-width LDS exchanges, non-1D groups, divergent `EXEC`, and real title shaders.
+Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), sub-dword LDS exchanges, non-1D groups, divergent `EXEC`, and real title shaders.
+
+### Startup compute 128-bit LDS exchange
+
+[The startup translator](../tools/startup/gfx2hlsl.py) (`check_lds_exchange`, `#1541`) extends the bounded group-shared LDS exchange to 128-bit contiguous quads (`ds_write_b128` and `ds_read_b128`, RDNA 2 DS `0xdf` and `0xff`) and unifies 32/64/128-bit reads over the same dword-indexed `groupshared uint lds[N]` array:
+
+- `ds_write_b128 addr, v[d0:d3] [offset:k]` requires a single VGPR byte address from `v_lshlrev_b32 addr, 4, v0`, a contiguous `v[d0:d3]` quad in `v0..v255`, 4-byte aligned `offset` (`offset % 4 == 0`, natural 16-byte alignment is not required on GFX10/RDNA2 dword-addressed LDS), and `offset + group[0] * 16 <= lds_words * 4` (`idx + 3 < lds_words`). It writes `lds[a]..lds[a + 3u]` from `a = (addr + offset) >> 2`.
+- `ds_read_b128 v[r0:r3], addr [offset:k]` (and mixed `ds_read_b32`, `ds_read2_b32`, `ds_read_b64` after any valid `b32`/`b64`/`b128` fill) requires a completed `s_waitcnt lgkmcnt(0)` before `s_barrier` and after each read, an exact `v[r0:r3]` quad, and literal or literal-masked (`v_and_b32`) byte addresses proving `[a + offset, a + offset + width)` lies 4-byte aligned inside `[fill_start, fill_end)`. It snapshots `a = (addr + offset) >> 2` before assigning `r0..r3 = lds[a]..lds[a + 3u]` (alias-safe across all four destination VGPRs).
+
+[The 128-bit LDS check](../tests/startup_compute_lds_b128_check.py) verifies offline sizing, quad validation, dword-aligned masks/offsets, mixed 32/64/128-bit interoperability and refusals, and dispatches four `gfx1013` programs on D3D12 (`cs_6_0`, `debug_layer=enabled`): `Q` (`[numthreads(32,1,1)]`, `groups=(2,1,1)`, `LDS_SIZE=2`, `offset:16`, `X ^ 17` with `v[9:12], v9` aliasing), `B` (`[numthreads(64,1,1)]`, `groups=(1,1,1)`, `LDS_SIZE=2`, `X ^ 32` with `v[9:12], v10` aliasing plus lane-37 broadcast at `offset:592`), `M` (128-bit fill read by `ds_read_b128`, `ds_read_b64`, and `ds_read_b32`), and `R` (32-bit fill read by `ds_read_b128`), alongside six mutated controls (`q-same-lane`, `q-swap-dwords`, `q-drop-fourth`, `b-wrong-mask`, `m-wrong-b64-off`, `r-wrong-mask`). On both WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`) and `NVIDIA GeForce RTX 4070 SUPER` (`10de:2783`, driver `32.0.16.2114`), all four cases matched all `320` words (`mismatches=0`, `debug_errors=0 debug_warnings=0`), and all six shader mutants rejected cleanly (`q-same-lane`: `word=0`, 256 mismatches; `q-swap-dwords`: `word=2`, 128 mismatches; `q-drop-fourth`: `word=3`, 64 mismatches; `b-wrong-mask`: `word=0`, 64 mismatches; `m-wrong-b64-off`: `word=4`, 64 mismatches; `r-wrong-mask`: `word=0`, 128 mismatches).
+
+```powershell
+. .\tools\dev.ps1
+cmake --preset release
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -j 1 -R "^startup_compute_lds_b128" -V
+python -B tests/startup_compute_lds_b128_check.py binary llvm-mc-15
+```
+
+Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), sub-dword LDS exchanges, non-1D groups, divergent `EXEC`, and real title shaders.
 
 ## Startup translator: refusal census
 

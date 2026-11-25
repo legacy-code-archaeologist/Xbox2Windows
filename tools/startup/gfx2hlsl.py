@@ -1037,13 +1037,23 @@ def _lds_single(tok):
     return int(m.group(1)) if m and int(m.group(1)) < 256 else None
 
 
-def _lds_pair(tok):
-    """Exact contiguous 2-VGPR pair v[n:n+1] (v0..v255) for bounded 64-bit LDS exchanges."""
+def _lds_vgpr_span(tok, count):
+    """Exact contiguous `count`-VGPR range v[n:n+count-1] (v0..v255) for bounded wide LDS exchanges."""
     m = re.fullmatch(r'v\[(\d+):(\d+)\]', tok)
     if not m:
         return None
     lo, hi = int(m.group(1)), int(m.group(2))
-    return lo if hi == lo + 1 and hi < 256 else None
+    return lo if hi == lo + count - 1 and hi < 256 else None
+
+
+def _lds_pair(tok):
+    """Exact contiguous 2-VGPR pair v[n:n+1] (v0..v255) for bounded 64-bit LDS exchanges."""
+    return _lds_vgpr_span(tok, 2)
+
+
+def _lds_quad(tok):
+    """Exact contiguous 4-VGPR quad v[n:n+3] (v0..v255) for bounded 128-bit LDS exchanges."""
+    return _lds_vgpr_span(tok, 4)
 
 
 def lds_byte_offsets(name, mods):
@@ -1051,7 +1061,9 @@ def lds_byte_offsets(name, mods):
         if not mods:
             return (0,)
         if len(mods) == 1 and re.fullmatch(r'offset:\d+', mods[0]):
-            return (int(mods[0][7:]),)
+            offset = int(mods[0][7:])
+            if offset <= 0xffff:
+                return (offset,)
         raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
     # DS_READ2 encodes each offset independently in dwords. An omitted field is zero.
     offsets = {}
@@ -1066,17 +1078,30 @@ def lds_byte_offsets(name, mods):
     return first, second
 
 
-def check_lds_exchange(ins, group, words):
-    """Prove one race-free 32-bit or 64-bit fill of a contiguous LDS span, one uniform barrier, then reads of initialized words.
+# (is_write, byte_width, fill_shift, fill_unit_name)
+LDS_EXCHANGE_OPS = {
+    'ds_write_b32': (True, 4, '2', 'dword'),
+    'ds_read_b32': (False, 4, None, 'dword'),
+    'ds_read2_b32': (False, 4, None, 'dword'),
+    'ds_write_b64': (True, 8, '3', 'qword'),
+    'ds_read_b64': (False, 8, None, 'qword'),
+    'ds_write_b128': (True, 16, '4', 'quad-dword'),
+    'ds_read_b128': (False, 16, None, 'quad-dword'),
+}
 
-    RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords and
-    ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4).
+
+def check_lds_exchange(ins, group, words):
+    """Prove one race-free 32/64/128-bit fill of a contiguous LDS span, one uniform barrier, then mixed-width reads of initialized dwords.
+
+    RDNA 2 ISA (Ch. 9 DS): ds_write_b32 / ds_read_b32 / ds_read2_b32 access 4-byte dwords,
+    ds_write_b64 / ds_read_b64 access two contiguous little-endian dwords (v[n] at addr+offset, v[n+1] at addr+offset+4), and
+    ds_write_b128 / ds_read_b128 access four contiguous little-endian dwords (v[n]..v[n+3] at addr+offset..addr+offset+12).
+    All widths share the dword-indexed groupshared uint lds[N] array and require 4-byte alignment (natural 8/16-byte alignment is not required on GFX10/RDNA2 LDS).
     LLVM 15 AMDGPUUsage defines COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE in 128-dword (512-byte) units on gfx10.
     """
-    if not 0 < words <= 8192 or group[1:] != (1, 1):
+    if not 0 < words <= 8192 or group[0] < 1 or group[1:] != (1, 1):
         raise Unsupported('LDS exchange needs a 1D group and a nonzero allocation of at most 32 KiB')
-    first = None
-    elem_bytes = None
+    fill_span = None
     published = False
     read = False
     prev = (None, [], [])
@@ -1087,42 +1112,37 @@ def check_lds_exchange(ins, group, words):
                 or base == 's_endpgm' and i + 1 < len(ins)):
             raise Unsupported('LDS exchange needs straight-line code and entry EXEC')
         if base == 's_barrier':
-            if (first is None or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
+            if (fill_span is None or published or prev != ('s_waitcnt', ['lgkmcnt(0)'], [])
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
-        elif base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64'):
-            write = base.startswith('ds_write')
-            width = 8 if base.endswith('_b64') else 4
+        elif base in LDS_EXCHANGE_OPS:
+            write, width, shift, unit_name = LDS_EXCHANGE_OPS[base]
+            dwords = width // 4
             addr_op = ops[0] if (write and len(ops) == 2) else (ops[1] if len(ops) == 2 else '')
             val_op = ops[1] if (write and len(ops) == 2) else (ops[0] if len(ops) == 2 else '')
             if base == 'ds_read2_b32':
                 if len(ops) != 2 or _lds_pair(val_op) is None or _lds_single(addr_op) is None:
                     raise Unsupported('LDS read2 needs a VGPR pair and a byte address VGPR')
             elif (len(ops) != 2 or _lds_single(addr_op) is None
-                  or (_lds_pair(val_op) is None if width == 8 else _lds_single(val_op) is None)):
+                  or (_lds_single(val_op) is None if dwords == 1 else _lds_vgpr_span(val_op, dwords) is None)):
+                need_val = ('a matching data VGPR' if dwords == 1
+                            else 'an aligned %d-VGPR %s' % (dwords, 'pair' if dwords == 2 else 'quad'))
                 raise Unsupported('LDS exchange needs %s, %s and an optional byte offset'
-                                  % ('two VGPRs' if width == 4 else 'a VGPR address',
-                                     'an aligned 2-VGPR pair' if width == 8 else 'a matching data VGPR'))
+                                  % ('two VGPRs' if dwords == 1 else 'a VGPR address', need_val))
             offsets = lds_byte_offsets(base, mods)
             producer, args, modifiers = prev
             if write:
                 offset, = offsets
-                shift = '3' if width == 8 else '2'
                 # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct element.
-                # 8-byte alignment is not required for LDS dword-addressed writes.
-                if (first is not None or producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0']
+                # 8-byte / 16-byte alignment is not required for LDS dword-addressed writes.
+                if (fill_span is not None or producer != 'v_lshlrev_b32' or args != [addr_op, shift, 'v0']
                         or modifiers or offset % 4 or offset + group[0] * width > words * 4):
-                    raise Unsupported('LDS exchange needs one bounded %s per local X ID'
-                                      % ('qword' if width == 8 else 'dword'))
-                first = offset
-                elem_bytes = width
+                    raise Unsupported('LDS exchange needs one bounded %s per local X ID' % unit_name)
+                fill_span = (offset, offset + group[0] * width)
             else:
                 if not published or modifiers or not args or args[0] != addr_op:
                     raise Unsupported('LDS read needs a bounded address after the fill barrier')
-                if elem_bytes != width:
-                    raise Unsupported('LDS read width (%dB) does not match initialized fill (%dB)'
-                                      % (width, elem_bytes or 0))
                 if producer == 'v_mov_b32' and len(args) == 2 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1]):
                     low = high = int(args[1], 0)
                 elif (producer == 'v_and_b32' and len(args) == 3 and re.fullmatch(r'0x[0-9a-f]+|\d+', args[1])
@@ -1130,9 +1150,11 @@ def check_lds_exchange(ins, group, words):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
+                fill_start, fill_end = fill_span
                 # Every byte offset in [a + offset, a + offset + width) must be 4-byte aligned and inside the filled span.
+                # Mixed 32/64/128-bit reads share the same dword-indexed LDS array once all read dwords lie in [fill_start, fill_end).
                 if (low % 4 or high % 4
-                        or any(offset % 4 or low + offset < first or high + offset + (width - 4) >= first + group[0] * width
+                        or any(offset % 4 or low + offset < fill_start or high + offset + width > fill_end
                                for offset in offsets)):
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
@@ -1140,7 +1162,7 @@ def check_lds_exchange(ins, group, words):
                 read = True
         elif base.startswith('ds_') or 'lds' in mods:
             raise Unsupported('LDS exchange does not cover ' + asm)
-        elif first is None and not base.startswith('s_'):
+        elif fill_span is None and not base.startswith('s_'):
             # Simple VALU instructions only write their single destination. Other forms, e.g. v_swap_b32,
             # can also change a source. After the fill, each read proves its own address without the entry X ID.
             if (base not in VEC_U and base not in VEC_F and base != 'v_mov_b32'
@@ -2435,7 +2457,7 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
-        if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 'ds_write_b64', 'ds_read_b64', 's_barrier'):
+        if base in (*LDS_EXCHANGE_OPS, 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
@@ -2468,16 +2490,17 @@ class Stage:
                         for index, offset in enumerate(offsets):
                             self.set_v(start + index, 'lds[(%s + %du) >> 2]' % (address, offset))
                 else:
-                    lo = _lds_pair(ops[1 if write else 0])
+                    dwords = 4 if base.endswith('_b128') else 2
+                    lo = _lds_vgpr_span(ops[1 if write else 0], dwords)
                     if write:
-                        d0, d1 = self.u('v%d' % lo), self.u('v%d' % (lo + 1))
+                        vals = [self.u('v%d' % (lo + k)) for k in range(dwords)]
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
-                        self.emit('lds[a] = %s;' % d0)
-                        self.emit('lds[a + 1u] = %s;' % d1)
+                        for k, val in enumerate(vals):
+                            self.emit('lds[%s] = %s;' % ('a' if k == 0 else 'a + %du' % k, val))
                     else:
                         self.emit('a = (%s + %du) >> 2;' % (address, offsets[0]))
-                        self.set_v(lo, 'lds[a]')
-                        self.set_v(lo + 1, 'lds[a + 1u]')
+                        for k in range(dwords):
+                            self.set_v(lo + k, 'lds[%s]' % ('a' if k == 0 else 'a + %du' % k))
             return None
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
