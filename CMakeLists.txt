@@ -3028,6 +3028,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # s_brev_b32 of a known constant folds to a known word (a sampler built from it is a constant descriptor).
     add_test(NAME startup_gfx2hlsl_scalar_brev_fold COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_brev_fold_check.py")
+    # v_pack_b32_f16 with op_sel and the neg/abs source modifiers, evaluated against a bit reference.
+    add_test(NAME startup_gfx2hlsl_pack_b32_f16 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_pack_b32_f16_check.py")
     # Scalar sign-extends and conditional moves (batch 3 #2).
     add_test(NAME startup_gfx2hlsl_s_sext_cmov COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_sext_cmov_check.py")

@@ -280,6 +280,7 @@ jobs:
             tests/startup_gfx2hlsl_sopk_signext_check.py \
             tests/startup_gfx2hlsl_mul_hi_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
+            tests/startup_gfx2hlsl_pack_b32_f16_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_buffer_format_word3_table_check.py \
