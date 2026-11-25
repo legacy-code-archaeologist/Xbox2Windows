@@ -7597,11 +7597,15 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
 (#870, issue #1919). They now lower as `~(S0 & S1)`, `~(S0 | S1)` and `~(S0 ^ S1)` on 32 bits, the text
 `pixel_aot` uses, and set SCC when the result is nonzero like the other logic operations. The check decodes
 SGPR, in-place, inline-constant, literal and m0-destination forms and evaluates the emitted lines against an
-integer reference over 0, all ones, alternating bits, every single bit and mixed words. Lane-mask forms (a
-vcc_lo/exec_lo operand or destination, or an SGPR holding a compare mask) are refused: guest SCC reads the whole
-32-bit mask, which the per-lane projection cannot show. A table
+integer reference over 0, all ones, alternating bits, every single bit and mixed words. A table
 entry without the complement or without the SCC write must fail, and SOP2 operations with no lowering stay
-refused by name. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
+refused by name. On lane masks (vcc_lo, exec_lo or an SGPR holding a compare mask) the result is exact per lane
+when every source is a mask, because bit i of the complement depends only on bit i of each source: that form
+lowers to `(~(a op b)) & 1` into an SGPR, checked on all 32 lanes of the edge words. Guest SCC reads the whole
+32-bit result, which the per-lane projection cannot show, so SCC is not emitted and a program that can read it
+before the next SCC write is refused, through joins and back edges. A mask mixed with a plain word or a constant
+and a vcc_lo or exec_lo destination stay refused, as does a mask source whose last write does not dominate a
+branch target crossed since, or which a block on a path to that target writes again. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sop2_complement$' -V`; with
 LLVM 15, `tests/startup_gfx2hlsl_sop2_complement_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip
 the same words.
 

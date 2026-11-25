@@ -16,9 +16,18 @@ write it fails. The value set gives SCC = 0 and SCC = 1 for every operation.
 
 The lowering text and SCC rule equal pixel_aot's SCALAR entries for the same operations (#561). Every numeric form
 (SGPR, inline, literal or m0 operands) emits the lines of its non-complement sibling (s_and_b32, s_or_b32, s_xor_b32)
-with the operation wrapped in ~( ). s_xnor_b32 on a lane mask is refused: a vcc_lo or exec_lo operand or destination, or an
-SGPR holding a compare mask, is the whole wave's mask, and SCC is set when any bit of the complemented 32-bit result
-is; the translator's per-lane projection cannot show that, so no mask lowering is claimed.
+with the operation wrapped in ~( ).
+
+Lane masks: vcc_lo, exec_lo or an SGPR holding a compare mask is the whole wave's mask, of which the translator keeps
+one lane's bit. Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask and an
+SGPR destination the lane's bit of the result is exact: the form is accepted and checked here on every lane of the
+edge words. SCC is set when any bit of the complemented 32-bit result is, which the other lanes decide (the bit of an
+idle lane is set); the per-lane projection cannot show that, so SCC is not emitted and a program that can read it
+before the next SCC write is refused (through branches too). A mask and a plain word mixed, a constant source, and a
+vcc_lo or exec_lo destination stay refused. The mask mark follows program order, so a mark is a proof at a branch
+target only if the register's last write dominates the target and no block on a path from that write to the target
+writes the register again; otherwise the complement is refused until the register is written again. Mutations: the
+join rule disabled and the SCC read scan disabled must each accept a refused program.
 
 Mutations: the table entry with the complement dropped, and the entry with the SCC write dropped, must each read a
 wrong result or SCC. Refused: every SOP2 operation the decoder names that still has no lowering.
@@ -226,6 +235,124 @@ def first_mismatch(name, reference=None, updates_scc=True):
             if got != expected:
                 return asm, hex(a), hex(b), got, expected
     return None
+
+
+def run_text(*instructions):
+    """Translate disassembly text with the branch scan of a real stage -> emitted lines."""
+    stage = Probe()
+    stage.attrs = {}
+    stage.ins = [(4 * i, 4, asm.split()[0], asm) for i, asm in enumerate(instructions)]
+    stage.translate()
+    return [line for _, lines, _ in stage.blocks for line in lines]
+
+
+def text_refusal(*instructions):
+    try:
+        return 'accepted: %s' % run_text(*instructions)
+    except G.Unsupported as error:
+        return str(error)
+
+
+def lane_mask_controls():
+    operator = {name: SIBLING_OPERATOR[sibling] for name, (sibling, _) in OPS.items()}
+    # 1. Every source a lane mask, SGPR destination: one line, the lane's bit of the complement, and no SCC write.
+    forms = [('s3, s1, s2', 's3', 's1', 's2'), ('s1, s2, s1', 's1', 's2', 's1'), ('s3, vcc_lo, s1', 's3', 'vcc', 's1'),
+             ('s3, s2, exec_lo', 's3', 's2', 'exec'), ('s3, vcc_lo, exec_lo', 's3', 'vcc', 'exec')]
+    for name, (_, reference) in OPS.items():
+        wrong = []
+        for operands, dest, left, right in forms:
+            stage = Probe()
+            stage.masks.update((1, 2))
+            stage.one(name, '%s %s' % (name, operands))
+            expected = ['%s = (~(%s %s %s)) & 1;' % (dest, left, operator[name], right)]
+            if stage.lines != expected or int(dest[1:]) not in stage.masks or stage.scc_effect != 'a lane-mask complement':
+                wrong.append((operands, stage.lines, expected, sorted(stage.masks), stage.scc_effect))
+                continue
+            for a, b in ((a, b) for a in SPECIAL for b in SPECIAL):
+                for lane in range(32):
+                    env = {left: (a >> lane) & 1, right: (b >> lane) & 1, 'scc': SCC_UNSET}
+                    out = run_lines(stage.lines, env)
+                    if (out[dest], out['scc']) != ((reference(a, b) >> lane) & 1, SCC_UNSET):
+                        wrong.append((operands, hex(a), hex(b), lane, out[dest], out['scc']))
+                        break
+        check('%s: %d all-mask forms give the lane bit of the reference on 32 lanes x %d pairs, SCC not written'
+              % (name, len(forms), len(SPECIAL) ** 2), not wrong, str(wrong[:2]))
+
+    # 2. Still refused: a constant or plain-word source next to a mask, a mask destination, a high-half mask name.
+    for name in OPS:
+        wrong = []
+        for operands in ('s3, s1, s9', 's3, s9, vcc_lo', 's3, s1, -1', 's3, 0, vcc_lo', 'vcc_lo, s1, s2',
+                         'exec_lo, s1, s2', 's3, s1, vcc_hi', 'm0, s1, s2'):
+            stage = Probe()
+            stage.masks.update((1, 2))
+            try:
+                stage.one(name, '%s %s' % (name, operands))
+                wrong.append((operands, stage.lines))
+            except G.Unsupported as error:
+                if str(error) != '%s on a lane mask' % name or stage.lines:
+                    wrong.append((operands, str(error), stage.lines))
+        check('%s: mixed, constant and mask-destination forms stay refused' % name, not wrong, str(wrong[:2]))
+
+    # 3. Whole programs. SCC after the complement is not the guest's: a read before the next SCC write is refused.
+    masks = ('v_cmp_eq_f32_e64 s5, 0, v1', 'v_cmp_lt_f32_e64 s4, 0, v2')
+    for name in OPS:
+        complement = '%s s4, s5, s4' % name
+        line = 's4 = (~(s5 %s s4)) & 1;' % operator[name]
+        lines = run_text(*masks, complement, 's_and_saveexec_b32 s4, s4', 's_endpgm')
+        at = lines.index(line) if line in lines else -1
+        check('%s between two compares and s_and_saveexec_b32 is accepted' % name,
+              at >= 0 and lines[at + 1:at + 3] == ['w = s4;', 's4 = exec;'] and 'scc = s4 != 0;' not in lines, str(lines))
+        lines = run_text(*masks, complement, 's_cmp_eq_u32 s2, 0', 's_cselect_b32 s6, 1, 0', 's_endpgm')
+        check('%s then an SCC write then a read is accepted' % name,
+              line in lines and any(text.startswith('s6 = scc ?') for text in lines), str(lines))
+        programs = {
+            's_cselect_b32': (*masks, complement, 's_cselect_b32 s6, 1, 0', 's_endpgm'),
+            's_cbranch_scc1': (*masks, complement, 's_cbranch_scc1 label_0010', 's_endpgm'),
+            # the read sits behind a jump that skips the SCC write
+            's_cmov_b32': (*masks, complement, 's_branch label_0014', 's_cmp_eq_u32 s2, 0', 's_cmov_b32 s6, s7',
+                           's_endpgm'),
+            # the read sits at a loop head that the complement reaches over the back edge
+            's_cselect_b64': ('s_cmp_eq_u32 s2, 0', 's_cselect_b64 s[6:7], 1, 0', *masks, complement,
+                              's_cbranch_vccz label_0004', 's_endpgm'),
+        }
+        got = {reader: text_refusal(*program) for reader, program in programs.items()}
+        want = {reader: 'scc from a lane-mask complement in %s' % reader for reader in programs}
+        check('%s: an SCC read before the next SCC write is refused (%d programs)' % (name, len(programs)),
+              got == want, str(got))
+
+    # 4. The mask mark at a branch target.
+    skip = ('s_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_0010', *masks)   # the branch skips both compares
+    loop = (*masks, 's_nand_b32 s6, s5, s4', 's_mov_b32 s5, s3', 's_cmp_eq_u32 s2, 0', 's_cbranch_scc0 label_0008',
+            's_endpgm')                                                   # the body overwrites s5 before the back edge
+    arms = ('v_cmp_eq_f32_e64 s5, 0, v1', 's_cmp_eq_u32 s2, 0', 's_cbranch_scc1 label_0014', 'v_cmp_lt_f32_e64 s4, 0, v2',
+            's_branch label_0020', 'v_cmp_lt_f32_e64 s4, 0, v3', 's_nand_b32 s4, s5, s4', 's_and_saveexec_b32 s4, s4',
+            's_endpgm')                                                   # s5 is written before the split only
+    joined = 's_nand_b32 on a lane mask joined at a branch target'
+    got = [text_refusal(*skip, 's_nand_b32 s6, s5, s4', 's_endpgm'), text_refusal(*loop)]
+    check('a mask that another path into the branch target changes is refused (skipped write, loop body write)',
+          got == [joined, joined], str(got))
+    lines = run_text(*arms)
+    check('a mask written before the split and on no arm crosses the join', 's4 = (~(s5 & s4)) & 1;' in lines, str(lines))
+    lines = run_text(*skip, *masks, 's_nand_b32 s6, s5, s4', 's_endpgm')
+    check('a mask written again after the join is proven again', 's6 = (~(s5 & s4)) & 1;' in lines, str(lines))
+    got = text_refusal(*masks, 's_mov_b32 s5, s3', 's_nand_b32 s6, s5, s4', 's_endpgm')
+    check('an overwritten mask is a plain word: refused', got == 's_nand_b32 on a lane mask', got)
+
+    # 5. Mutations: each rule disabled accepts a program refused above.
+    saved = G.Stage.unjoined_masks
+    G.Stage.unjoined_masks = lambda self, target, last_write: set()
+    try:
+        got = [text_refusal(*skip, 's_nand_b32 s6, s5, s4', 's_endpgm'), text_refusal(*loop)]
+    finally:
+        G.Stage.unjoined_masks = saved
+    check('mutation without the join rule accepts both programs', all(t.startswith('accepted') for t in got), str(got))
+    saved = G.Stage.descriptor_scc_reads
+    G.Stage.descriptor_scc_reads = lambda self, branches, effects: iter(())
+    try:
+        got = text_refusal(*masks, 's_nand_b32 s4, s5, s4', 's_cselect_b32 s6, 1, 0', 's_endpgm')
+    finally:
+        G.Stage.descriptor_scc_reads = saved
+    check('mutation without the SCC read scan accepts the read', got.startswith('accepted'), got)
 
 
 def pack_controls():
@@ -501,8 +628,8 @@ def controls():
         check('%s: %d numeric forms emit the %s lines complemented, same mask and EXEC bookkeeping'
               % (name, len(VALUE_FORMS), sibling), not wrong, str(wrong[:2]))
 
-    # 5b. s_xnor_b32 lane-mask forms are refused (s_nand_b32 and s_nor_b32 are lowered, see startup_gfx2hlsl_s_nor_nand_check.py).
-    for name in ('s_xnor_b32',):
+    # 5b. Refused: a lane mask next to a plain word, or as the destination (lane_mask_controls has the accepted forms).
+    for name in OPS:
         accepted = []
         for form in MASK_FORMS:
             asm, stage = attempt(code(name, form))
@@ -560,6 +687,7 @@ def controls():
                 wrong.append((asm, str(error)))
     check('%d SOP2 operations without a lowering are refused by name (%s)' % (len(missing), ', '.join(missing)),
           missing and not wrong and not set(OPS) & set(missing), str(wrong))
+    lane_mask_controls()
     pack_controls()
     bfe_controls()
     mul_controls()

@@ -1798,7 +1798,34 @@ class Stage:
                 regs = set().union(*(writes[w] for w in div)) if div else set()
                 affected = ({off_of[w] for w in div} | ({off_of[ipd]} if ipd is not None else set())) & all_targets
             div_targets[off] = (regs, affected)
+        self.flow = (index, block_of, succ, dom, writes, {})
         return joined, forward_splits, div_targets
+
+    def unjoined_masks(self, target, last_write):
+        """Marked SGPRs whose mark is not proven at a branch target. self.masks follows program order, so a mark
+        holds on every path into the target only if the block of the register's last write dominates the target and
+        no block on a path from that write to the target writes the register again."""
+        index, block_of, succ, dom, writes, reached = self.flow
+        if target not in index:
+            return set(self.masks)
+        def after(block):  # blocks reached from block over at least one edge
+            if block not in reached:
+                seen, todo = set(), list(succ[block])
+                while todo:
+                    b = todo.pop()
+                    if b not in seen:
+                        seen.add(b)
+                        todo += succ[b]
+                reached[block] = seen
+            return reached[block]
+        t = block_of[index[target]]
+        into = {b for b in range(len(succ)) if t in after(b)}
+        out = set()
+        for reg in self.masks:
+            w = block_of[index[last_write[reg]]] if reg in last_write else 0
+            if w not in dom[t] or any(reg in writes[b] for b in (after(w) & into) - {w}):
+                out.add(reg)
+        return out
 
     def translate(self):
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
@@ -1851,6 +1878,8 @@ class Stage:
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
             self.masks = set(init_masks)
+            self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined_masks)
+            last_write = {}           # SGPR -> offset of its last write in program order
             self.attrs = dict(init_attrs)
             self.used_s, self.used_v = set(init_used_s), set(init_used_v)
             self.exports = {}
@@ -1929,6 +1958,7 @@ class Stage:
                         if reg != 'm0':
                             self.used_s.add(reg)
                     clobber = here if off in joined else every_sgpr
+                    self.join_masks |= self.unjoined_masks(off, last_write)
                     fwd_clobber = forward_splits.get(off, clobber)
                     blocked = force_unproven | force_at.get(off, set())
                     kept_u = {
@@ -1967,6 +1997,7 @@ class Stage:
                 falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
                 dests = scalar_destinations(name, asm)
                 written |= every_sgpr if 'any' in dests else dests
+                last_write.update(dict.fromkeys(dests, off))
                 try:
                     if off in refused:
                         raise Unsupported(refused[off])
@@ -1996,6 +2027,8 @@ class Stage:
                         raise
                     refusals.append((handler_error(name, error, refusals), self.kind))
                     continue
+                # A write proves the mark again: every path from here on runs it. s_movreld can write any SGPR.
+                self.join_masks = (self.join_masks | every_sgpr) if 'any' in dests else self.join_masks - dests
                 if self.scc_effect:
                     scc_effects[off] = self.scc_effect
                 if term:
@@ -2024,9 +2057,9 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
-        if 'descriptor' in scc_effects.values():
-            for name in self.descriptor_scc_reads(dict(branches), scc_effects):
-                reason = 'scc from descriptor data in %s' % name
+        if set(scc_effects.values()) - {'emitted'}:
+            for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
+                reason = 'scc from %s in %s' % ('descriptor data' if kind == 'descriptor' else kind, name)
                 if refusals is None:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
@@ -2047,7 +2080,7 @@ class Stage:
     def descriptor_scc_reads(self, branches, effects):
         """Find reads reachable with an elided SCC write, including through joins and back edges."""
         instructions = {off: (size, name, asm) for off, size, name, asm in self.ins}
-        pending = [(0, False)]
+        pending = [(0, None)]  # stale: None, or the scc_effect of the write that left the emitted scc behind
         seen = set()
         while pending:
             off, stale = pending.pop()
@@ -2056,9 +2089,9 @@ class Stage:
             seen.add((off, stale))
             size, name, asm = instructions[off]
             if stale and off not in self.calculated_pc and reads_scc(name, asm):
-                yield name
+                yield stale, name
             if off in effects:
-                stale = effects[off] == 'descriptor'
+                stale = effects[off] if effects[off] != 'emitted' else None
             if off in branches:
                 pending.append((branches[off], stale))
             if name not in ('s_branch', 's_setpc_b64', 's_endpgm'):
@@ -2707,6 +2740,7 @@ class Stage:
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
+        lane_complement = False
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
         word_pack = (base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_flbit_i32_b32')
                      or base in SCA_WORD_ONLY)
@@ -2714,22 +2748,26 @@ class Stage:
         if base in SCA_RMW_DEST:
             # The old destination is the first source of the expression.
             srcs = [dname] + srcs
-        if shift_add or base == 's_xnor_b32' or word_pack or base == 's_ff0_i32_b32' or word_absdiff:
+        if shift_add or word_complement or word_pack or base == 's_ff0_i32_b32' or word_absdiff:
             # The per-lane mask cannot supply the full word needed by these operations. s_nand_b32 and
             # s_nor_b32 on a lane mask act on each lane's own bit, like s_and_b32 and s_or_b32.
             # s_mul_hi_u32 into an SGPR that held a mask replaces it with a plain word (set_s drops the
             # mark), so only vcc/exec count as a mask destination there.
             mask_dest = (dname in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi') if base == 's_mul_hi_u32'
                          else self.is_lane_mask(dname))
-            if mask_dest or any(self.is_lane_mask(t) for t in srcs):
+            # Bit i of ~(S0 op S1) depends only on bit i of each source, so with every source a lane mask the lane's
+            # bit of the result is exact. Only an SGPR destination is taken; a mixed mask and plain word is not.
+            def mask_source(tok):
+                r = reg_range(tok)
+                return tok in ('vcc', 'vcc_lo', 'exec', 'exec_lo') or bool(
+                    r and r[0] == 's' and r[1] == r[2] and r[1] in self.masks)
+            lane_complement = (word_complement and bool(dst) and dst[0] == 's' and dst[1] == dst[2] and dst[1] <= 105
+                               and all(mask_source(t) for t in srcs))
+            if not lane_complement and (mask_dest or any(self.is_lane_mask(t) for t in srcs)):
                 raise Unsupported('%s on a lane mask' % base)
-        elif word_complement:
-            operands = [dname] + srcs
-            if any(t in ('exec_hi', 'vcc_hi') for t in operands):
-                raise Unsupported('%s on the high half of a lane mask' % base)
-            # A raw scalar word (inline constant, plain SGPR) has no per-lane bit: keep it refused.
-            if any(self.is_lane_mask(t) for t in operands) and not all(self.is_lane_mask(t) for t in srcs):
-                raise Unsupported('%s mixes a lane mask with an unprojected scalar word' % base)
+            if lane_complement and any(reg_range(t) and reg_range(t)[1] in getattr(self, 'join_masks', ())
+                                       for t in srcs):
+                raise Unsupported('%s on a lane mask joined at a branch target' % base)
         if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
             raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
@@ -2889,7 +2927,13 @@ class Stage:
         result_uniform = None
         if base in SCC_CARRY_IN and self.tracks_uniformity():
             result_uniform = carry_in_uniform and self.scalar_expr_uniform(expr)
-        self.set_s(d, expr, scc=scc, uniform=result_uniform)
+        self.set_s(d, expr, scc=None if lane_complement else scc, uniform=result_uniform)
+        if lane_complement:
+            # The guest SCC is (the whole complemented word != 0), which the bits of every other lane decide (an
+            # idle lane's bit is set). It is not emitted: translate() refuses a program that can read it.
+            self.scc_effect = 'a lane-mask complement'
+            if self.tracks_uniformity():
+                self.scc_uniform = False
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':

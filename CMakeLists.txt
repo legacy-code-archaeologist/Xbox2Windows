@@ -3110,8 +3110,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_s_abs COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_abs_check.py")
     # s_nand_b32 and s_nor_b32 on a lane mask (exec, vcc, compare-result SGPRs), per-lane bit against a reference (#1723).
-    add_test(NAME startup_gfx2hlsl_s_nor_nand COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_nor_nand_check.py")
+    # local/intro-shaders: not registered. Its PR (#2030) and #2459 lower the same complements with contradicting
+    # rules; this branch keeps #2459 (mark proven at branch targets, SCC not emitted, vcc/exec destination refused),
+    # which startup_gfx2hlsl_sop2_complement_check.py tests. Re-register when one of the two PRs lands upstream.
     # gfx2hlsl scalar s_lshl2_add_u32, s_lshl3_add_u32, s_bitset0_b32 and s_ff0_i32_b32 against an integer reference (#1723).
     # gfx2hlsl scalar s_bitset0_b32 and s_ff0_i32_b32 against an integer reference (#1723).
     add_test(NAME startup_gfx2hlsl_scalar_twins COMMAND "${INTAKE_PYTHON}" -B
