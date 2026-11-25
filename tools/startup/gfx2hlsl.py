@@ -4599,11 +4599,6 @@ class Stage:
         guest reads a stale value (v_readlane_b32) or keeps the old destination (v_permlanex16_b32)."""
         raise Unsupported('%s requires every selected source lane to be proven active' % name)
 
-    def op_v_readlane_b32(self, ops, mods):
-        if mods or len(ops) != 3:
-            raise Unsupported('v_readlane_b32 with %d operands and modifiers %s' % (len(ops), mods))
-        self.uniform_vgpr('v_readlane_b32', ops[1])
-
     def op_v_permlanex16_b32(self, ops, mods):
         if mods or len(ops) != 4:
             raise Unsupported('v_permlanex16_b32 with %d operands and modifiers %s' % (len(ops), mods))
