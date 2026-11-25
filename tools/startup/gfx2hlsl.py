@@ -4188,11 +4188,9 @@ class Stage:
         hardware drops them for lanes outside exec.
         """
         name = 'image_store'
-        d16 = self.kind == 'cs' and mods.count('d16') == 1
-        if self.kind == 'cs' and not d16:
-            raise Unsupported('compute image_store requires d16')
-        if not d16 and self.kind != 'ps':
+        if self.kind not in ('ps', 'cs'):
             raise Unsupported('%s outside a pixel stage' % name)
+        d16 = self.kind == 'cs' and mods.count('d16') == 1
         if len(ops) != 3:
             raise Unsupported('%s with %d operands' % (name, len(ops)))
         # UNORM only changes how a sampler normalizes the address; a store addresses integer texels, and the RDNA 2 ISA
@@ -4232,15 +4230,17 @@ class Stage:
             raise Unsupported('%s with %d address registers: %s expected' % (name, len(cs),
                                                                           'one packed x, y' if packed_2d else 'x and y'))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
-        if d16:
+        if self.kind == 'cs':
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
                 raise Unsupported('compute image_store requires full-width VGPR coordinates')
             key = self.fixed_table_image(ops[2], name)
+        else:
+            key = self.descriptor(ops[2])
+        if d16:
             # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
             rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
             value = 'float4(%s)' % ', '.join(rgba)
         else:
-            key = self.descriptor(ops[2])
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         image = self.pipe.uav(key, 'tex2d')
         if packed_2d:

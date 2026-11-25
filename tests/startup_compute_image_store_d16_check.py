@@ -46,7 +46,6 @@ def controls(llvm_mc):
         (fixture.STORE.replace('v[8:9]', 'v8').replace(' d16', ' a16 d16'), '080f20f0080e06c0', 'modifier a16'),
         (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
          '100f20f0080e0680', 'only 2D images'),
-        (fixture.STORE.replace('v[14:15]', 'v[14:17]').removesuffix(' d16'), '080f20f0080e0600', 'requires d16'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))

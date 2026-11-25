@@ -111,11 +111,12 @@ def controls():
     assert manifest.startswith('x2w-manifest 2\n'), manifest
     print('store: %s manifest uav 0 tex2d table 0 0' % STORE_LINE)
 
-    # Cache-policy bits do not change the written texel.
-    for name, store in (('glc', patched(1, 0x20)), ('slc', patched(3, 0x02)), ('dlc', patched(0, 0x80))):
+    # Cache-policy bits and unorm (integer texel coordinates) do not change the written texel.
+    for name, store in (('glc', patched(1, 0x20)), ('slc', patched(3, 0x02)),
+                        ('dlc', patched(0, 0x80)), ('unorm', patched(1, 0x10))):
         assert D.decode_instruction(store, 0)[2].endswith(' ' + name), D.decode_instruction(store, 0)
         assert STORE_LINE in translate(with_store(store)).hlsl_ps(), name
-    print('glc, slc and dlc accepted')
+    print('glc, slc, dlc and unorm accepted')
 
     # UNORM does not change the store (integer texel address); A16 packs x and y into one VGPR.
     unorm = patched(1, 0x10)

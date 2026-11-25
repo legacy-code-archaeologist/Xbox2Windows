@@ -13775,6 +13775,29 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 ```
 
+### Startup compute 32-bit float image store
+
+The startup compute translator also accepts a 2D 32-bit `image_store` (with or
+without the integer-coordinate `unorm` modifier) when all four DMASK bits are
+set, coordinates are two full-width VGPRs, data comes from four consecutive
+VGPRs and the eight image descriptor words come from an unmodified fixed table
+offset. The translator emits `asfloat(uint4(...))` into a `RWTexture2D<float4>`
+under the lane's EXEC bit and records `uav N tex2d float table P O channels 4`
+in the version 2 compute manifest. Pixel-stage 2D `image_store` also accepts
+`unorm`.
+
+The standalone dispatch reuses the source and CPU reference from the
+[gfx1013 2D float store fixture](#gfx1013-2d-float-image-stores-and-mip-loads).
+Two groups write 16 texels to mip zero of an `R32G32B32A32_FLOAT` UAV while
+comparing all 1,344 words across three mips. A second program masks out the
+second row. Omitting the store, swapping R/B, swapping RG/BA and dropping the
+EXEC guard produce 64, 32, 64 and 32 mismatches respectively.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_image_store(_warp|_hardware)?$' -V
+```
+
 ### Explicit-LOD 2D gather
 
 The startup pixel and compute translators lower gfx1013 `image_gather4_l` on a
