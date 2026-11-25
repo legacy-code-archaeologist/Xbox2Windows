@@ -2087,6 +2087,55 @@ class Stage:
     def tracks_uniformity(self):
         return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
 
+    def vgpr_writer(self, reg, before, after=-1):
+        """Index of the last instruction in self.ins[after + 1:before] that may write VGPR reg (the first operand,
+        and the second of v_swap_b32), or None."""
+        for i in range(before - 1, after, -1):
+            _, _, name, asm = self.ins[i]
+            ops = parse(asm)[1]
+            for tok in (ops[:2] if name.startswith('v_swap') else ops[:1]):
+                r = reg_range(tok)
+                if r and r[0] == 'v' and r[1] <= reg <= r[2]:
+                    return i
+        return None
+
+    def tid_shift(self, count, source):
+        """The uniform expression of `v_lshrrev_b32 vD, count, source` in the entry block of a compute program, or None.
+
+        The X thread id (v0, each local id has its own VGPR) is below the group's X size, so a right shift by n with
+        size <= 1 << n clears every thread-id bit. That gives 0 for the thread id itself, and for a vector built as
+        (uniform << K) + v0 with n <= K and size <= 1 << K the low K bits of the base are clear, the sum does not
+        carry, and the result is the same in every lane. Program order is execution order here, so the nearest
+        earlier writer is the definition; v0 must be unwritten at the definition and the scalar unwritten after it."""
+        src, now = reg_range(source), self.pc_index()
+        if (not re.fullmatch(r'0x[0-9a-f]+|\d+', count) or int(count, 0) >= 32 or not src or src[0] != 'v' or
+                src[1] != src[2] or now is None):
+            return None
+        n, size = int(count, 0), getattr(self.pipe, 'group', (1 << 31,))[0]
+        if size > 1 << n:
+            return None
+        defined = self.vgpr_writer(src[1], now)
+        if src[1] == 0 and defined is None:
+            return '0u'
+        if defined is None:
+            return None
+        _, _, name, asm = self.ins[defined]
+        _, d, mods = parse(asm)
+        base = re.sub(r'_e(32|64)$', '', name)
+        scalar = reg_range(d[1]) if len(d) == 4 else None
+        if (base != 'v_lshl_add_u32' or mods or not scalar or scalar[0] != 's' or scalar[1] != scalar[2] or
+                scalar[1] > 105 or d[3] != 'v0' or not re.fullmatch(r'0x[0-9a-f]+|\d+', d[2]) or
+                n > int(d[2], 0) or int(d[2], 0) >= 32 or size > 1 << int(d[2], 0) or
+                self.vgpr_writer(0, defined) is not None or not self.uniform_source(d[1])):
+            return None
+        for _, _, later, later_asm in self.ins[defined + 1:now]:
+            if scalar[1] in scalar_destinations(later, later_asm) or 'any' in scalar_destinations(later, later_asm):
+                return None
+        return '((s%d << %du) >> %du)' % (scalar[1], int(d[2], 0), n)
+
+    def pc_index(self):
+        return next((i for i, ins in enumerate(self.ins) if ins[0] == self.pc), None)
+
     def uniform_source(self, tok):
         r = reg_range(tok)
         if r:
@@ -2153,6 +2202,17 @@ class Stage:
                 dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
                 loaded = False
+        # A shift right of the X thread id, or of (uniform << K) + thread id, that leaves no thread-id bit.
+        shifted = None
+        if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and
+                self.tracks_uniformity() and hasattr(self, 'uniform_expr') and getattr(self, 'kind', None) == 'cs' and
+                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)):
+            candidate = reg_range(ops[0])
+            shifted = self.tid_shift(ops[1], ops[2])
+            if shifted is not None and candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
+                dst = candidate[1]
+            else:
+                shifted = None
         self.last_v = None
         term = self.lower(base, asm, ops, mods)
         uniform_written = self._uniform_written
@@ -2175,7 +2235,9 @@ class Stage:
                 # Proven sources are scalars, constants and VGPRs; each VGPR needs its own current expression.
                 expr = self.last_v[1] if self.last_v and self.last_v[0] == dst else None
                 vs = [int(n) for n in re.findall(r'\bv(\d+)\b', expr or '')]
-                if expr is None or loaded or any(n not in self.uniform_expr for n in vs):
+                if shifted is not None:
+                    self.uniform_expr[dst] = shifted
+                elif expr is None or loaded or any(n not in self.uniform_expr for n in vs):
                     self.uniform_expr.pop(dst, None)
                 else:
                     self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],

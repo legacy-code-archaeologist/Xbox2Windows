@@ -33,10 +33,12 @@ COMPARE = 'v_cmp_lt_f32_e64 s2, v0, v1'
 ALIAS_LOAD = 's_buffer_load_dwordx2 s[2:3], s[4:7], s2'
 
 
-def run(*instructions, exec_known=True, kind=None):
+def run(*instructions, exec_known=True, kind=None, group=None):
     """Translate disassembly text using the same dispatch and branch scan as a real stage."""
     s = G.Stage.__new__(G.Stage)
     s.pipe, s.lines = Pipe(), []
+    if group:
+        s.pipe.group = group
     s.attrs = {}
     s.sym = {4 + i: ('desc', ('table', 0), 0, i) for i in range(4)}
     s.sym[3] = ('fixed_buffer_word',)
@@ -261,6 +263,51 @@ for label, instructions, read in (
         ('two-dword load with a varying offset', ('buffer_load_dwordx2 v[7:8], v0, s[4:7], 0 offen',), 8),
         ('other register after a load', ('v_mov_b32_e32 v6, v0', 'buffer_load_dwordx2 v[7:8], off, s[4:7], s2'), 6)):
     got = run(*instructions, 'v_readfirstlane_b32 s9, v%d' % read, kind='cs')
+    check(f'{label} refused', got == REFUSAL, repr(got))
+
+# tid.x >> n is 0 in every lane when the group's X size is at most 1 << n (the thread id VGPR is untouched).
+WAVE = 'v_lshrrev_b32_e32 v1, 6, v0'
+READ1 = 'v_readfirstlane_b32 s9, v1'
+for size in (1, 33, 64):
+    got = run(WAVE, READ1, kind='cs', group=(size, 1, 1))
+    check(f'wave index of a group of {size} accepted', got[-1] == 's9 = v1;', repr(got))
+got = run(WAVE, 's_cbranch_scc0 label_0010', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(64, 1, 1))
+check('wave index read past the entry block recomputed as zero', got[-1] == 's9 = 0u;', repr(got))
+for label, instructions, kind, group in (
+        ('wave index of a group of 65', (WAVE, READ1), 'cs', (65, 1, 1)),
+        ('wave index of a group of 128', (WAVE, READ1), 'cs', (128, 1, 1)),
+        ('wave index of a group with no recorded size', (WAVE, READ1), 'cs', None),
+        ('shift by 5 of a group of 64', ('v_lshrrev_b32_e32 v1, 5, v0', READ1), 'cs', (64, 1, 1)),
+        ('wave index in a graphics stage', (WAVE, READ1), 'ps', (64, 1, 1)),
+        ('wave index without a stage kind', (WAVE, READ1), None, (64, 1, 1)),
+        ('wave index of v1', ('v_lshrrev_b32_e32 v1, 6, v1', READ1), 'cs', (64, 1, 1)),
+        ('wave index after v0 is overwritten', ('v_mov_b32_e32 v0, 200', WAVE, READ1), 'cs', (64, 1, 1)),
+        ('wave index after v0 is loaded', ('buffer_load_dword v[0:1], off, s[4:7], s2', WAVE, READ1), 'cs', (64, 1, 1)),
+        ('wave index after v0 is swapped', ('v_swap_b32 v2, v0', WAVE, READ1), 'cs', (64, 1, 1)),
+        ('wave index with an output modifier', ('v_lshrrev_b32_e64 v1, 6, v0 clamp', READ1), 'cs', (64, 1, 1)),
+        ('wave index of a register shift', ('v_lshrrev_b32_e32 v1, v2, v0', READ1), 'cs', (64, 1, 1))):
+    got = run(*instructions, kind=kind, group=group)
+    check(f'{label} refused', got == ("v_lshrrev_b32 with ['clamp']" if 'modifier' in label else REFUSAL), repr(got))
+
+# The global thread id of a 64-wide group, (uniform << 6) + tid.x, shifted back by 6 is the uniform part.
+GID = 'v_lshl_add_u32 v0, s2, 6, v0'
+got = run(GID, WAVE, READ1, kind='cs', group=(64, 1, 1))
+check('global thread id shifted back accepted', got[-1] == 's9 = v1;', repr(got))
+got = run(GID, WAVE, 's_cbranch_scc0 label_0014', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(64, 1, 1))
+check('thread id base shifted back recomputed past the entry block', got[-1] == 's9 = ((s2 << 6u) >> 6u);', repr(got))
+got = run(GID, WAVE, 's_mov_b32 s2, 5', 's_cbranch_scc0 label_0018', READ1, 's_endpgm', 's_endpgm', kind='cs', group=(64, 1, 1))
+check('thread id base shifted back refused past the entry block after the scalar changed', got == REFUSAL, repr(got))
+for label, instructions, group in (
+        ('thread id base of a group of 128', (GID, WAVE, READ1), (128, 1, 1)),
+        ('thread id base shifted by more than the scale', ('v_lshl_add_u32 v0, s2, 6, v0', 'v_lshrrev_b32_e32 v1, 7, v0', READ1), (64, 1, 1)),
+        ('thread id base from a varying scalar', (COMPARE, 'v_lshl_add_u32 v0, s2, 6, v0', WAVE, READ1), (64, 1, 1)),
+        ('thread id base with the scalar rewritten', (GID, 's_mov_b32 s2, vcc_lo', WAVE, READ1), (64, 1, 1)),
+        ('thread id base from a vector', ('v_lshl_add_u32 v0, v5, 6, v0', WAVE, READ1), (64, 1, 1)),
+        ('thread id base added to another vector', ('v_lshl_add_u32 v0, s2, 6, v4', WAVE, READ1), (64, 1, 1)),
+        ('thread id base added to a rewritten v0', ('v_mov_b32_e32 v0, 3', GID, WAVE, READ1), (64, 1, 1)),
+        ('thread id base rewritten after', (GID, 'v_add_nc_u32_e32 v0, s3, v0', WAVE, READ1), (64, 1, 1)),
+        ('thread id base scaled by 32', ('v_lshl_add_u32 v0, s2, 5, v0', WAVE, READ1), (64, 1, 1))):
+    got = run(*instructions, kind='cs', group=group)
     check(f'{label} refused', got == REFUSAL, repr(got))
 
 # Older probes may provide either no tracker or only part of the tracking state.
