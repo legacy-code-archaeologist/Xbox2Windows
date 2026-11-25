@@ -1419,10 +1419,10 @@ class Stage:
         return False, tok
 
     def u_src(self, tok):
-        """uint expression for an integer-context source that the disassembler may print negated."""
-        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
-        # pattern a float negation produces. Only handlers that model it ask for this; other integer
-        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        """uint expression for an integer-context source that the disassembler may print with abs/neg."""
+        # In RDNA2 VOP3, `abs` clears bit 31 first and `-` / `neg(...)` flips bit 31 second (so `-|x|`
+        # forces bit 31 to 1, while `-x` flips bit 31). Only handlers that model them ask for this;
+        # other integer sources keep using u(), so an unexpected modifier stays refused.
         neg, tok = self.split_neg(tok)
         # `|vN|` clears the sign bit before any negation, so `-|vN|` is always negative.
         if len(tok) > 2 and tok.startswith('|') and tok.endswith('|'):
