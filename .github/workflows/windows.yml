@@ -120,6 +120,7 @@ jobs:
               (["tests/startup_gfx2hlsl_join_symbols_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_mul_hi_i32_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_sop2_complement_check.py", "binary", "llvm-mc-15"], {}),
@@ -271,6 +272,7 @@ jobs:
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
+            tests/startup_gfx2hlsl_mul_hi_i32_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
             tests/startup_gfx2hlsl_cmp16_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py             tests/startup_gfx2hlsl_cmp_class_f16_sdwa_check.py \
