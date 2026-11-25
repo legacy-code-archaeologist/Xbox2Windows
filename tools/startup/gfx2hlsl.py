@@ -4124,6 +4124,22 @@ class Stage:
         sym, uniform = slot
         self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=sym, uniform=uniform)
 
+    def uniform_vgpr(self, name, tok):
+        """Refuse: a cross-lane read cannot be proven safe, because the model proves uniformity over the
+        active lanes only and EXEC may be sparse. The selected source lane can be inactive, where the
+        guest reads a stale value (v_readlane_b32) or keeps the old destination (v_permlanex16_b32)."""
+        raise Unsupported('%s requires every selected source lane to be proven active' % name)
+
+    def op_v_readlane_b32(self, ops, mods):
+        if mods or len(ops) != 3:
+            raise Unsupported('v_readlane_b32 with %d operands and modifiers %s' % (len(ops), mods))
+        self.uniform_vgpr('v_readlane_b32', ops[1])
+
+    def op_v_permlanex16_b32(self, ops, mods):
+        if mods or len(ops) != 4:
+            raise Unsupported('v_permlanex16_b32 with %d operands and modifiers %s' % (len(ops), mods))
+        self.uniform_vgpr('v_permlanex16_b32', ops[1])
+
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
