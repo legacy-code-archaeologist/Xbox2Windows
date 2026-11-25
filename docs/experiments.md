@@ -481,6 +481,20 @@ cmake --build --preset dev --target cpu_crc_line cpu_crc_castagnoli cpu_exe_orig
 ctest --preset dev --no-tests=error -R '^cpu_exe_aot_convert$' -V
 ```
 
+## Bounded startup debugger logging
+
+The source-built `startup_debug_probe` calls a known entry point 19 times.
+`X2W_LOG_AT` records the first two calls with a changing register, two known
+qwords at signed offsets and an unreadable address. The probe checks that all
+19 calls execute and the original opcode is restored. A second run uses the
+default limit and register list, with `X2W_COUNT` sharing the site and
+counting all 19 calls. See the [startup debugger switches](startup-runtime.md).
+
+```powershell
+cmake --build --preset dev --target startup_debug_probe
+ctest --preset dev --no-tests=error -R '^startup_debug' -V
+```
+
 ## EXE startup through the desktop runtime shims
 
 The source-built `cpu_shim_startup` EXE calls a companion DLL that links
@@ -974,7 +988,7 @@ The source-built fixtures render an 8x8 ramp through three programs: a masked re
 
 Either opener may also switch the region once to its else arm with `s_andn2_b64 exec, s[a:b], exec` on the saved pair (issue #1315). EXEC then holds the saved lanes whose condition is false, so the else arm runs on the negated region condition. The else arm starts from the pre-region vector state: it reads a register the then arm wrote at its value from before the region, and a register first defined by the then arm is undefined there until the else arm writes it. At the close each register merges as `condition ? then : else`, with the pre-region value standing in for an arm that did not write it. A register undefined before the region and not written on both arms stays undefined after the close. An optional `s_cbranch_execz` directly after the opener must land exactly on the transition, and one directly after the transition must land exactly on the close. Only the arms of one region may carry skips. `s_andn2_b64` writes SCC from the new EXEC, which is untracked, so SCC is unknown in the else arm until an admitted scalar compare redefines it. A scalar written in a then arm that the wave may skip is undefined in the else arm. The body rules above apply to both arms. A transition naming another pair, a second transition, a transition outside a region, a then-arm skip onto the close of a region with an else, misplaced skips, wave32 `s_andn2_b32 exec_lo` inside a wave64 region and nesting reject. `check_masked_else_draw`, part of `pixel_aot_exec_regions_{warp,hardware}`, draws one region whose then arm writes v13 and v14 and whose else arm writes v13 and reads v14 into v15. It covers both openers, both closes and the four skip shapes (none, then, else, both) at the mixed, full and empty thresholds. Three mutants must mismatch: the transition removed, the predicate reversed, and an expectation whose else arm reads the then arm's v14. On WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.31044.16), Windows 11 build 26300.9974, all 48 cases matched and all three mutants mismatched. LLVM 15 assembles and disassembles the 16 programs, including the labelled skips.
 
-The wave32 spelling of this structured region (issue #2137) is lowered only under a declared wave32 guest profile, `lower(..., wave_size=32)`, the same declaration the wave32 entry-mask save and restore need. `s_and_saveexec_b32 sN, vcc_lo` (or a single SGPR holding a tracked condition) saves `exec_lo` into `sN` and opens the region; `s_mov_b32 exec_lo, sN` or `s_or_b32 exec_lo, exec_lo, sN` closes it, and `s_andn2_b32 exec_lo, sN, exec_lo` switches it once to its else arm. A wave32 guest's EXEC is `exec_lo`, so the lane conditions are those of the wave64 region, and the arm, join, skip, wait, scalar-load and scalar-ALU rules above apply unchanged. LLVM 15.0.7 with `+wavefrontsize32` prints the compare destination as `vcc_lo` and these forms in exactly these spellings. A region accepts only the close and else spellings of its own width, so a wave64 form inside a wave32 region and a wave32 form inside a wave64 region are refused as instructions that cannot run in a masked region. The opener is refused without the profile, with any other operand spelling (`vcc`, an SGPR pair, a constant, `exec_lo`, `m0` or `vcc_lo` as destination), when the save register is the condition register, pending or out of range, and when the condition is untracked or spans two registers; a close or else on another SGPR, a second transition, a skip onto another register's copy and an SCC reader after either close reject as for the wave64 region. In a wave32 region only `sN` is saved, so a write to `sN+1` inside it is an ordinary scalar write. The compare that writes the condition is tracked the same way in both profiles; the translator records no width for it, and a wave32 entry save followed by a wave64 region is neither added nor removed by this change. The controls (`check_wave32_region_controls`) derive each wave32 fixture from a wave64 fixture by replacing its exec lines (the plain, complementary and skip regions with both closes, every saveexec if/else shape, and the saveexec variants of the wait, scalar-ALU, scalar-load and body families) and require the two to lower to identical HLSL, which holds for these fixtures because every HLSL name comes from an instruction index and each compare writes one register; they also pin every refusal above, and in a mutation run that is not part of the repository 13 of 14 mutations of the new branches failed them (the survivor drops the `scc = None` after the `s_or_b32` close, which no reader can observe because the opener already left SCC unknown). `pixel_aot_exec_regions_{warp,hardware}` also draws every wave32 twin with the expected pixels and mutants of its wave64 fixture; because the HLSL is identical, these draws add form coverage records for `s_and_saveexec_b32`, not new pixel evidence, and nothing here runs on gfx1013. The LLVM 15 round trip assembles and disassembles the wave32 programs with `+wavefrontsize32,-wavefrontsize64`. The compute translator has its own `s_and_saveexec_b32` guard (see the compute store paragraphs); this change does not touch it, the wave32 `v_cmpx` opener after `s_mov_b32 sN, exec_lo`, the other translators, the `SUPPORTED_INSTRUCTIONS_REGEX` list of `tools/scan_unsupported_shaders.py` or the command line, which has no wave-size option. On top of `38fa5314`, Windows 11 build 26100 with the debug layer unavailable, `pixel_aot_exec_regions_warp` (Microsoft Basic Render Driver 10.0.26100.8972) and `pixel_aot_exec_regions_hardware` on an NVIDIA Quadro M1000M (driver 32.0.15.7371) and an Intel HD Graphics 530 (driver 31.0.101.2111) each ran 50 batches, 21 of them wave32: all 108 expected-pass cases matched and all 14 mutant cases mismatched. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_exec_regions_' -V`.
+The wave32 spelling of this structured region (issue #2137) is lowered only under a declared wave32 guest profile, `lower(..., wave_size=32)`, the same declaration the wave32 entry-mask save and restore need. `s_and_saveexec_b32 sN, vcc_lo` (or a single SGPR holding a tracked condition) saves `exec_lo` into `sN` and opens the region; `s_mov_b32 exec_lo, sN` or `s_or_b32 exec_lo, exec_lo, sN` closes it, and `s_andn2_b32 exec_lo, sN, exec_lo` switches it once to its else arm. A wave32 guest's EXEC is `exec_lo`, so the lane conditions are those of the wave64 region, and the arm, join, skip, wait, scalar-load and scalar-ALU rules above apply unchanged. LLVM 15.0.7 with `+wavefrontsize32` prints the compare destination as `vcc_lo` and these forms in exactly these spellings. A region accepts only the close and else spellings of its own width, so a wave64 form inside a wave32 region and a wave32 form inside a wave64 region are refused as instructions that cannot run in a masked region. The opener is refused without the profile, with any other operand spelling (`vcc`, an SGPR pair, a constant, `exec_lo`, `m0` or `vcc_lo` as destination), when the save register is the condition register, pending or out of range, and when the condition is untracked or spans two registers; a close or else on another SGPR, a second transition, a skip onto another register's copy and an SCC reader after either close reject as for the wave64 region. In a wave32 region only `sN` is saved, so a write to `sN+1` inside it is an ordinary scalar write. The compare that writes the condition is tracked the same way in both profiles; the translator records no width for it, and a wave32 entry save followed by a wave64 region is neither added nor removed by this change. The controls (`check_wave32_region_controls`) derive each wave32 fixture from a wave64 fixture by replacing its exec lines (the plain, complementary and skip regions with both closes, every saveexec if/else shape, and the saveexec variants of the wait, scalar-ALU, scalar-load and body families) and require the two to lower to identical HLSL, which holds for these fixtures because every HLSL name comes from an instruction index and each compare writes one register; they also pin every refusal above, and in a mutation run that is not part of the repository 13 of 14 mutations of the new branches failed them (the survivor drops the `scc = None` after the `s_or_b32` close, which no reader can observe because the opener already left SCC unknown). `pixel_aot_exec_regions_{warp,hardware}` also draws every wave32 twin with the expected pixels and mutants of its wave64 fixture; because the HLSL is identical, these draws add form coverage records for `s_and_saveexec_b32`, not new pixel evidence, and nothing here runs on gfx1013. The LLVM 15 round trip assembles and disassembles the wave32 programs with `+wavefrontsize32,-wavefrontsize64`. Under the same profile a `v_cmpx` also opens a wave32 region when `s_mov_b32 sN, exec_lo` of the entry mask directly precedes it: the save is one SGPR, the region closes and switches with the wave32 spellings above, and the compare keeps VCC and SCC as the wave64 `v_cmpx` region does. A save spelled `exec` instead of `exec_lo`, a save that does not directly precede the compare, one taken after a whole-quad mask, a pending save register and a compare that reads the save register are refused. The same equality control covers the `v_cmpx` fixtures (`cmpx_region` with both closes, its skip, `cmpx_observables`, the class regions, every predicate group in both encodings, the binary16 and binary32 class groups, the 64-bit integer groups under `translate_int`, the binary64 groups under `translate_f64`, and the `v_cmpx` variants of the else, wait, scalar-ALU, scalar-load and body families), and four mutations of the opener (the wave32 save not recognised, the region given width 64, the entry-mask check skipped for the wave32 save, the `exec` spelling accepted) each fail it in a run that is not part of the repository. `pixel_aot_cmpx_regions_{warp,hardware}` draws wave32 twins of the binary32 regions (both closes, the skip, the class regions) and of their mutants; the integer, binary64 and `_e64` twins are covered by the equality control only and are not drawn. On top of `ab9a020c`, Windows 11 build 26100 with the debug layer unavailable, `pixel_aot_cmpx_regions_warp` (Microsoft Basic Render Driver 10.0.26100.8972) and `pixel_aot_cmpx_regions_hardware` on an NVIDIA Quadro M1000M (driver 32.0.15.7371) and an Intel HD Graphics 530 (driver 31.0.101.2111) each ran 44 batches, 7 of them wave32 twins (five regions and two compare mutants): all 251 expected-pass cases matched and all 67 mismatch cases mismatched, in 12 s, 24 s and 19 s against the 60 s limit (statuses counted with a temporary print in `run_pixel_batch`, not part of the repository). The compute translator has its own `s_and_saveexec_b32` guard (see the compute store paragraphs); this change does not touch it, the other translators, the `SUPPORTED_INSTRUCTIONS_REGEX` list of `tools/scan_unsupported_shaders.py` or the command line, which has no wave-size option. On top of `38fa5314`, Windows 11 build 26100 with the debug layer unavailable, `pixel_aot_exec_regions_warp` (Microsoft Basic Render Driver 10.0.26100.8972) and `pixel_aot_exec_regions_hardware` on an NVIDIA Quadro M1000M (driver 32.0.15.7371) and an Intel HD Graphics 530 (driver 31.0.101.2111) each ran 50 batches, 21 of them wave32: all 108 expected-pass cases matched and all 14 mutant cases mismatched. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_exec_regions_' -V`.
 
 A forward `s_cbranch_scc0` or `s_cbranch_scc1` on a tracked scalar compare (`s_cmp_*`, `s_bitcmp*`; issue #1413) skips a block of per-lane vector ALU. SCC is a wave value, so the whole wave either skips the block or runs it. Each register the block writes merges at the branch target with a select on the condition under which the block runs: SCC for `s_cbranch_scc0`, the negated SCC for `s_cbranch_scc1`. The target must be a later instruction boundary, checked on real offsets. The block admits only the vector ALU forms that masked regions admit and `s_nop`. Memory, sampling, exports, waits, EXEC writes, scalar and wave updates, and nested branches or regions reject, as does a branch inside a masked region. An SCC from an ALU result rather than a compare also rejects. A VGPR first written in the block is undefined after it, including at the target, until an unconditional write defines it. SCC and VCC keep their tracked values across the block. `pixel_aot_scc_skip_{warp,hardware}` draws `s_cmp_eq_u32` + `s_cbranch_scc1` and `s_cmp_lg_u32` + `s_cbranch_scc0` with the runtime flag in constant word 6 set to 0, 1 and 7. An instruction after the target reads the merged value. The opposite polarity and a dropped branch must mismatch. On WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.31044.16), Windows 11 build 26300.9974, all six cases matched and all six mutant cases mismatched. LLVM 15 assembles and disassembles both labelled programs.
 
@@ -987,7 +1001,7 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_exec_regions_(warp|hardware)$' -V
 ```
 
-The same region can also open with `s_mov_b64 s[a:b], exec` immediately followed by a VOPC `_e32` `v_cmpx` on binary16, binary32, binary64 or 16-, 32- or 64-bit integer operands (issue #932): all 16 predicates at each of binary16, binary32 and binary64, the 8 signed and 8 unsigned integer predicates at 32 and 64 bits and the 6 signed and 6 unsigned ones at 16 bits (gfx10 has no 16-bit `f` or `t`), and the three class tests `v_cmpx_class_f16`, `v_cmpx_class_f32` and `v_cmpx_class_f64`, 95 forms: every VOPC `v_cmpx` form of gfx1013. `v_cmpx_class_f32` tests the class of the raw binary32 encoding of src0 against the class mask in VSRC1, as the e32 `v_cmp_class_f32` does. The binary16 forms and `v_cmpx_class_f16` share the lowering of the e32 `v_cmp_f16` and `v_cmp_class_f16`: they read the low 16 bits of each source (a literal must fit in 16 bits), treat a NaN in either one as unordered, and take the class mask from the VGPR in VSRC1. The binary64 forms and `v_cmpx_class_f64` share the lowering of the e32 `v_cmp_*_f64` and `v_cmp_class_f64` (one helper, `f64_comparison`, serves both): they compare the raw words with the `cmp_f64` helpers and no HLSL double, take a VGPR pair as VSRC1 (a VGPR class mask for the class test) and, like `v_cmp_*_f64`, need the declared binary64 denormal entry state. A 16-bit comparison reads the low 16 bits of each operand, and a 64-bit one takes the VGPR-pair, SGPR-pair and inline-constant sources of the 64-bit `v_cmp` with a VGPR pair as VSRC1. The [AMD RDNA 2 ISA guide](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf) (§6.2.2, §12.9) defines `v_cmpx` as writing its comparison to EXEC, and a thread writes only while its EXEC bit is set. From the known entry mask the translator therefore takes the new mask as the entry mask intersected with the comparison, the same lane condition as `v_cmp` plus `s_and_saveexec_b64`. That intersection rule comes from the ISA text and from LLVM's gfx10.3 rewrite of `v_cmp` plus `s_and_saveexec` into this pattern; no gfx1013 hardware run checks it. The save must hold the entry mask (not a whole-quad mask), must directly precede the `v_cmpx` and must not overlap a pending scalar load, and the region closes with `s_mov_b64 exec, s[a:b]` or `s_or_b64 exec, exec, s[a:b]` on the saved pair; the optional `s_cbranch_execz` must sit right after the `v_cmpx` and target that restore. `v_cmpx` writes neither VCC nor SCC, so both keep their tracked values through the region; `s_mov_b64` leaves SCC, while `s_or_b64` writes it from the restored mask, which is untracked, so an SCC reader after the `s_or_b64` close rejects. The region body follows the rules above. The same 95 comparisons also open a region in the VOP3 (`_e64`) encoding. On gfx10 that encoding has no SGPR destination and writes only EXEC (LLVM 15 rejects `v_cmpx_lt_f32_e64 s[0:1], v1, v2` for gfx1013). Each `_e64` opener lowers like the `_e64` `v_cmp` of the same type on the same sources: src1 may be an SGPR, an SGPR pair or a constant, the binary16, binary32 and binary64 forms take `neg` and `abs` (not on a class mask, and not on a binary64 class source), and the binary64 forms need the declared denormal state. SDWA, an `_e32` VSRC1 that is not a VGPR (a VGPR pair at 64 bits), `_e32` source modifiers, an `_e64` SGPR destination, `clamp`, output modifiers, modifiers on integer sources, chained or nested `v_cmpx`, wave32 saves and kill shapes all reject; the else transition follows the rules above.
+The same region can also open with `s_mov_b64 s[a:b], exec` immediately followed by a VOPC `_e32` `v_cmpx` on binary16, binary32, binary64 or 16-, 32- or 64-bit integer operands (issue #932): all 16 predicates at each of binary16, binary32 and binary64, the 8 signed and 8 unsigned integer predicates at 32 and 64 bits and the 6 signed and 6 unsigned ones at 16 bits (gfx10 has no 16-bit `f` or `t`), and the three class tests `v_cmpx_class_f16`, `v_cmpx_class_f32` and `v_cmpx_class_f64`, 95 forms: every VOPC `v_cmpx` form of gfx1013. `v_cmpx_class_f32` tests the class of the raw binary32 encoding of src0 against the class mask in VSRC1, as the e32 `v_cmp_class_f32` does. The binary16 forms and `v_cmpx_class_f16` share the lowering of the e32 `v_cmp_f16` and `v_cmp_class_f16`: they read the low 16 bits of each source (a literal must fit in 16 bits), treat a NaN in either one as unordered, and take the class mask from the VGPR in VSRC1. The binary64 forms and `v_cmpx_class_f64` share the lowering of the e32 `v_cmp_*_f64` and `v_cmp_class_f64` (one helper, `f64_comparison`, serves both): they compare the raw words with the `cmp_f64` helpers and no HLSL double, take a VGPR pair as VSRC1 (a VGPR class mask for the class test) and, like `v_cmp_*_f64`, need the declared binary64 denormal entry state. A 16-bit comparison reads the low 16 bits of each operand, and a 64-bit one takes the VGPR-pair, SGPR-pair and inline-constant sources of the 64-bit `v_cmp` with a VGPR pair as VSRC1. The [AMD RDNA 2 ISA guide](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf) (§6.2.2, §12.9) defines `v_cmpx` as writing its comparison to EXEC, and a thread writes only while its EXEC bit is set. From the known entry mask the translator therefore takes the new mask as the entry mask intersected with the comparison, the same lane condition as `v_cmp` plus `s_and_saveexec_b64`. That intersection rule comes from the ISA text and from LLVM's gfx10.3 rewrite of `v_cmp` plus `s_and_saveexec` into this pattern; no gfx1013 hardware run checks it. The save must hold the entry mask (not a whole-quad mask), must directly precede the `v_cmpx` and must not overlap a pending scalar load, and the region closes with `s_mov_b64 exec, s[a:b]` or `s_or_b64 exec, exec, s[a:b]` on the saved pair; the optional `s_cbranch_execz` must sit right after the `v_cmpx` and target that restore. `v_cmpx` writes neither VCC nor SCC, so both keep their tracked values through the region; `s_mov_b64` leaves SCC, while `s_or_b64` writes it from the restored mask, which is untracked, so an SCC reader after the `s_or_b64` close rejects. The region body follows the rules above. The same 95 comparisons also open a region in the VOP3 (`_e64`) encoding. On gfx10 that encoding has no SGPR destination and writes only EXEC (LLVM 15 rejects `v_cmpx_lt_f32_e64 s[0:1], v1, v2` for gfx1013). Each `_e64` opener lowers like the `_e64` `v_cmp` of the same type on the same sources: src1 may be an SGPR, an SGPR pair or a constant, the binary16, binary32 and binary64 forms take `neg` and `abs` (not on a class mask, and not on a binary64 class source), and the binary64 forms need the declared denormal state. SDWA, an `_e32` VSRC1 that is not a VGPR (a VGPR pair at 64 bits), `_e32` source modifiers, an `_e64` SGPR destination, `clamp`, output modifiers, modifiers on integer sources, chained or nested `v_cmpx` and kill shapes reject, and so does a wave32 save without the wave32 profile (under the profile it opens a wave32 region, see the wave32 paragraph above); the else transition follows the rules above.
 
 The fixtures draw the ramp region with the `s_mov_b64` restore, the `s_or_b64` restore and the skip on mixed (0.5), full (10) and empty (-1) masks, and each must match all 64 pixels; a reversed predicate and a mask-free copy of the body must mismatch on the mixed mask. A second program sets VCC and SCC before the region and reads both after the `s_mov_b64` close; references that take VCC from the `v_cmpx` comparison or invert SCC must mismatch. Sixteen programs of four regions each draw every accepted predicate against the truth tables of the existing `v_cmp` draws (less, equal, greater and, for binary16 and binary32, unordered inputs), alternating the two restores; the signed shader against the unsigned truth table must mismatch. The 16-bit operand pairs have high halves that disagree with their low halves, so a signed 16-bit reference read as unsigned or over all 32 bits must mismatch. The binary16 operand pairs cover less, equal, -0 against +0, greater, denormals, infinities and a NaN on either side, with high halves chosen so that a binary32 read of the whole word gives another relation; references taken from that binary32 relation or with less and greater swapped must mismatch wherever the truth row changes. Four more programs run each 64-bit predicate over the operand shapes and word patterns of the 64-bit `v_cmp` draws against the same reference, and the signed shader against the unsigned reference must mismatch. Two more programs open the ramp region with `v_cmpx_class_f32_e32` on the +normal class of `s44 - sample.x`, which holds exactly where `s44 > sample.x`. Through both restores, they must match the same masked pixels on the mixed, full and empty masks. The -normal mask (the reversed region) and a mask-free body must mismatch. A fourth program opens four uniform class regions on the inputs of the `v_cmp_class_f32` draw: +inf against its own bit, a quiet NaN against both NaN bits, -0 against the +0 bit and a positive denormal against its bit. A wrong result in any channel must mismatch. A fifth program runs the same four regions as `v_cmpx_class_f16` on binary16 +inf, a quiet NaN, -0 and a positive denormal in the low halves, whose high halves give a binary32 class outside each mask; a wrong result in any channel and the binary32 class of the whole words must mismatch. Five more programs run every binary64 predicate and the binary64 class test as openers, with the operand shapes and class masks of the e32 `v_cmp_*_f64` draw, on all of its word rows against the same reference; those rows separate the integer order of the words, unequal signed zeros, flushed denormals and a NaN test on the high word only. Swapped operands on -1.0 against -2.0 and flipped class channels must mismatch. Every fixture is also assembled and disassembled with LLVM 15 for gfx1013 and must lower identically. The translation controls cover the rejections listed above, wrong skip targets, an overwritten save pair and unsupported body instructions.
 
@@ -3757,6 +3771,48 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_at
 python3 -B tests/compute_image_atomics_gfx1013_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
+### gfx1030 native FP32 BVH box readback probe
+
+This Linux HIP fixture captures all four destination DWORDs of
+`image_bvh_intersect_ray` and `image_bvh64_intersect_ray`. The code object
+contains the contiguous, full-precision instructions. The host uploads two
+synthetic 128-byte nodes and dispatches five rays per opcode. The first node
+has a disabled child and covers two hits, extent clipping, all-miss and
+reverse traversal. The second node supplies four hits with distinct entry
+points. The 32-bit kernel uses a descriptor-relative typed pointer. The
+64-bit kernel uses both DWORDs of an absolute typed pointer with descriptor
+base zero. The host computes both pointers from offsets in the uploaded
+allocation.
+
+The [RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+Tables 48 and 49 describe the operand order and resource fields. Mesa 25.1.0
+provides a reference for the
+[FP32 box node layout](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/vulkan/bvh/bvh.h)
+and the [absolute-pointer descriptor](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/vulkan/nir/radv_nir_rt_common.c).
+The CPU candidate orders hits by entry distance and uses `ffffffff` in
+unused positions. Reversing the sort first changes word 0 from `0000001d`
+to `00000025`. Using zero for the all-miss result changes word 0 from
+`ffffffff` to `00000000`.
+
+```sh
+sh tests/gfx1030_bvh_box/build.sh
+python3 -B tests/gfx1030_bvh_box/check.py --model-only
+```
+
+Select a physical `gfx1030` device using `rocminfo`, then pass its HIP ordinal
+with `--device`. The runner prints the code object SHA-256, HIP versions,
+descriptor, typed pointer, and all four raw and candidate words for each ray.
+Include the device target and the first reported difference in the capture.
+
+```sh
+python3 -B tests/gfx1030_bvh_box/check.py --device 0
+```
+
+LLVM and LLD 15 build the code object and verify one instruction of each
+kind in its disassembly. The CPU witnesses and mutations pass independently.
+Native readback remains pending, including the raw miss and disabled-slot
+words. The probe leaves translator behavior and form coverage unchanged.
+
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
@@ -4995,11 +5051,11 @@ The compute store profile lowers `buffer_store_format_x`, `_xy`, `_xyz` and `_xy
 
 FORMAT is bits 18:12. The remaining bits must be the GFX10 identity value `0x01000FAC` (RESOURCE_LEVEL set, DST_SEL XYZW, index stride, ADD_TID, OOB and type clear) or the legacy identity value `0x00000FAC`. Legacy programs store DFMT in bits 18:15 and NFMT in bits 14:12. Any other fixed bits skip the store.
 
-The handled GFX10 formats are 32-bit UINT and FLOAT for one to four channels, `16_16_FLOAT`, `16_16_16_16_FLOAT`, `8_8_8_8_UNORM`, `16_16_UNORM`, `10_10_10_2_UNORM`, and the single-channel 16-bit UNORM, SNORM, UINT, SINT and FLOAT forms. The opcode width has to match the format. A d16 opcode converts each packed binary16 half with `f16tof32` before that packing. d16 combined with 16-bit UINT or SINT does not store. Every other format does not store. UNORM and SNORM follow the Direct3D float conversion (scale, add or subtract 0.5, then drop the fraction). The fixture includes one exact binary32 unorm8 tie, where that rule yields 3 and ties-to-even would yield 2. The RDNA buffer-format unit's tie break is unverified: the ISA text checked here does not state it, and LLVM's AMDGPU packed conversions are ties-to-even on a different unit. The profile does not write raw dwords in place of an unknown format.
+The handled GFX10 formats are 32-bit UINT and FLOAT for one to four channels, `16_16_FLOAT`, `16_16_16_16_FLOAT`, `8_8_8_8_UNORM`, `16_16_UNORM`, `2_10_10_10_UNORM`, and the single-channel 16-bit UNORM, SNORM, UINT, SINT and FLOAT forms. The opcode width has to match the format. A d16 opcode converts each packed binary16 half with `f16tof32` before that packing. d16 combined with 16-bit UINT or SINT does not store. Every other format does not store. UNORM and SNORM follow the Direct3D float conversion (scale, add or subtract 0.5, then drop the fraction). The fixture includes one exact binary32 unorm8 tie, where that rule yields 3 and ties-to-even would yield 2. The RDNA buffer-format unit's tie break is unverified: the ISA text checked here does not state it, and LLVM's AMDGPU packed conversions are ties-to-even on a different unit. The profile does not write raw dwords in place of an unknown format.
 
 A 32-bit result is a raw UAV store of one to four dwords. Packed UNORM and FLOAT16 results occupy one or two dwords. A single 16-bit channel clears its half of the containing dword with `InterlockedAnd` and inserts it with `InterlockedOr`. The reservation is four bytes per channel, so `d16_xyzw` reserves sixteen bytes rather than the two data VGPRs. Overlapping reservations are refused. The address stays 2-byte aligned, the element stays inside the stride, and the indexed layout keeps a single writer for each dword.
 
-The gfx1013 fixture uses a group of 4 and a 112-byte record. One dispatch writes all eight opcodes, thirteen formats, a legacy `32_32_32_FLOAT` xyz store and a legacy `16_16_FLOAT` xy store. WARP and the hardware adapter compare all 320 words for one group and for two. Replacing the first format with `BUF_FMT_8_SNORM`, or binding `16_UINT` to the `d16_x` store, leaves that element at the sentinel. Changing the 32-bit payload must fail at word 14. LLVM 15 assembles the fixture and `lower` of the disassembly matches `lower` of the source. The Windows LLVM 15.0.7 installer has no `llvm-mc.exe`; that round trip uses the same package's clang integrated assembler and `LLVM-C.dll`.
+The gfx1013 fixture uses a group of 4 and a 112-byte record. One dispatch writes all eight opcodes, thirteen formats, a legacy `32_32_32_FLOAT` xyz store and a legacy `16_16_FLOAT` xy store. WARP and the hardware adapter compare all 320 words for one group and for two. Replacing the first format with `BUF_FMT_8_SNORM`, the `2_10_10_10_UNORM` store's format with `10_10_10_2_UNORM`, or binding `16_UINT` to the `d16_x` store, leaves that element at the sentinel. Changing the 32-bit payload must fail at word 14. LLVM 15 assembles the fixture and `lower` of the disassembly matches `lower` of the source. The Windows LLVM 15.0.7 installer has no `llvm-mc.exe`; that round trip uses the same package's clang integrated assembler and `LLVM-C.dll`.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -5010,11 +5066,17 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_descriptor_store_form
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+#### 2_10_10_10 and 10_10_10_2
+
+AMD format names list the fields from the most significant bit. Mesa's `gfx10_format_table.py` reverses each name into little-endian channel sizes, and radeonsi and radv map R10G10B10A2 (x in bits 9:0, w in bits 31:30) to `2_10_10_10`. So the 10-bit-x layout is `BUF_FMT_2_10_10_10_UNORM` (gfx10 code 50, legacy DFMT 9). `BUF_FMT_10_10_10_2_UNORM` (code 44, legacy DFMT 8) has a 2-bit x in bits 1:0 and 10-bit y, z and w.
+
+The descriptor-format stores and loads first used the 10-bit-x packer for code 44 and legacy DFMT 8, which would have read and written the wrong fields. They now use it for code 50 and legacy DFMT 9 only, and refuse code 44 and legacy DFMT 8. A store with that format is skipped, and a load with it is invalid, so nothing is published. The store and load fixtures use code 50, and each adds a GPU run with code 44 that must leave its output at the sentinel.
+
 ### Descriptor-format buffer loads
 
 The gfx1013 compute store profile lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` through the t0 source binding. The format is read at run time from V# word 3. Repeat `--load-format-constant` once per formatted load, in program order. Each index names a ready `s_buffer_load` word of the constant descriptor.
 
-This is the format decoder of item A of #2022. The descriptor still comes from the static table offset (`--source-descriptor`, `--source-stride`). Taking the descriptor from the heap at run time is a separate slice, so this alone does not count as coverage of any application dispatch.
+This is the format decoder of item A of #2022. The descriptor still comes from the static table offset (`--source-descriptor`, `--source-stride`). Taking the descriptor from a run-time view record is the [next slice](#heap-view-buffer-loads), so this alone does not count as coverage of any application dispatch.
 
 The address is `idxen` only and 4-byte aligned, and four bytes per opcode channel must fit inside the stated stride. These stay refused with this flag:
 - the `d16_` forms;
@@ -5026,7 +5088,7 @@ The caller-format gfx1030 path and the static raw reads are unchanged.
 
 The fixed bits and the format set are those of the descriptor-format stores. The fixed bits must be the GFX10 identity `0x01000FAC` or the legacy identity `0x00000FAC`. The formats are:
 - 32-bit UINT and FLOAT, one to four channels;
-- `8_8_8_8_UNORM`, `16_16_UNORM` and `10_10_10_2_UNORM`;
+- `8_8_8_8_UNORM`, `16_16_UNORM` and `2_10_10_10_UNORM`;
 - `16_16_FLOAT` and `16_16_16_16_FLOAT`;
 - 16-bit UNORM, SNORM, UINT, SINT and FLOAT.
 
@@ -5055,11 +5117,12 @@ A `--compute-store-case` file may now end with 320 t0 words; without them, t0 ke
 
 Threads 4 to 7 are pseudo-random. The expected words come from a Python model that rounds with `Fraction`. WARP and the hardware adapter compare all 320 words for one group and for two.
 
-Four more runs each make one load invalid, and each must leave all 320 words at the sentinel:
+Five more runs each make one load invalid, and each must leave all 320 words at the sentinel:
 - `8_SNORM`;
 - an `xyz` opcode on `32_32_32_32_UINT`;
 - an `xy` opcode on `32_FLOAT`;
-- a non-identity `DST_SEL`.
+- a non-identity `DST_SEL`;
+- `10_10_10_2_UNORM` in place of `2_10_10_10_UNORM`.
 
 References that publish placeholder words must fail on those runs: zeros for the invalid load, and the D3D (0, 0, 0, 1) fill for the `xy` opcode on `32_FLOAT`.
 
@@ -5090,6 +5153,49 @@ ctest --preset dev --no-tests=error -R '^compute_(store_aot_descriptor_load_form
 
 ```sh
 python3 -B tests/compute_load_format_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### Heap-view buffer loads
+
+The gfx1013 compute store profile can now take the t0 V# of a `buffer_load_format_x/xy/xyz/xyzw` from a run-time view record instead of a static descriptor. `--heap-view SLOT_WORD TABLE_OFFSET COUNT BUFFER_BYTES` selects it. It is slice 2 of item A of #2022 and builds on the format decoder of [descriptor-format buffer loads](#descriptor-format-buffer-loads). It excludes `--load-format-constant`: the format now comes from the record.
+
+What it adds:
+- A view record per heap slot, written by the runtime when it writes the view. It is 32 bytes: V# word 0 (base byte offset into t0), word 1 (stride in bits 29:16), word 2 (`num_records`), word 3 (the format word of the decoder), a state word (1 only while the view is live) and three reserved words. The word layout follows the public V# description in the LLVM AMDGPU documentation and Mesa's `ac_build_buffer_descriptor`; the record around it is this project's own.
+- The slot is a ready `s_buffer_load` constant word (`SLOT_WORD`). The records start at byte `TABLE_OFFSET` of a t0 of `BUFFER_BYTES` bytes and the binding declares `COUNT` of them.
+- The address is `base + index * stride + instruction offset`, and the decoder of the descriptor-format loads converts the words.
+
+A load is **refused**, and the whole dispatch leaves u0 unwritten as for an invalid format, when:
+- the slot is not below `COUNT`;
+- the record state is not 1 (never written, or released);
+- the stride is zero;
+- the base, the stride or the instruction offset is not a multiple of four (the DWORD load of the decoder needs an aligned address);
+- the format is unknown, or its channel count differs from the opcode.
+
+A load on a live view whose element does not exist **reads zero** and stays valid (zero data from a valid read is distinguishable from a refusal). That is the case when:
+- the index is not below `num_records`;
+- the opcode needs more bytes than one stride;
+- the element would leave the `BUFFER_BYTES` of t0. The bound is derived from the buffer length and the stride (`index <= (BUFFER_BYTES - base) / stride`), so it holds for any index a dispatch can reach and the product `index * stride` cannot wrap.
+
+Refused: `d16_` forms, `offen`, gfx1030, `--source-stride` and `--source-format` with this flag.
+
+What is not done here: the records live in the t0 buffer, as a side table; binding them as their own resource and reaching the desktop view through `ResourceDescriptorHeap[index]` (SM 6.6) needs a heap-indexed root signature and is still open. This is not application coverage until a real dispatch uses it.
+
+The fixtures use a group of four, two groups and 8 threads. Each opcode width (`xy`, `xyzw`) has a table of thirteen records, twelve declared:
+- a whole-range view, one with an index past `num_records`, one with a legacy format word and a smaller stride;
+- a stride too small for the opcode, a view whose end leaves the buffer;
+- a view that is not live, a zero stride, an unknown format, a format of the other channel count and a released view;
+- a base that is not DWORD aligned and a stride that is not DWORD aligned;
+- a valid record past the declared count.
+
+Every slot and one slot past the records are dispatched on WARP and the hardware adapter for one and two groups, and compared word for word with a Python model that reads the views from the case words. Zero words against a refused slot must fail. Three references must fail too: no `num_records` bound, a fixed 16-byte stride and out-of-range threads left unwritten. So must fourteen mutated sources: `num_records`, the stride, the opcode-versus-stride check, the liveness check, the released state, the zero stride, the buffer end, the index bound, the table count, the base and stride alignment checks, the view base, the zero result and the refusal. The fixture buffer is 1280 bytes, so no dispatch reaches an index of 2^18; the overflow-safe bound is checked in the controls on the generated source only.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_(store_aot_heap_view_load_|heap_view_controls$)' -V
+```
+
+```sh
+python3 -B tests/compute_heap_view_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
 ### Per-lane guards around compute stores
@@ -5326,7 +5432,9 @@ The source-built gfx1013 fixture `VADD_NC_I32` in `tests/compute_store_check.py`
 
 #### Guarded float-to-byte insert
 
-`v_cvt_pk_u8_f32 vD, s0, s1, s2` (VOP3A opcode 350, #1546) lowers to an inline expression on known words. The RDNA 1.0 and RDNA 2 ISA guides give `D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])`. The byte select and the merge are fully specified. `flt32_to_uint8` is not defined: the guides give no rounding mode, no bounds and no result for NaN or negative inputs, and AMD's machine-readable ISA description only says that the float becomes an unsigned 8-bit integer. The translation is claimed only where every reading agrees: an S0 that is +0.0 or an integer in [1, 255]. Truncation, every rounding mode and any clamp give the same byte there. The HLSL is `(S2 & ~(0xffu << ((S1 & 3u) << 3u))) | ((uint(asfloat(S0)) & 0xffu) << ((S1 & 3u) << 3u))`.
+`v_cvt_pk_u8_f32 vD, s0, s1, s2` (VOP3A opcode 350, #1546) lowers to an inline expression on known words. The RDNA 1.0 and RDNA 2 ISA guides give `D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])`. The byte select and the merge are fully specified. `flt32_to_uint8` is not defined: the guides give no rounding mode, no bounds and no result for NaN or negative inputs, and AMD's machine-readable ISA description only says that the float becomes an unsigned 8-bit integer. The translation is claimed only where every reading agrees: an S0 that is +0.0 or an integer in [1, 255]. Truncation, every rounding mode and any clamp give the same byte there. A constant S0 outside that set is refused.
+
+A register S0 is accepted by ordinary translation only when it is proven in the set: written by `v_cvt_f32_ubyte0..3` without modifier, in straight-line code under the entry exec mask, with no write since. Any other register is refused (`source vN is not proven to be +0.0 or an integer in 1..255`) unless the caller selects the `pk_u8_s0_contract` keyword of `Pipeline`, which states that every such S0 holds +0.0 or an integer in 1..255 and is recorded in the pipeline notes. The fixture draws select it, because their S0 words come from flat parameters; the request path never does. The HLSL is `(S2 & ~(0xffu << ((S1 & 3u) << 3u))) | ((uint(asfloat(S0)) & 0xffu) << ((S1 & 3u) << 3u))`.
 
 S0 is a VGPR, an SGPR that holds a known word, a literal, the integer zero or an inline float constant. S1 and S2 are any known word. A constant S0 outside the agreed set is refused with `Unverified ALU operand`: `0.5`, `1/(2*pi)`, 1.5, negative values, -0.0, 256.0, infinity, NaN, a nonzero inline integer (a denormal bit pattern) and a word wider than 32 bits. A word read from memory is not known statically, so a caller that binds one must keep it inside the set. The input modifiers `-`, `|...|` and `-|...|`, `clamp`, `mul:2`, the `_e64` spelling and a register range are not lowered; each stops at the instruction. Unknown, pending, descriptor and saved-exec sources and a destination past v255 are refused, as for the integer subset. A result is data only and is refused as an address or a lane-guard operand.
 
@@ -6534,8 +6642,9 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
 sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read
-a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates stay refused
-in their SDWA form until their NaN behavior is verified (#1920). The
+a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates were refused in
+their SDWA form until their NaN behavior was verified (#1920); DWORD selections are now lowered (f32 SDWA entry
+below). The
 destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
 A sub-dword class value, a missing or repeated select and unsupported SDWA modifiers are refused.
 `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted class predicate for 42 forms across all ten binary32 classes,
@@ -6573,7 +6682,8 @@ fixtures matched); FXC on both backends and DXC on WARP gave the ordered result.
 `startup_gfx2hlsl_f32_lg` decodes every f32 condition of the table (v_cmp and v_cmpx, e32 and e64 under every
 neg/abs combination, 510 forms), translates it and evaluates the HLSL over all 256 pairs of +-0, +-min denormal,
 +-1.0, +-max finite, +-inf, +-quiet, signalling and payload NaN against a reference built from the ISA
-definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms, and the f32 SDWA forms stay refused.
+definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms. The f32 SDWA lg/nlg forms with DWORD
+selections must emit the e64 text (see the f32 SDWA entry below).
 The draws `startup_gfx2hlsl_f32_lg_{warp,hardware}` build one of those words from the pixel's x and one from its
 y, so 16 x 16 pixels cover every pair, and write `v_cmp_lg_f32_e32`, `v_cmp_nlg_f32_e64`, `v_cmp_lg_f32_e64` and
 `v_cmp_nlg_f32_e32` results or keep a pixel through `v_cmpx_lg/nlg_f32_e32/e64`, compiled with FXC `ps_5_1` and
@@ -6605,6 +6715,34 @@ is recorded, and it matched. Also recorded, not checked: with `/Gis` and `-Gis` 
 both matched every pixel. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_nan' -V`;
 `tests/startup_gfx2hlsl_f32_nan_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the fixtures through
 LLVM 15.
+
+**f32 SDWA compares (#1906).** `compare()` refused every `v_cmp_*_f32_sdwa` and `v_cmpx_*_f32_sdwa` until the f32
+predicates were exact on NaN (#1930, #1949). DWORD selections are now lowered: they read the register as binary32
+with neg/abs as in the e64 form, so a `src0_sel:DWORD src1_sel:DWORD` compare emits the e64 text of the same
+modifiers, NaN bit test included. Byte and word selections are refused
+(`<name>: f32 SDWA byte/word selection depends on the binary32 denormal mode`), because the selected field is always
++0 or a denormal and its result depends on the denormal mode, which gfx2hlsl does not read. `tools/pixel_aot.py`
+refuses the same forms. `sext()` is integer-only (LLVM's `AMDGPUModifierSyntax`) and refused; LLVM 15 does not
+decode the bit on a float source. LLVM's `SIPeepholeSDWA` models the sub-dword case as zero-extension read as
+binary32 bits; the RDNA 2 ISA guide gives only the SDWAB fields (§13.3.8) and says VOPC SDWA has no OMOD, CLMP,
+DST_U or DST_SEL (§6.8). `startup_gfx2hlsl_f32_sdwa` builds and decodes every f32 SDWA form: 15 conditions; v_cmp
+into `vcc_lo` and into an SGPR, v_cmpx into EXEC; 7 x 7 selects; 4 x 4 neg/abs. Each of the 720 DWORD/DWORD forms
+must emit the e64 text, and its HLSL is evaluated over the 256 source pairs of the lg check under the IEEE, FXC and
+DXC models of the nan check (184,320 evaluations) against the ISA reference. Each of the 34,560 forms with a byte or
+word select on either source must be refused with that message. The text before #1930/#1949 on the same operands
+fails all 128 guarded forms under the model of the compiler that broke it. The draws
+`startup_gfx2hlsl_f32_sdwa_{warp,hardware}` write four DWORD/DWORD results of each condition (`(a, b)`,
+`(-a, |b|)`, `(-|a|, -b)`, `(|a|, b)`, into `vcc_lo` and SGPRs) and keep pixels through
+`v_cmpx_<cond>_f32_sdwa -v3, |v4| src0_sel:DWORD src1_sel:DWORD`, 30 fixtures compiled with default-flag FXC
+`ps_5_1` and DXC `ps_6_0`. Every pixel matched on WARP and the RX 9070 XT with both compilers (denormal sources
+flushed where they matter). The text before #1930/#1949 fails each draw on the compiler that broke it (lg/nlg on
+both) and matches that compiler's model. The exception is o and u under DXC: their old text keeps each source's
+modifiers, and DXC folded `x == x` for `(a, b)` and `(-a, |b|)` in `cmp_o`/`cmp_u` but not for `(-|a|, -b)` or
+`(|a|, b)`. In `cmpx_o`/`cmpx_u`, DXC folded the `|b|` side but not the `-a` side. Those matches are recorded, as
+are the old text on the other compiler and `/Gis`/`-Gis` runs (every fixture matched). Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_sdwa' -V`;
+`tests/startup_gfx2hlsl_f32_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip all 35,280 forms
+(lowered and refused) and the fixtures through LLVM 15. Class compares are unchanged.
 
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
@@ -7734,6 +7872,39 @@ case fail at the result word with that same sentinel. The maintainer ran the
 exact merged candidate on WARP and an RTX 4060 Laptop. Both readbacks passed.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45473674036)
 · [Physical adapter report](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7142831918)
+
+#### GPU-written command count for an indirect dispatch
+
+Slot 61 now accepts a rootless desktop Dispatch signature with a maximum
+command count above one and an optional count buffer. The count word is four
+bytes at a word-aligned offset in a unique slot-133 buffer tracked from
+`COMMON`. As on the desktop, the executed number is the smaller of the word and
+the maximum count. Every record up to the maximum must lie inside the argument
+buffer; otherwise the call is refused with a named reason and records nothing.
+Without a count buffer all `count` records run. A zero maximum count, a count
+offset without a buffer, and any count or count buffer on a graphics signature
+are still refused.
+A Dispatch signature with root constants stays single-command: a maximum count above one or a count buffer is refused, even when its root matches the bound root.
+
+The `count` mode of
+[`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp) places
+a count word and three Dispatch records, `(2,1,1)`, `(1,2,1)` and `(1,1,3)`,
+in one buffer with a maximum count of 3. A GPU writer stores the word and the
+records. The consumer adds `1 + x + 10y + 100z` per group, so each record
+changes the result. The cases are:
+
+- count 2 (runs the first two records);
+- count 9 (clamped to the three records);
+- count 0 and an omitted writer (nothing runs);
+- no count buffer with a zero count word (all three records run);
+- an unmapped argument, a count word outside the buffer, an unaligned count
+  offset, records that overflow the buffer, and a placeholder signature
+  (all keep the sentinel).
+
+```powershell
+cmake --build --preset dev --target startup_indirect_dispatch
+ctest --preset dev --no-tests=error -R '^startup_indirect_count_(warp|hardware)$' -V
+```
 
 #### Root constants in an indirect dispatch signature
 
@@ -11141,9 +11312,8 @@ does not write into any newly created container such as `slot-b`. The contract
 test covers both controls plus independent `slot-a`/`slot-b` names on one
 provider.
 
-`XUserAddAsync` remains an explicit stub. Its completion contract needs the public
-`XAsyncBlock` and `XUserAddResult` semantics, which this repository does not model
-without GDK headers. `XGameSaveInitializeProviderAsync` is implemented; see below.
+`XUserAddAsync` was first an explicit stub; it and `XUserAddResult` are now implemented
+on the manual task queue (see below), as is `XGameSaveInitializeProviderAsync`.
 
 The same fixture adds the smallest documented synchronous persistent local
 storage and package subset. `XPersistentLocalStorageGetPathSize`,
@@ -11164,9 +11334,8 @@ than the reported size and
 handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
 and `XPackageCloseMountHandle` invalidates the handle; later path queries return
 `E_HANDLE`. The mapping is shim-only and does not read or verify a real package
-manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
-`XUserAddAsync`, because the
-`XAsyncBlock` completion contract is not modeled without GDK headers.
+manifest. `XPackageMountWithUiAsync` remains an explicit stub because its
+completion contract is not modeled.
 
 The same fixture adds the synchronous XSystem and XGame identity subset.
 `XSystemGetConsoleId` reports the fixed 38-character console ID
@@ -11194,18 +11363,17 @@ device type.
 `xgameruntime_pls_xpackage` calls every implemented PLS and XPackage function,
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
-that no implemented call logged `E_NOTIMPL`. Its negative controls are
-`XPackageMountWithUiAsync` and `XUserAddAsync`, which must both log
-`E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
+that no implemented call logged `E_NOTIMPL`. Its negative control is
+`XPackageMountWithUiAsync`, which must log `E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
 checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
 `XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
 calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
 repeats each call for stability, checks the short-buffer and null-pointer errors,
-and asserts that `XUserAddAsync` still logs `E_NOTIMPL`. The DLL remains under
+and asserts that `XUserAddAsync(None)` (the unsupported picker option) still logs `E_NOTIMPL`. The DLL remains under
 `out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
 names are `xgameruntime_thunks`, `xgameruntime_contracts`,
-`xgameruntime_pls_xpackage`, `xgameruntime_identity`, and
-`xgameruntime_gamesave_async`.
+`xgameruntime_pls_xpackage`, `xgameruntime_identity`,
+`xgameruntime_gamesave_async`, and `xgameruntime_user_async`.
 
 `XGameSaveInitializeProviderAsync` and `XGameSaveInitializeProviderResult` are
 implemented on top of the synchronous provider path. Argument errors (null
@@ -11228,14 +11396,37 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XAsyncGetStatus`,
-`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+the leading queue, context and callback fields. `XPackageMountWithUiAsync` remains an `E_NOTIMPL` stub.
+`XUserAddAsync` and `XUserAddResult` (part of #870, #1334; on #2170 and #2179)
+use the same manual-queue contract for the one synthetic user. Only
+`AddDefaultUserSilently` or `AddDefaultUserAllowingUI` alone are accepted. Any
+other option value (including `None` and `AllowGuests`), a null queue or a queue
+the shim did not make is refused with `E_NOTIMPL` before the block or capacity
+is touched. The callback fires once on `XTaskQueueDispatch`; `XUserAddResult`
+returns `E_PENDING` until then without consuming anything, then `S_OK` with one
+handle for `XUserCloseHandle`, once. An untracked block, a second claim or a
+game-save block gets `E_INVALIDARG`. A start that finds no free user handle
+fails with `E_OUTOFMEMORY` and frees its block.
+`XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
+Operation completion and callback dispatch stay separate: once the provider work
+has finished, both queries report the stored status (and a result size of one
+provider or user handle) even while the completion callback still waits for
+`XTaskQueueDispatch`, matching the installed runtime. A block whose work is
+still in flight reports `E_PENDING`; a waiting status sleeps until that work
+completes or the start fails (then `E_INVALIDARG`). A null, untracked or
+already consumed block returns `E_INVALIDARG`. `xgameruntime_async_status` covers
+this against the manual queue of #2179 and the completion-port contract of #2170,
+including Begin, query status and size before the first dispatch, then dispatch
+exactly once.
+`xgameruntime_user_async` covers the user-add path, including the close guard and
+user-table exhaustion, and that `XAsyncGetStatus` and `XAsyncGetResultSize` report
+`S_OK` and one user handle size right after completion, before the callback pump.
 `xgameruntime_gamesave_async` covers the positive completion, the callback and
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check xgameruntime_user_async_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
@@ -11270,7 +11461,7 @@ refused before any image is loaded or mapped. The default `plan(report)` keeps
 the earlier permissive behavior because the offline preflight does not inspect
 host providers. The XGameRuntime fixture is built under
 `out/build/dev/fixture-shims/`, never beside `xmem.dll` or `d3d12_xs.dll`. A
-source-built EXE importing `xgameruntime.dll!XUserAddAsync` is packaged with the
+source-built EXE importing `xgameruntime.dll!XPackageMountWithUiAsync` is packaged with the
 normal shims but without that fixture DLL; `xgameruntime_preflight_stub_refused`
 checks its `external_unverified` status and the strict plan's refusal.
 
@@ -12023,7 +12214,7 @@ For plain 2D `image_load`, the startup translator reads `a16` coordinates from t
 halves of one VGPR and emits `Texture2D.Load` at mip zero. The synthetic case in
 `python -B tests/startup_image_load_mip_check.py` packs x=1 and y=2 into v0 and assigns 63 to v1, which the
 old lowering used as y. Full-width loads still accept cache-policy flags. Plain loads refuse an empty
-`dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
+`dmask`, `r128`, `lwe`, `tfe` and reserved bits. The fixture also checks that 3D `a16` and a
 patched 2D `a16` instruction carrying an unexpected NSA extension are refused, and that the runtime
 and offline cache keys use the same revision. The check verifies translation on the CPU.
 
@@ -12036,6 +12227,17 @@ Verified on commit base `82c07000` on Windows 11 26H2 (build `26300.9974`) with 
 ```powershell
 cmake --build --preset dev --target offscreen_check d3d12_xs_shim
 ctest --preset dev --no-tests=error -R '^startup_image_sample_a16_(controls|warp|hardware)$' -V
+```
+
+## Startup translator: level-zero D16 image loads
+
+For level-zero `image_load` with `d16` on 2D (including `a16` and NSA), 3D and 2D-array resources, `tools/startup/gfx2hlsl.py` narrows each enabled `dmask` component of the `Load` result to IEEE binary16 and packs the halves pairwise into `ceil(popcount(dmask) / 2)` consecutive VGPRs (low half first, high half second). HLSL `f32tof16` truncates toward zero on WARP (lowering 31,740 of the 65,536 `DXGI_FORMAT_R16_UNORM` depth values by 1 ULP relative to RDNA hardware), while narrowing an intermediate binary32 `Load` value still double-rounds `R16_UNORM` at `0xffaf` (`0x3bfe` instead of `0x3bfd`) and `0xffef` (`0x3c00` instead of `0x3bff`). `gfx2hlsl.py` therefore emits both an integer binary32-to-binary16 round-to-nearest-even helper (`pack16_rne`, quieting NaNs while preserving sign) and an exact `UNORM16` helper (`pack16_unorm16`, recovering `u = uint(saturate(v) * 65535.0 + 0.5)` and rounding `u / 65535` directly to binary16), selected per SRV via `udsrc <ud> d16unorm16 <index>`, and writes `d16srv <index> exact` to `<key>.txt`. Before drawing, `src/startup_stubs/d3d12_draw.inl` (`src/startup_stubs/d16_image_format.h`) validates the bound view's effective `DXGI_FORMAT` against the 14 independently GPU-verified exact formats (five 32-bit float views, six 8-bit `UNORM` views, and three 16-bit `UNORM` views), setting `d16unorm16` to `1` for `R16*_UNORM` and `0` for the exact binary32/`UNORM8` formats while refusing integer (`UINT`/`SINT`), typeless, depth-stencil-only, `SNORM16`, `R24_UNORM`, `SRGB`, block-compressed, packed-target stand-in, console extension, null-resource and unbound views. When `popcount(dmask)` is odd (`1` or `3`), bits `31:16` of the final destination VGPR are hardware-undefined on RDNA 2; `gfx2hlsl.py` tracks those registers across expressions and basic blocks and refuses whole-word reads unless consumed through a low-16-bit operation (`v_cvt_f32_f16`, `v_cvt_f32_ubyte0`/`1`, `SDWA` `BYTE_0`/`BYTE_1`/`WORD_0`, `v_and_b32` with constant mask `<= 0xffff`, `v_cmp_class_f16`/`v_cmpx_class_f16`, or `v_fma_mix*` half operands). Pipelines without `image_load` `d16` omit all helpers and `d16srv` lines; `image_load_mip` with `d16`, sampler MIMG forms with `d16`, 1D and cube dimensions, 3D or 2D-array `a16`, `tfe`, `lwe`, `r128`, set reserved MIMG bits, an empty `dmask`, and mismatched register counts remain refused.
+
+Verified on commit base `009153b7` on Windows 11 26H2 (build `26300.9974`) across Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.9818`) and AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`), D3D12 debug layer enabled (`debug_errors=0 debug_warnings=0`): exhaustive GPU probes across all 65,536 `DXGI_FORMAT_R16_UNORM` texels (DXC `cs_6_2` and FXC `cs_5_0`) and all 256 `DXGI_FORMAT_R8_UNORM` texels match RDNA 2 hardware `d16` loads with 0 mismatches (`65,536 / 65,536` and `256 / 256`, including `0xffaf -> 0x3bfd` and `0xffef -> 0x3bff`). In `offscreen_check --startup-image-load-d16` (DXC `ps_6_0` and FXC `ps_5_1`), fixtures A and B match all 128 output words (32 pixels) on `8x2` `R16_UNORM` and `8x2` `R32G32B32A32_FLOAT` textures, remain invariant when `0xdead0000` is injected into bits `31:16` of the odd-`dmask` registers, and reject eight mutated HLSL controls (truncation toward zero, binary32 `double_round` on `0xffaf`/`0xffef`, unpacked 32-bit `U(t.x)`, swapped low/high halves, dropped `<< 16` shift, dropped `a16` coordinate unpack, ignored NSA register list, and unmasked odd-`dmask` upper half). Through `d3d12_xs.dll` (`startup_d16_srv_{warp,hardware}`), `R16_UNORM` (`0xffef -> 0x3bff`), `R32_FLOAT` (`0x3f7ff000 -> 0x3c00`) and `R16_TYPELESS` viewed as `R16_UNORM` (`0xaaaa -> 0x3955`) dispatch the exact per-SRV mode on one PSO while `R16_UINT`, `R16_SNORM`, null-resource and unwritten views are refused and malformed `d16srv` manifests are rejected.
+
+```powershell
+cmake --build --preset dev --target offscreen_check startup_d16_image_format_check startup_stream_consumer
+ctest --preset dev --no-tests=error -R '^startup_(image_load_d16_(controls|warp|hardware)|d16_image_format.*|d16_srv_(warp|hardware))$' -V
 ```
 
 ## Startup translator: pixel depth export
@@ -12105,6 +12307,8 @@ lane masks and the discard destination. Run
 
 `tests/startup_gfx2hlsl_bit_alu_check.py` translates a source-built pixel stage that applies each operation to four lanes (the VOP1 operations alternate `_e32` and `_e64`) and evaluates the generated text with a small 32-bit HLSL evaluator against a reference written from the ISA description with bit loops, string reversal and integer arithmetic. The grid holds 17,459 inputs for `v_bfe_i32` (every offset and width 0 to 31 for 17 base words, plus offsets and widths above 31), 324 for `v_bcnt_u32_b32` and 81 for each scan. Each lowering also has a mutation that must read a wrong word: no sign extension, a subtracted addend, 0 instead of 0xffffffff for zero, no `31u -`, a negative value scanned unchanged, and no bit reversal. On `origin/main` the check fails with `Unsupported: v_bfe_i32`. `binary <llvm-mc>` reassembles the fixtures (llvm-mc 19 here; the CI job passes llvm-mc 15). The `draw` mode compiles the translated pair with FXC and DXC and draws one pixel per four input sets through `offscreen_check --startup-flat-param`; the inputs travel as flat vertex parameters so the compilers cannot fold them. It also draws the first set of each operation with the mutated lowering and requires the mutated words in the readback. The evaluator and reference results above come from Linux. The draw mode passed at `48d9571d` on Windows 11 build 26300.9974 with DXC 1.8.2502.11 and the Windows SDK 10.0.26100 FXC, with the debug layer on and 0 errors and 0 warnings. It passed on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). On each adapter, all 34 draws (17 through FXC `ps_5_1` and 17 through DXC `ps_6_0`) matched the reference words, and all 12 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_bit_alu_controls`, `startup_gfx2hlsl_bit_alu_warp` and `startup_gfx2hlsl_bit_alu_hardware`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) `v_xor3_b32` (`D = S0 ^ S1 ^ S2`, the LLVM 15 and RDNA 2 definition, as in the compute lowering of #1573) joins the same check with 729 grid inputs and three draw sets whose three sources differ in every byte (0x13579bdf, 0x2468ace0, 0xfedcba98 and their rotations); its mutation drops the third operand and reads `src0 ^ src1`. Source modifiers, `clamp`, `op_sel` and a wrong operand count stay refused. `binary` matches the xor3 words with llvm-mc 23; the draw has not run on Windows for it yet.
 
+`tools/startup/gfx2hlsl.py` lowers the gfx1013 binary16 interpolation pair `v_interp_p1ll_f16` / `v_interp_p2_f16` (#1996, item C). The attribute channel holds two binary16 values that the vertex stage exports with `compr`; half `h` of channel `c` is float channel `2 * c + h` of the parameter, and the pair becomes `(vD & 0xffff0000u) | f32tof16(i.paramN.<channel>)`, with the upper half of the destination kept. Only the plain form and `high` are lowered: `clamp`, an output modifier, a source modifier, a channel above `y`, a `p2` whose third source is not the matching `p1ll` result, and an attribute that the vertex stage does not export with `compr` are refused. `tests/startup_gfx2hlsl_interp_f16_check.py` evaluates the translated text on the CPU against a reference from the ISA layout and fails when the lowering is removed or the `high` bit is inverted; `binary <llvm-mc>` reassembles the fixtures and `draw` is the desktop readback (tests `startup_gfx2hlsl_interp_f16_controls`, `_warp` and `_hardware`). The `op_sel` bits (word 0 bits 11 to 14, each refused on its own) and any read of the upper 16 bits of a `p2` destination stay refused because no source states them for gfx10. Either of two kinds of evidence would lift the refusals: a source that states the gfx10 behaviour of the high 16 bits of the `v_interp_p2_f16` destination and of `op_sel` (kept, cleared or written), or a hardware draw on RDNA that reads back both halves of a `p2` result for each `op_sel` value and compares them with the lowering.
+
 The startup pixel stage lowers DPP16 quad swaps (#2125 item B): `v_mov_b32_dpp` and the VOP2 forms in the integer and binary32 operation tables with `quad_perm:[1,0,3,2]`, `[2,3,0,1]` or `[3,2,1,0]` and full `row_mask`/`bank_mask` read the source from the neighbouring pixel of the 2x2 quad (X, Y or diagonal), written as `QuadReadAcrossX`, `QuadReadAcrossY` and `QuadReadAcrossDiagonal` (SM 6.0, helper lanes included). The second source of a VOP2 keeps the lane's own register. The form needs a straight-line pixel stage at entry EXEC, proven whole-quad by an earlier `s_wqm_b64 exec, exec` (a partly covered quad has inactive source lanes that the hardware masks and `QuadReadAcross*` does not; a later write to EXEC or a restored older copy drops the proof), and plain VGPR operands; vertex stages, broadcast and pair selections (items A and C), row shifts, mirrors, DPP8, partial masks, `fi:1`, source modifiers and operations without a table entry are refused. FXC ps_5_1 has no quad intrinsic, so `translate_to` compiles a pair that uses one with DXC as vs_6_0/ps_6_0 (`X2W_DXC`, then PATH) and refuses it when no DXC exists. `tests/startup_gfx2hlsl_dpp_quad_swap_check.py` builds three pixel programs from the lane rule (OR and move forms, plus `v_min_u32_dpp` of the exchanged and own positions, #2023 item H, whose reference is the integer unsigned minimum and which also rejects a maximum) (the packed position in v0, the neighbour at x^1, y^1 or both, an own-lane control), draws 16 x 16 pixels and compares every word with an integer reference; three wrong exchanges, a missing exchange and (for the minimum) a maximum must read a different image, and a reference with one swap dropped must be rejected. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_dpp_quad_swap_' -V`. The Python controls run on Linux; the draws need DXC and `offscreen_check` on Windows.
 
 The binary32 table (`VEC_F`) applies the same operand-count rule. Before this change, a form one source short (`v_add_f32 v1, v2`) raised `IndexError` in `Stage.one` instead of `Unsupported`. A form with one source too many (`v_med3_f32 v1, v2, v3, v4, v5`) translated with the extra source dropped. `tests/startup_gfx2hlsl_operand_count_check.py` (`startup_gfx2hlsl_operand_count`) checks every operation of both tables: one source fewer and one source more are refused, and the exact count translates. It also checks that the constant and accumulator forms (`v_fmac_f32`, `v_mac_f32`, `v_fmamk_f32`, `v_fmaak_f32`, `v_madmk_f32`, `v_madak_f32`) keep translating with their usual operands. As a control, it loads the translator with the new `VEC_F` guard removed and requires both old failures to come back.
@@ -12147,6 +12351,64 @@ though newer LLVM can fill unused VOP3 fields differently in other forms.
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
+```
+
+## Compute stage in the startup translator
+
+`gfx2hlsl.ComputePipeline` translates one gfx1013 compute program with the root and resource model of
+the graphics stages. The caller passes `COMPUTE_PGM_RSRC2` and the thread group size, which are pipeline
+register state. Each group-ID axis enabled by `TGID_X/Y/Z_EN` gets the next SGPR after the user
+SGPRs, with no gap for an omitted axis (`SV_GroupID`). v0-v2 hold `SV_GroupThreadID` up to
+`TIDIG_COMP_CNT`. This is how `compute_store_aot` decodes `COMPUTE_PGM_RSRC2` (#1608).
+`TG_SIZE_EN` stays refused.
+
+Root parameters are placed from s4, which is an inference, like the graphics stages' s8. #1608 defines no
+root placement. The only in-repo evidence is the local compute-record scan above, whose table bindings
+used s4 or s5. A numeric read of a user SGPR that the root signature does not place, including s0-s3,
+is refused because its value is unknown.
+
+Inside a block that `s_cbranch_execz` skips, a scalar instruction is refused. The wave runs that block
+when any lane is active, while the one-lane model would skip it for an inactive lane. An image sample
+with implicit LOD is also refused, because a compute lane has no derivatives.
+
+The output is a `cs` HLSL main with `[numthreads]` and a version 2 manifest. The manifest has
+`stage cs` and `group` lines, plus one `uav <slot> table <param> <byte offset>` line for each store
+target. The only store lowered is `buffer_store_dword[x2|x3|x4]` in the `offen` form: a per-lane byte VGPR, plus
+the scalar offset and the immediate, through a descriptor at a fixed root-table offset. It writes a
+`RWByteAddressBuffer`. All four descriptor words must still be the words the `s_load` returned. Refused:
+- the `off` and `idxen` forms, and the cache-policy flags;
+- an immediate offset that is not a multiple of 4;
+- a descriptor word that was moved, overwritten or modified;
+- a descriptor that is also loaded.
+
+As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
+handling of out-of-range stores, are assumptions, not measurements.
+The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
+
+`startup_gfx2hlsl_compute_check.py` translates three source-built programs:
+- Case A enables all three group-ID axes and v0-v2, with group size 2x3x4 and 3x2x2 groups, and stores one word.
+- Case B enables X and Z only, so Z is s8, with group size 5x2x1 and 4x1x3 groups. It stores two words at an
+  immediate offset.
+- Case C enables Y only, with group size 8x1x1 and 1x5x1 groups. It stores four words from every lane, then
+  three words under an exec mask set from a compare.
+
+Each thread reads a read buffer at its own index and stores to its own destination. DXC compiles the HLSL
+for `cs_6_0`, and a plain D3D12 device dispatches it. The root signature is the test runner's (a root SRV,
+a root UAV and the root constants), so the manifest's table lines and the descriptor fetch are not exercised
+on the GPU. All 320 words are compared, including the sentinels. Four controls must each mismatch: swapping
+the X and Y group IDs, dropping the store, dropping case B's immediate offset, and dropping case C's exec
+predicate. The pure-Python controls refuse every reviewed input that was previously accepted: a modified
+descriptor word, an execz-skipped scalar write, an implicit-LOD sample and a misaligned immediate offset.
+
+Translating every cached graphics request before and after the descriptor-tracking change gave identical
+output and refusals. The local check covered 925 requests, 123 of which translate.
+
+On Windows 11 (26300), all 320 words matched in every case on WARP (10.0.26100.10068) and on an RTX 5090
+(32.0.16.2135), with the debug layer on.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
+python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
 ## Startup translator: refusal census
@@ -12205,12 +12467,21 @@ In straight-line code with a known `exec`, the proof follows `v_cvt_u32_f32`, `v
 
 Uniform sources include inline constants and literals, SGPRs holding constants, user data or fixed buffer words, other SGPRs tracked as uniform, and VGPRs with an existing proof. A scalar result is tracked as varying when its expression depends on `vcc`, `exec`, `m0`, a varying scalar register, a VGPR without a proof, or a varying `scc`. Descriptor, pointer, and sampler symbols, and SGPRs holding a lane mask (a compare result, even from uniform operands), are treated as non-uniform sources. A 64-bit move proves its high word only from the source high word as it was before the move, never when the destination overlaps it, and a descriptor-path move carries a high-word symbol only when that symbol does not depend on the register's run-time contents. SCC follows the same dependency tracking, with saveexec and wrexec marking it varying. A scalar write to `m0` that also sets SCC judges SCC from the write's sources, so `s_and_b32 m0, vcc_lo, -1` makes it varying while a write from uniform scalars makes it uniform. Instructions whose SCC result is not modelled (`s_add`, `s_sub`, `s_min` and `s_max`, `s_wqm`, and scalar ops on symbolic descriptor words, which emit nothing) mark SCC varying. Scalar buffer loads track the original offset across every destination word, including when the emitted code saves it in a temporary.
 
-An overwrite clears the destination's old proof unless the new value is proven uniform. This applies to SDWA forms and all three interpolation forms (`v_interp_p1_f32`, `v_interp_p2_f32`, and `v_interp_mov_f32`). Either WQM form, and restoring `exec` from a saved copy, clears all existing VGPR proofs because they can activate helper lanes. The read requires known `exec` and no modifiers. In a program with branches, the proof and the read are accepted only in the entry block: before the first branch target and before the first terminator. Every path reaches those instructions through the same instructions, so the program-order tracking is exact there. A branch back to the first instruction makes the whole program refuse, because a loop re-enters the entry block. It now explicitly checks for a single SGPR destination and a single VGPR source.
+An overwrite clears the destination's old proof unless the new value is proven uniform. This applies to SDWA forms and all three interpolation forms (`v_interp_p1_f32`, `v_interp_p2_f32`, and `v_interp_mov_f32`). Either WQM form, and restoring `exec` from a saved copy, clears all existing VGPR proofs because they can activate helper lanes. The read takes no modifiers. In straight-line code and in the entry block of a program with branches (before the first branch target and before the first terminator), the proof and the read require known `exec` and the read copies the VGPR; past the entry block the read recomputes the definition instead (below). Every path reaches those instructions through the same instructions, so the program-order tracking is exact there. A branch back to the first instruction ends the entry block at the first instruction, because a loop re-enters it. It now explicitly checks for a single SGPR destination and a single VGPR source.
 
-`tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, after the first terminator, or in an entry block re-entered by a loop), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
+Past the entry block of a program with branches, the read does not copy the VGPR. It recomputes the uniform expression that defined the VGPR, for example `s9 = U(F(s3) * 2.0)` after `v_mul_f32 v7, s3, 2.0`. The value read is the first active lane's, and that lane ran the definition when nothing between the definition and the read could change which lanes ran it or what they computed:
+
+- no branch target lies between them (a join, a loop head or a back edge): a branch target clears every VGPR proof;
+- no instruction between them writes `exec`, explicitly or implicitly (`saveexec`, `wrexec`, `v_cmpx`, WQM, `s_movreld`); narrowing is refused as well as widening;
+- the VGPR is not written in between, and no SGPR that the expression reads is written in between (VOP3b carry-out destinations count);
+- every SGPR source was proven uniform since the last branch target, so a value from another path cannot reach it; an SCC from before the last branch target is not trusted.
+
+A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge and a join where two definitions reach.
+
+`tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, in a loop whose header is in the entry block, at a backward branch target, in an entry block re-entered by a loop, or after `s_endpgm` in a branch-free program; a read after the first terminator is recomputed), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_uniform$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_(uniform|recompute)$' -V
 ```
 
 ## Desktop audio render sink
@@ -12342,6 +12613,69 @@ announced, or rounding the tile rows down in `Bc16Surface`. The last also fails
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|startup_bc7_4k_s|bc7_tile_swizzle)$'
+```
+
+### Sample by-address textures of the non-XOR console layouts
+
+Slot 70 took a few texture shapes without a resource object (the R8 plane of an existing resource,
+the single texel, the `0x105` BC3/BC7 view above and the `0x109` BC chains below; those keep their
+own paths) and refused every other description, which leaves the destination descriptor as it was.
+It now also takes a two-dimensional,
+single-sample, sampled-only texture with a known element size whose layout is `0x101`, `0x102`,
+`0x105`, `0x106`, `0x109` or `0x10a`, and reads it in that console layout, mip tail and array slices
+included. Layout `0` and the linear mode `0x100` are refused as before: `startup_address_srv` still
+runs in the default configuration, and its mismatched-width and interior-address calls stay refused.
+The accepted descriptions, views, limits and log lines are listed in `docs/startup-runtime.md`
+("Textures published by address").
+
+`startup_gfx10_layout` needs no device. It compares `src/startup_stubs/gfx10_layout.h` with the 30
+one-pipe equations of AMD addrlib's `GFX10_SW_{256,4K,64K}_{S,D}_PATINFO` rows written out in the test
+(five element sizes for each of the six modes), with `bc7_4k_s.h` on five 4 KiB surfaces, with
+`bc64_chain.h` on eight 64 KiB chains and with `tile64_plan.h` on ten tile plans; it tiles and
+detiles nine textures back to their bytes, and lists 11 refused layouts, 19 slot 70 descriptions and
+21 views on each side of the accepted set. `startup_gfx10_layout_display_control` reads the `0x10a`
+order as `0x109` and must fail. The addrlib reference is the revision `tools/fetch_addrlib.py` pins
+(Mesa 25.1.0, commit `5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib`, MIT); the files
+and their notice ("Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.",
+`SPDX-License-Identifier: MIT`) are named in the header and in both fixtures.
+[AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)
+
+`startup_address_console_{warp,hardware}` builds the backing bytes in Python from the same addrlib
+rows, independently of the header, publishes them through slot 70 with no resource object, and
+compares all 65,536 RGBA pixels of a 512 by 128 target for each of seven textures: RGBA8 96 by 40
+and BC1 192 by 96 at `0x105`, BC1 256 by 128 at `0x10a`, mips 1, 2 and 3 of a four-mip RGBA8 256 by
+256 chain at `0x10a` (mips 2 and 3 are in the mip tail), and RGBA8 40 by 24 at `0x101`. Each run must
+also log `slot70 texture kind 1: published console layout`. Two held descriptions follow: the first
+texture again over an address announced as an XG copy of rows (`console_layout_xg_rows`), and
+RGBA8 257 by 257 at `0x109`, whose nine 64 KiB blocks run past the 393,216 bytes the XG stand-in
+reports (`console_layout_beyond_xg_size`). Both must log their reason, publish nothing and read the
+null view at every pixel. Last, the first texture is published and its address is then announced as
+an XG copy of rows before the draw; the published view must read the null view at every pixel, as
+a partial-tile BC view does after a later row copy.
+
+An upload of a console-layout texture owns its upload buffer. The buffer and the texture stay referenced
+by the recording and by each submit of it until the queue has completed that submit; the shared
+upload ring, which is reused without waiting for a queue, is not used. `startup_address_console_gate_{warp,hardware}`
+starts by closing and resetting an unsubmitted recording of payload 0, then records the identical bytes again. It makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
+lists on one list object, resetting the allocator and the list between them. Each republishes one
+2048 by 2048 RGBA8 texture at `0x109` (16 MiB) from the same address with a new payload and draws it,
+payload 0 over the left half of the target and the others over the right half. No submit may complete
+before the fixture signals the fence. After the last one completes, the left half must hold payload 0
+and the right half payload 17, and the log must report eighteen retained submits released.
+`startup_address_console_gate_ring_{warp,hardware}` is the control: with
+`X2W_TEST_ADDRESS_UPLOAD_RING=1` (fixtures only) the same uploads come from the 256 MiB ring, the
+later ones pass over the bytes of payload 0 before the queue copies them, and the left half must not
+hold payload 0.
+
+The equations are checked against addrlib and against the three existing layout headers, not against
+console memory. Which layouts a given console build writes for which textures is not established by
+these fixtures. The gate fixture covers one direct queue, one texture and uploads recorded by draws;
+it does not cover a release of the desktop texture, which this change never does.
+
+```powershell
+cmake --build --preset release --target startup_gfx10_layout_check startup_stream_consumer
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_layout'
+ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_(console|console_gate|console_gate_ring|bc_view|srv)_(hardware|warp)$'
 ```
 
 ### Six BC5/BC7 mips on a 64 KiB standard layout

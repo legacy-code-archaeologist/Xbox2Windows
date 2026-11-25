@@ -23,7 +23,7 @@ THREADS = 8
 LOADS = (
     ("xyzw", 0, 56, False, 0),    # 8_8_8_8_UNORM
     ("xy", 4, 23, False, 16),     # 16_16_UNORM
-    ("xyzw", 8, 44, False, 24),   # 10_10_10_2_UNORM
+    ("xyzw", 8, 50, False, 24),   # 2_10_10_10_UNORM: x in bits 9:0, w in bits 31:30
     ("xy", 12, 29, True, 40),     # 16_16_FLOAT, legacy DFMT/NFMT
     ("xyzw", 16, 71, False, 48),  # 16_16_16_16_FLOAT
     ("x", 24, 7, False, 64),      # 16_UNORM
@@ -43,6 +43,8 @@ INVALID = (
     ("xyz opcode on a four-channel format", 10, aot.descriptor_format_word(75)),
     ("xy opcode on a one-channel format", 13, aot.descriptor_format_word(22)),
     ("non-identity DST_SEL", 12, IDENTITY_32_UINT ^ 1),
+    # 10_10_10_2_UNORM has a 2-bit x in bits 1:0; only the 2_10_10_10 layout is handled.
+    ("10_10_10_2_UNORM", 2, aot.DESCRIPTOR_GFX10_FIXED | (44 << 12)),
 )
 # Thread 0-3 t0 words: edge values per field. Threads 4-7 are pseudo-random.
 CURATED = (

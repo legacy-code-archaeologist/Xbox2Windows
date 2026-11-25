@@ -32,6 +32,8 @@ def main(argv=None):
         for script, code, output, secs in pool.map(run_one, args.scripts):
             print(f"::group::{script} ({'ok' if code == 0 else f'exit {code}'}, {secs:.1f}s)")
             sys.stdout.write(output)
+            if output and not output.endswith("\n"):
+                print()
             print("::endgroup::")
             if code != 0:
                 failed.append(script)

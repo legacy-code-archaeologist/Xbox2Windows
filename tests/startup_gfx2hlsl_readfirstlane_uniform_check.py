@@ -142,7 +142,6 @@ REFUSED = [
                                      'v_rcp_f32_e32 v7, v7', READ, 's_endpgm')),
     # A program with branches proves only before its first branch target or terminator (the entry block).
     ('read at the first branch target', (MOVE, 's_cbranch_scc0 label_000C', 's_nop 0', READ, 's_endpgm')),
-    ('read after the first terminator', (MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')),
     ('entry block re-entered by a loop', (MOVE, READ, 's_mov_b32 s2, vcc_lo', 's_cbranch_scc0 label_0000',
                                           's_endpgm')),
     ('exec write in the entry block', (MOVE, 's_and_saveexec_b32 s8, s2', READ, 's_branch label_0010',
@@ -165,6 +164,10 @@ for label, instructions in (('branch after read', (MOVE, READ, 's_branch label_0
 got = run('v_cvt_f32_u32_e32 v7, s3', 'v_rcp_f32_e32 v7, v7', READ, 's_cbranch_scc0 label_0010', 's_endpgm')
 check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7 = U(1.0 / F(v7));', 's9 = v7;'],
       repr(got))
+# Past the entry block the read recomputes the definition instead of copying the VGPR
+# (tests/startup_gfx2hlsl_readfirstlane_recompute_check.py covers that rule).
+got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
+check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
 # Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
 EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:

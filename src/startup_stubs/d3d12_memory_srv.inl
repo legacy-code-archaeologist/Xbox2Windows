@@ -15,7 +15,9 @@ bool same_texture_description(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE
 
 bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 {
-    return (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 1 &&
+           r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
+           (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
            static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
            (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) &&
            r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
@@ -57,7 +59,16 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
     return plan.size == UINT64_MAX ? 0 : (plan.size + 0xFFFF) & ~u64{0xFFFF};
 }
 
+bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
+// The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
+// addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    if (supports_placed_memory_srv(r, v)) return true;
+    return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
+}
+
+bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return x2w_startup::supports_buffer_memory_srv(r, v);
@@ -86,6 +97,27 @@ bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOUR
            v.Texture2D.ResourceMinLODClamp == 0.0f;
 }
 
+// The layout tables describe the bytes independently of the desktop adapter's format support.
+bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& r,
+                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    auto* const desktop = device_of(device);
+    D3D12_FEATURE_DATA_FORMAT_INFO planes{r.Format};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) || planes.PlaneCount != 1)
+        return false;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT view{v.Format};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &view, sizeof(view))) ||
+        !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
+        return false;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
+    if (r.Format == v.Format) storage = view;
+    else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage)))) return false;
+    return (storage.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) &&
+           (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
+}
+
 bool memory_srv_destination(u64 handle)
 {
     bool valid = false;
@@ -109,6 +141,7 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
         if (reinterpret_cast<u64>(wrapper->own().title_memory) != address ||
+            wrapper->own().tiled_address_srv ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 ||
             !same_texture_description(desc, info.console)) continue;
         if (match) {
@@ -119,6 +152,26 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     }
     ReleaseSRWLockShared(&note_lock);
     return match;
+}
+
+// An unmatched or interior view must not reinterpret bytes owned by a live resource.
+bool address_resource_overlap(u64 address, u64 span)
+{
+    bool found = false;
+    AcquireSRWLockShared(&note_lock);
+    for (const auto& [wrapper, info] : resource_infos()) {
+        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+            continue;
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        const u64 bytes = info.bytes ? info.bytes
+            : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
+        if (base && (address <= base ? base - address < span : address - base < bytes)) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return found;
 }
 
 // A live render-target, depth or UAV resource overlapping the texel is written on the desktop side, so its
@@ -205,10 +258,60 @@ bool latest_texture_write_is_rows(u64 address)
     return rows;
 }
 
+// A texture slot 70 reads in a console layout of gfx10_layout.h: not one of the shapes it read before
+// (the single texel, the 0x105 BC3/BC7 surface and the 0x109 BC chains keep their own paths).
+bool console_layout_srv(const D3D12_RESOURCE_DESC& desc)
+{
+    return x2w_startup::console_address_texture(desc) && !x2w_startup::single_element_bytes(desc) &&
+           !tiled_bc_srv(desc) && !x2w_startup::bc64::supports(desc);
+}
+
+// One line for each new kind of slot-70 texture call (format, layout, shape class, view and outcome), so
+// a run shows every shape a title asks for without a line per texture.
+void log_address_kind(const char* outcome, const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address)
+{
+    static std::mutex mutex;
+    static std::unordered_map<u64, LONG> kinds;
+    const u64 words[] = {static_cast<u64>(r.Format), static_cast<u64>(r.Layout), r.MipLevels > 1 ? 2u : 1u,
+                         r.DepthOrArraySize > 1 ? 2u : 1u, static_cast<u64>(r.Flags), static_cast<u64>(r.Dimension),
+                         static_cast<u64>(v.Format), static_cast<u64>(v.ViewDimension), reinterpret_cast<u64>(outcome)};
+    const u64 key = fnv_bytes(words, sizeof(words));
+    std::lock_guard lock(mutex);
+    if (kinds.size() >= 200 || kinds[key]++) return;
+    log("x2w-d3d12 slot70 texture kind %zu: %s; first seen res{dim=%d fmt=%d size=%llux%ux%u mips=%u layout=0x%x flags=0x%x "
+        "align=%llu} view{dim=%d fmt=%d map=0x%x} address=0x%llx", kinds.size(), outcome, r.Dimension, r.Format, r.Width,
+        r.Height, r.DepthOrArraySize, r.MipLevels, static_cast<UINT>(r.Layout), static_cast<UINT>(r.Flags), r.Alignment,
+        v.ViewDimension, v.Format, v.Shader4ComponentMapping, address);
+}
+
+// Bytes the texels of a by-address texture span at their address.
+u64 address_texture_bytes(const D3D12_RESOURCE_DESC& desc)
+{
+    if (const UINT element = x2w_startup::single_element_bytes(desc)) return element;
+    if (x2w_startup::bc64::supports(desc)) return x2w_startup::bc64::Chain(desc).bytes();
+    if (console_layout_srv(desc)) return x2w_startup::gfx10::Layout(desc).bytes();
+    return x2w_startup::Bc16Surface(desc).size();
+}
+
+// Why a console-layout description is not read from an address, or null. The two cases a partial-tile
+// BC view is held for:
+// - the latest XG stand-in copy to the address wrote desktop-footprint rows (only the opt-in BC7 4 KiB
+//   copy records a tiled write; the 0x109 BC chains, which XG writes in their layout, keep their own
+//   path and never come through here);
+// - the layout runs past the size the XG stand-in reports for the description (the desktop copyable
+//   footprints of a slice rounded up to 64 KiB, times the slices), which the title may not own.
+const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
+{
+    if (latest_texture_write_is_rows(address)) return "console_layout_xg_rows";
+    const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels);
+    if (plan.size == UINT64_MAX || !plan.size) return "console_layout_without_footprints";
+    const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * desc.DepthOrArraySize;
+    return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
+}
+
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
-    const UINT element = x2w_startup::single_element_bytes(desc);
-    const auto bytes = element ? u64{element} : x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
+    const auto bytes = address_texture_bytes(desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
@@ -238,7 +341,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
     // An already-published token can outlive a write in a different layout.
-    if (partial_tiled_bc(sampled.desc) &&
+    if ((partial_tiled_bc(sampled.desc) || console_layout_srv(sampled.desc)) &&
         latest_texture_write_is_rows(reinterpret_cast<u64>(resource->own().title_memory)))
         return nullptr;
     if (!sampled.desktop) {
@@ -335,6 +438,23 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
+    // A new console-layout view reads the address only when there is no matching live resource.
+    const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
+    if (console_layout_srv(*resource)) {
+        if ((!texture || !supports_placed_memory_srv(*resource, input->view)) &&
+            !desktop_address_view_supported(self, *resource, input->view)) {
+            held = "unsupported_desktop_format";
+            texture = nullptr;
+        } else if (!texture) {
+            held = console_address_hold(self, input->address, *resource);
+            if (!held && address_resource_overlap(input->address, address_texture_bytes(*resource)))
+                held = "overlapping_resource";
+            texture = held ? nullptr : publish_tiled_texture(self, input->address, *resource);
+            outcome = "published console layout";
+        }
+    }
+    if (!texture) outcome = held ? held : "texture_unavailable (no resource there, or texels not readable or over 64 MiB)";
+    log_address_kind(outcome, *resource, input->view, input->address);
     if (!texture) {
         if (first_calls(refused, 8))
             log_refused_memory_srv("unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",

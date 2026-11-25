@@ -3710,8 +3710,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
             # Either opener may close with an exact copy of the saved pair (issue #1315 for s_and_saveexec_b64).
             # EXEC inside the region is a subset of the saved entry mask, so this restores the same mask as
-            # s_or_b64 exec, exec, s[a:b]. Unlike s_or_b64 it leaves SCC; after s_and_saveexec_b64, which wrote
-            # SCC from the new EXEC, SCC is already untracked, so no reader can follow either close.
+            # s_or_b64 exec, exec, s[a:b]. Unlike s_or_b64 it leaves SCC: after s_and_saveexec_b64, which wrote
+            # SCC from the new EXEC, SCC is already untracked; after v_cmpx, which leaves SCC, it stays tracked.
             close_region(i, sgpr_pair(m[1]))
             region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
@@ -3733,7 +3733,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scc = None
         elif region is not None and region["width"] == 32 and (m := match(r"s_mov_b32 exec_lo, (s\d+)")):
             # The MOV close of a wave32 region: exec_lo is the whole EXEC of a wave32 guest. As for s_mov_b64, SCC
-            # is left alone, and it is already untracked after s_and_saveexec_b32.
+            # is left alone (untracked after s_and_saveexec_b32, still tracked after a v_cmpx opener).
             close_region(i, [m[1]])
             region = None
         elif m := match(r"s_mov_b32 (?:exec|exec_lo), (s\d+)"):
@@ -3796,7 +3796,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # A masked-if opened by a VOPC compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
-            # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
+            # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64. Under the
+            # wave32 profile `s_mov_b32 sN, exec_lo` may be the save instead, and the region then closes and
+            # switches with the wave32 spellings.
             # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
             # v_cmpx_class_f32 tests the class of the raw binary32 encoding in src0 against the mask in VSRC1,
             # as the e32 v_cmp_class_f32 does. The binary16 forms and v_cmpx_class_f16 read the low 16 bits
@@ -3812,8 +3814,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             previous = previous[1] if isinstance(previous, tuple) else previous
             saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
             pair = sgpr_pair(saved[1]) if saved else None
+            width, entry = 64, [("entry", 0), ("entry", 1)]
+            # A wave32 guest saves exec_lo, its whole EXEC, into one SGPR; the save branch already refused it
+            # without the wave32 profile. The region then closes and switches with the wave32 spellings.
+            if pair is None and guest_wave32 and (saved32 := re.fullmatch(r"s_mov_b32 (s\d+), exec_lo", previous)):
+                pair, width, entry = [saved32[1]], 32, [("entry", "w32")]
             if (region is not None or mask != "entry" or pair is None
-                    or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
+                    or [scalar.get(r) for r in pair] != entry):
                 raise ValueError("Unsupported v_cmpx execution mask save")
             # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
             wide = kind in ("i64", "u64") or f64op not in (None, "class")
@@ -3852,10 +3859,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                           for t in (src0, src1)]
                 expr = INT_COMPARE[iop].format(*values)
             lines.append(f"    bool cmp{i} = {expr};")
-            scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
+            for reg in pair:
+                scalar[reg] = ("exec_saved",)
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
-                      "scalar_written": set(), "scc_written": False, "opener": "cmpx", "width": 64,
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx", "width": width,
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
@@ -3938,7 +3946,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # The else transition (issue #1315): EXEC becomes saved & ~EXEC, the saved lanes whose condition is
             # false. The else arm starts from the pre-region vector state; a register first defined by the then
             # arm is undefined there. A then-arm skip must land exactly here. s_andn2_b64 writes SCC from the new
-            # EXEC, which is untracked. The wave32 spelling (an s_and_saveexec_b32 region; the in-region filter
+            # EXEC, which is untracked. The wave32 spelling (a wave32 s_and_saveexec_b32 or v_cmpx region; the in-region filter
             # admits each spelling only in a region of its width) names the one saved SGPR.
             if ((sgpr_pair(m[1]) if m[1] else [m[2]]) != region["save"] or region["else"] is not None
                     or (region["skip"] is not None and region["skip"] != i)):

@@ -56,6 +56,9 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "fxc ps: /home/alice/secret/shader.hlsl(1,1): error X3000 at 0x00007ff712345678\n",
             encoding="utf-8",
         )
+        # A device slot 67 compute request with the same reason is counted in its own class.
+        (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
+        (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -73,6 +76,7 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 2 | `slot5` | `0x80004005` |",
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
+            "| 1 | `compute: image_load_mip tfe` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:

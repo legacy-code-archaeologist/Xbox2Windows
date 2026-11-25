@@ -22,6 +22,9 @@ using Words = std::vector<std::uint32_t>;
 // Word 0 pads the record to byte offset 4. The `constants` mode puts two root constants (scale, bias) in front of
 // the Dispatch record; the default mode has the Dispatch record alone. The last two words are result and guard.
 bool constants = false;
+// The `count` mode runs a three-record argument buffer behind a GPU-written count word (max count 3).
+bool counted = false;
+constexpr UINT max_commands = 3;
 Words initial;
 UINT argument_bytes = 0;
 constexpr UINT argument_offset = sizeof(std::uint32_t);
@@ -46,6 +49,19 @@ void consume_constant_args(uint3 group : SV_GroupID) {
     uint previous;
     data.InterlockedAdd(0, scale * (1 + group.x + 10 * group.y + 100 * group.z) + bias, previous);
 }
+void write_records(uint count) {
+    data.Store(4, count);
+    data.Store3(8, uint3(2, 1, 1));
+    data.Store3(20, uint3(1, 2, 1));
+    data.Store3(32, uint3(1, 1, 3));
+}
+[numthreads(1, 1, 1)]
+void write_count2() { write_records(2); }
+[numthreads(1, 1, 1)]
+void write_count9() { write_records(9); }
+[numthreads(1, 1, 1)]
+void write_count0() { write_records(0); }
+
 [numthreads(1, 1, 1)]
 void write_args() { data.Store3(4, uint3(4, 3, 2)); }
 
@@ -122,9 +138,14 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
 
 // partial_record (constants mode) starts the record 12 bytes before the buffer end: a Dispatch alone would fit,
 // the constants and Dispatch do not. padded_stride uses a constant signature whose stride has 4 spare bytes.
-enum class Rejection { none, unmapped, short_range, placeholder, other_root, partial_record, padded_stride };
+// The count mode adds no_count_buffer (accepted: every record up to the max count runs), count_outside and
+// count_unaligned (count word outside the buffer or off a word boundary) and records_short (max count records overflow).
+enum class Rejection { none, unmapped, short_range, placeholder, other_root, partial_record, padded_stride,
+                       no_count_buffer, count_outside, count_unaligned, records_short, rooted_multi, rooted_count_buffer };
 
 // `record` is what the writer stores after the padding word: (scale, bias) in the constants mode, then the groups.
+// The constants mode also refuses a rooted signature with two records (rooted_multi) or a count buffer
+// (rooted_count_buffer): batching is rootless-only in this slice.
 // The other-root control binds `other_guest_root`, which lacks the signature's constants.
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, ID3D12RootSignature* guest_root,
          ID3D12RootSignature* other_guest_root, ID3D12PipelineState* writer, IUnknown* consumer,
@@ -191,10 +212,22 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     auto* argument = rejection == Rejection::unmapped ? nullptr : guest_arguments.Get();
-    UINT64 offset = argument_offset;
+    UINT64 offset = counted ? 2 * sizeof(std::uint32_t) : argument_offset;
+    UINT64 count_offset = sizeof(std::uint32_t);
+    if (rejection == Rejection::count_outside) count_offset = argument_bytes;
+    if (rejection == Rejection::count_unaligned) count_offset = 6;
+    if (rejection == Rejection::records_short) offset = 3 * sizeof(std::uint32_t);
     if (rejection == Rejection::short_range) offset = argument_bytes;
     if (rejection == Rejection::partial_record) offset = argument_bytes - sizeof(D3D12_DISPATCH_ARGUMENTS);
-    slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, 1, argument, offset, nullptr, 0);
+    if (counted)
+        slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, max_commands, argument, offset,
+                                            rejection == Rejection::no_count_buffer ? nullptr : argument,
+                                            rejection == Rejection::no_count_buffer ? 0 : count_offset);
+    else
+        slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, rejection == Rejection::rooted_multi ? 2 : 1,
+                                            argument, offset,
+                                            rejection == Rejection::rooted_count_buffer ? argument : nullptr,
+                                            rejection == Rejection::rooted_count_buffer ? sizeof(std::uint32_t) : 0);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), argument_bytes, result.Get(), 0, result_bytes);
     using Close = HRESULT (WINAPI*)(IUnknown*);
@@ -217,8 +250,30 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     readback->Unmap(0, &untouched);
     Words expected = initial;
     if (writer) std::copy(record.begin(), record.end(), expected.begin() + 1);
+    if (counted) {
+        // Words 2..10 hold three Dispatch records. The GPU count word (word 1) lowers the number run, never raises it.
+        const std::size_t result_word = initial.size() - 2;
+        const bool runs = rejection == Rejection::none || rejection == Rejection::no_count_buffer;
+        const std::uint32_t executed = !runs ? 0 : rejection == Rejection::no_count_buffer ? max_commands
+                                                                                       : (std::min)(expected[1], max_commands);
+        for (std::uint32_t i = 0; i < executed; ++i)
+            for (std::uint32_t z = 0; z < expected[4 + 3 * i]; ++z)
+                for (std::uint32_t y = 0; y < expected[3 + 3 * i]; ++y)
+                    for (std::uint32_t x = 0; x < expected[2 + 3 * i]; ++x)
+                        expected[result_word] += 1 + x + 10 * y + 100 * z;
+        std::printf("%s: count word=%u, executed=%u, result=0x%08x (expected 0x%08x)\n",
+                    rejection == Rejection::none ? (writer ? "GPU writer" : "omitted writer")
+                                                  : rejection == Rejection::no_count_buffer ? "no count buffer" : "refused call",
+                    observed[1], executed, observed[result_word], expected[result_word]);
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            if (observed[i] == expected[i]) continue;
+            std::fprintf(stderr, "word %zu: got 0x%08x, expected 0x%08x\n", i, observed[i], expected[i]);
+            return false;
+        }
+        return true;
+    }
     const std::size_t groups = constants ? 3 : 1;
-    const std::size_t sum = groups + 3;
+    const std::size_t sum = expected.size() - 2;
     const std::uint32_t scale = constants ? expected[1] : 1;
     const std::uint32_t bias = constants ? expected[2] : 0;
     if (rejection == Rejection::none) {
@@ -246,8 +301,9 @@ int main(int argc, char** argv) try
     const bool warp = argc >= 2 && std::strcmp(argv[1], "warp") == 0;
     if (!warp && (argc < 2 || std::strcmp(argv[1], "hardware") != 0)) return 2;
     constants = argc == 3 && std::strcmp(argv[2], "constants") == 0;
-    if (argc > 3 || (argc == 3 && !constants)) return 2;
-    initial = constants ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a}
+    counted = argc == 3 && std::strcmp(argv[2], "count") == 0;
+    if (argc > 3 || (argc == 3 && !constants && !counted)) return 2;
+    initial = counted ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x31415926, 0x5a5a5a5a} : constants ? Words{0xa5a5a5a5, 0, 0, 0, 0, 0, 3, 5, 1, 1, 1, 0x31415926, 0x5a5a5a5a}
                         : Words{0xa5a5a5a5, 0, 0, 0, 0x31415926, 0x5a5a5a5a};
     argument_bytes = static_cast<UINT>((initial.size() - 2) * sizeof(std::uint32_t));
     ComPtr<ID3D12Debug> debug;
@@ -337,7 +393,9 @@ int main(int argc, char** argv) try
     const HRESULT placeholder_hr = guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&placeholder));
     if (info) info->PopStorageFilter();
     check(placeholder_hr, "create placeholder command signature");
-    const auto writer = pipeline(device.Get(), root.Get(), constants ? "write_constant_args" : "write_args");
+    const auto writer = pipeline(device.Get(), root.Get(), counted ? "write_count2" : constants ? "write_constant_args" : "write_args");
+    const auto clamped_writer = pipeline(device.Get(), root.Get(), "write_count9");
+    const auto zero_writer = pipeline(device.Get(), root.Get(), "write_count0");
     const auto other_writer = pipeline(device.Get(), root.Get(), constants ? "write_swapped_args" : "write_fewer_args");
     const auto consumer = guest_pipeline(guest.Get(), guest_root.Get());
     const auto verify = [&](ID3D12PipelineState* producer, const Words& record, Rejection rejection,
@@ -345,18 +403,35 @@ int main(int argc, char** argv) try
         return run(device.Get(), guest.Get(), root.Get(), guest_root.Get(), other_guest_root.Get(), producer,
                    consumer.Get(), command_signature, record, rejection);
     };
+    const auto run_counted = [&] {
+        const Words records{0, 2, 1, 1, 1, 2, 1, 1, 1, 3};
+        const auto with_count = [&](std::uint32_t count) { Words r = records; r[0] = count; return r; };
+        const auto& sig = signature;
+        return verify(writer.Get(), with_count(2), Rejection::none, sig.Get()) &&
+               verify(clamped_writer.Get(), with_count(9), Rejection::none, sig.Get()) &&
+               verify(zero_writer.Get(), with_count(0), Rejection::none, sig.Get()) &&
+               verify(nullptr, {}, Rejection::none, sig.Get()) &&
+               verify(zero_writer.Get(), with_count(0), Rejection::no_count_buffer, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::unmapped, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::count_outside, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::count_unaligned, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::records_short, sig.Get()) &&
+               verify(writer.Get(), with_count(2), Rejection::placeholder, placeholder.Get());
+    };
     // The second writer swaps the two constants (constants mode) or halves the X groups (default mode).
     const Words record = constants ? Words{3, 7, 4, 3, 2} : Words{4, 3, 2};
     const Words other_record = constants ? Words{7, 3, 4, 3, 2} : Words{2, 3, 2};
-    if (!verify(writer.Get(), record, Rejection::none, signature.Get()) ||
+    if (counted ? !run_counted() : (!verify(writer.Get(), record, Rejection::none, signature.Get()) ||
         !verify(other_writer.Get(), other_record, Rejection::none, signature.Get()) ||
         !verify(nullptr, {}, Rejection::none, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::unmapped, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::short_range, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::placeholder, placeholder.Get()) ||
         (constants && (!verify(writer.Get(), record, Rejection::other_root, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::rooted_multi, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::rooted_count_buffer, signature.Get()) ||
                        !verify(writer.Get(), record, Rejection::partial_record, signature.Get()) ||
-                       !verify(writer.Get(), record, Rejection::padded_stride, padded.Get())))) return 1;
+                       !verify(writer.Get(), record, Rejection::padded_stride, padded.Get()))))) return 1;
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;

@@ -146,9 +146,102 @@ static void* desktop_pipeline(void* device)
                                                                                    &pipeline)) ? pipeline : nullptr;
 }
 
+// A slot-67 compute description as the stand-in reads it: 64-bit words 0 (root signature), 1-2 (state
+// block A), 3-4 (state block B: 20 fixed bytes, dwords 0x1234abcd, 0xffff0000, 0, 0, 0), 5-6 (program code), 7-8 (data blob), 9-10 (pointers into this
+// process: heap and stack) and 11 (a plain value). X2W_TEST_COMPUTE_ROOT=<file> creates the root signature
+// from that serialized blob instead of using the stream root.
+//
+// Cases (each pipeline is a placeholder):
+//   valid            the description twice
+//   order            valid, then refused (no root), then valid with another data blob
+//   code-limit       code of exactly 1 MiB (the program, then zeros)    code-over: 1 MiB + 1
+//   state-limit      state block A of exactly 4 KiB                     state-over: 4 KiB + 1
+//   data-limit       data blob of exactly 1 MiB                         data-over: 1 MiB + 1
+//   stateb-limit     state block B of exactly 4 KiB                     stateb-over: 4 KiB + 1
+//   data-pointer     valid, with the first data qword pointing at state block A
+//   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
+//   stateb-unreadable, desc-unreadable
+// The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
+static bool create_slot67(void* device, const char* code_path, const char* data_path, const char* state_path, const char* mode)
+{
+    std::ifstream code_file(code_path, std::ios::binary), data_file(data_path, std::ios::binary), state_file(state_path, std::ios::binary);
+    std::vector<char> code{std::istreambuf_iterator<char>(code_file), {}};
+    std::vector<char> data{std::istreambuf_iterator<char>(data_file), {}};
+    std::vector<char> state{std::istreambuf_iterator<char>(state_file), {}};
+    if (code.empty() || data.empty() || state.empty() || !stream_root_signature()) return false;
+    void* root = stream_root_signature();
+    char root_path[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("X2W_TEST_COMPUTE_ROOT", root_path, MAX_PATH);
+    if (n && n < MAX_PATH) {
+        std::ifstream file(root_path, std::ios::binary);
+        const std::vector<char> blob{std::istreambuf_iterator<char>(file), {}};
+        using CreateRoot = HRESULT (WINAPI*)(void*, UINT, const void*, SIZE_T, REFIID, void**);
+        if (blob.empty() || FAILED(reinterpret_cast<CreateRoot>((*static_cast<void***>(device))[16])(
+                device, 0, blob.data(), blob.size(), __uuidof(ID3D12RootSignature), &root))) return false;
+    }
+    // Two pages: the first readable, the second PAGE_NOACCESS.
+    auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    DWORD old = 0;
+    if (!pages || !VirtualProtect(pages + 0x1000, 0x1000, PAGE_NOACCESS, &old)) return false;
+    unsigned char* guard = pages + 0x1000;
+    const std::string m(mode);
+    if (m == "code-limit" || m == "code-over") code.resize((1u << 20) + (m == "code-over"));
+    if (m == "state-limit" || m == "state-over") state.resize(0x1000 + (m == "state-over"));
+    std::vector<char> state_b{char(0xcd), char(0xab), 0x34, 0x12, 0, 0, char(0xff), char(0xff), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (m == "data-limit" || m == "data-over") data.resize((1u << 20) + (m == "data-over"));
+    if (m == "stateb-limit" || m == "stateb-over") state_b.resize(0x1000 + (m == "stateb-over"));
+    if (m == "data-pointer") {  // the first qword of the data blob points at state block A
+        const UINT64 address = reinterpret_cast<UINT64>(state.data());
+        if (data.size() < sizeof(address)) return false;
+        std::memcpy(data.data(), &address, sizeof(address));
+    }
+    alignas(8) unsigned char desc[0x300]{};
+    UINT64 words[12] = {reinterpret_cast<UINT64>(root), reinterpret_cast<UINT64>(state.data()), state.size(),
+                        reinterpret_cast<UINT64>(state_b.data()), state_b.size(),
+                        reinterpret_cast<UINT64>(code.data()), code.size(), reinterpret_cast<UINT64>(data.data()), data.size(),
+                        reinterpret_cast<UINT64>(state.data()), reinterpret_cast<UINT64>(desc), 0xb};
+    if (m == "code-zero") words[6] = 0;
+    if (m == "data-zero") words[8] = 0;
+    if (m == "no-root") words[0] = 0;
+    if (m == "code-unreadable") words[5] = reinterpret_cast<UINT64>(guard);
+    if (m == "state-unreadable") words[1] = reinterpret_cast<UINT64>(guard);
+    if (m == "data-unreadable") words[7] = reinterpret_cast<UINT64>(guard);
+    if (m == "stateb-unreadable") words[3] = reinterpret_cast<UINT64>(guard);
+    if (m == "code-past-end") {
+        std::memcpy(guard - code.size(), code.data(), code.size());
+        words[5] = reinterpret_cast<UINT64>(guard - code.size());
+        words[6] = code.size() + 1;
+    }
+    std::memcpy(desc, words, sizeof(words));
+    const void* where = desc;
+    if (m == "desc-unreadable") where = guard;
+    using Create = HRESULT (WINAPI*)(void*, const void*, REFIID, void**);
+    auto create = [&](const void* d) {
+        void* pipeline = nullptr;
+        return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[67])(device, d, __uuidof(ID3D12PipelineState), &pipeline)) &&
+               pipeline;
+    };
+    if (m == "order") {
+        if (!create(desc)) return false;
+        UINT64 refused[12];
+        std::memcpy(refused, words, sizeof(refused));
+        refused[0] = 0;
+        if (!create(refused)) return false;
+        std::vector<char> other(data);
+        other[0] ^= 1;
+        words[7] = reinterpret_cast<UINT64>(other.data());
+        std::memcpy(desc, words, sizeof(words));
+        return create(desc);
+    }
+    for (int i = 0; i < (m == "valid" ? 2 : 1); ++i)
+        if (!create(where)) return false;
+    return true;
+}
+
 int main(int argc, char** argv)
 {
-    if (argc != 4 && (argc < 6 || argc > 8) && argc != 10) return 2;
+    if (argc != 4 && (argc < 6 || argc > 9) && argc != 10) return 2;
+    if (argc == 9 && std::strcmp(argv[4], "slot67") != 0) return 2;
     const bool draw = argc != 4;
     StartupBc7Input bc7{};
     if (argc == 10) {
@@ -163,8 +256,12 @@ int main(int argc, char** argv)
     void* device = nullptr;
     void* pso = nullptr;
     const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
-    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, bc7.blocks != nullptr,
+    const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0;
+    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
+    // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
+    if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
+        return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (argc == 4) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;

@@ -117,6 +117,7 @@ MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "elseifdef", "endi
 MASM_DEFINERS = {"proc", "endp", "label", "equ", "db", "dw", "dd", "dq", "byte", "word", "dword",
                  "qword", "segment", "ends", "struct", "macro", "endm", "textequ"}
 MASM_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz"}
+MASM_LABEL = re.compile(r"^\s*(?:@@|[@$?A-Za-z_][\w@$?]*)::?")
 # MASM condition-code spellings -> iced-x86's canonical mnemonic suffix.
 CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb": "ae", "nbe": "a",
                      "na": "be", "nge": "l", "nl": "ge", "nle": "g", "ng": "le", "pe": "p", "po": "np"}
@@ -125,17 +126,19 @@ CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb
 def masm_mnemonics(text):
     """Instruction mnemonics in MASM source; both arms of IFDEF/ELSE count (both variants are built)."""
     found = set()
-    macros = set()
+    ignored = MASM_DIRECTIVES | MASM_DEFINERS
     for line in text.splitlines():
         # Local (`@@:`) or global label, then a MASM assembly-time assignment.
-        line = re.sub(r"^\s*(?:@@|[@$?A-Za-z_][\w@$?]*)::?", "", line.split(";", 1)[0]).strip()
+        line = line.partition(";")[0]
+        if ":" in line:
+            line = MASM_LABEL.sub("", line)
         words = line.lower().split()
         if len(words) > 1 and words[1] == "=":
             continue
         if len(words) > 1 and words[1] == "macro":
-            macros.add(words[0])
+            ignored.add(words[0])
             continue
-        if (not words or words[0].startswith(".") or words[0] in MASM_DIRECTIVES | MASM_DEFINERS | macros
+        if (not words or words[0].startswith(".") or words[0] in ignored
                 or (len(words) > 1 and words[1] in MASM_DEFINERS and words[2:3] != ["ptr"])):
             continue
         while words and words[0] in MASM_PREFIXES:

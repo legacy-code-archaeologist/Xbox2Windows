@@ -24,6 +24,8 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false);
+void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                  bool depth16, std::uint32_t words[64]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,

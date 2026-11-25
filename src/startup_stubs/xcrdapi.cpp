@@ -740,7 +740,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         }
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1) {
+            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
                 if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {

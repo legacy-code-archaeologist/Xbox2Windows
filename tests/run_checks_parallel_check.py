@@ -29,7 +29,8 @@ with tempfile.TemporaryDirectory() as tmp:
         # The usage line promises `python -B <script>`.
         f.write("import sys\nassert sys.flags.dont_write_bytecode\nprint('good ran')\n")
     with open(bad, "w") as f:
-        f.write("import sys\nprint('bad ran')\nsys.exit(3)\n")
+        # A child may exit with a partial line on stderr.
+        f.write("import sys\nsys.stderr.write('bad ran')\nsys.exit(3)\n")
     with open(fail, "w") as f:
         # An uncaught assertion exits 1 and writes its traceback to stderr, the usual way a check fails.
         f.write("assert False, 'fail ran'\n")
@@ -45,10 +46,10 @@ with tempfile.TemporaryDirectory() as tmp:
     many = run(bad, fail, good)
     assert many.returncode == 1, many.stdout
     assert "FAILED: " + bad + " " + fail + "\n" in many.stdout, many.stdout
-    assert "bad ran" in group(many.stdout, bad, "exit 3"), many.stdout
+    assert group(many.stdout, bad, "exit 3").endswith("bad ran\n"), many.stdout
     assert "AssertionError: fail ran" in group(many.stdout, fail, "exit 1"), many.stdout
-    assert "good ran" in group(many.stdout, good, "ok"), many.stdout
-    assert many.stdout.count("::endgroup::") == 3, many.stdout
+    assert group(many.stdout, good, "ok").endswith("good ran\n"), many.stdout
+    assert many.stdout.splitlines().count("::endgroup::") == 3, many.stdout
     # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
     serial = run(good, jobs="0")
     assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout

@@ -28,7 +28,6 @@ static_assert(not_implemented == E_NOTIMPL);
 struct XAsyncBlock;
 struct XUserHandleStorage;
 using XUserHandle = XUserHandleStorage*;
-enum class XUserAddOptions : std::uint32_t { None = 0 };
 
 struct ExpectedThunk {
     const char* name;
@@ -36,10 +35,8 @@ struct ExpectedThunk {
     const char* function;
 };
 
-constexpr std::array<ExpectedThunk, 3> expected_thunks{{
-    {"XUserAddAsync", "XUser", "XUserAddAsync"},
+constexpr std::array<ExpectedThunk, 1> expected_thunks{{
     {"XPackageMountWithUiAsync", "XPackage", "XPackageMountWithUiAsync"},
-    {"XAsyncGetStatus", "XAsync", "XAsyncGetStatus"},
 }};
 
 struct XGameRuntimeShimLogEntry {
@@ -55,9 +52,7 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, result) == 4);
 static_assert(offsetof(XGameRuntimeShimLogEntry, component) == 8);
 static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
 
-using UserAddAsync = HRESULT(WINAPI*)(XUserAddOptions, XAsyncBlock*);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
-using AsyncGetStatus = HRESULT(WINAPI*)(XAsyncBlock*, bool);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
 
@@ -163,13 +158,9 @@ bool find_proc(HMODULE module, const char* name, Proc& proc)
 
 bool calls_return_not_implemented(HMODULE module)
 {
-    UserAddAsync user_add = nullptr;
     PackageMountWithUiAsync package_mount = nullptr;
-    AsyncGetStatus async_get_status = nullptr;
 
-    if (!find_proc(module, expected_thunks[0].name, user_add) ||
-        !find_proc(module, expected_thunks[1].name, package_mount) ||
-        !find_proc(module, expected_thunks[2].name, async_get_status)) {
+    if (!find_proc(module, expected_thunks[0].name, package_mount)) {
         return false;
     }
 
@@ -177,10 +168,8 @@ bool calls_return_not_implemented(HMODULE module)
         const char* name;
         HRESULT result;
     };
-    const std::array<Call, 3> calls{{
-        {expected_thunks[0].name, user_add(XUserAddOptions::None, nullptr)},
-        {expected_thunks[1].name, package_mount(nullptr, nullptr)},
-        {expected_thunks[2].name, async_get_status(nullptr, false)},
+    const std::array<Call, 1> calls{{
+        {expected_thunks[0].name, package_mount(nullptr, nullptr)},
     }};
     for (const auto& call : calls) {
         if (call.result != not_implemented) {

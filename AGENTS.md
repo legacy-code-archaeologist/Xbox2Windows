@@ -150,9 +150,11 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/shader_signed_zero_minmax_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_a16_check.py
+./out/pe-env/bin/python -B tests/startup_image_load_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
 ./out/pe-env/bin/python -B tests/startup_live_telemetry_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
@@ -160,8 +162,10 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_refusals_check.py
+./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_accum_check.py
@@ -169,6 +173,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
+./out/pe-env/bin/python -B tests/startup_build_rev_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
@@ -179,6 +184,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_bcnt64_check.py
 ./out/pe-env/bin/python -B tests/compute_load_format_check.py
+./out/pe-env/bin/python -B tests/compute_heap_view_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/mesh_lane_spill_check.py

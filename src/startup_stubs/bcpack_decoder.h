@@ -1161,6 +1161,264 @@ inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t targe
     return true;
 }
 
+inline constexpr uint8_t ALPHA_CODE[8] = { 0, 2, 3, 4, 5, 6, 7, 1 };
+inline constexpr uint8_t COLOUR_CODE[4] = { 0, 2, 3, 1 };
+
+inline void pack_alpha(uint8_t e0, uint8_t e1, const uint8_t* ix, uint8_t* out) {
+    uint64_t v = static_cast<uint64_t>(e0 ^ 0x80) | (static_cast<uint64_t>(e1 ^ 0x80) << 8);
+    for (size_t p = 0; p < 16; ++p) {
+        v |= static_cast<uint64_t>(ALPHA_CODE[ix[p] & 7]) << (16 + 3 * p);
+    }
+    std::memcpy(out, &v, 8);
+}
+
+inline void pack_colour(const uint8_t* ep, const uint8_t* ix, uint8_t* out) {
+    uint16_t c0 = static_cast<uint16_t>((static_cast<uint16_t>(ep[0]) << 11) |
+                                        (static_cast<uint16_t>(ep[1]) << 5) |
+                                        static_cast<uint16_t>(ep[2]));
+    uint16_t c1 = static_cast<uint16_t>((static_cast<uint16_t>(ep[3]) << 11) |
+                                        (static_cast<uint16_t>(ep[4]) << 5) |
+                                        static_cast<uint16_t>(ep[5]));
+    uint32_t w = 0;
+    for (size_t p = 0; p < 16; ++p) {
+        w |= static_cast<uint32_t>(COLOUR_CODE[ix[p] & 3]) << (2 * p);
+    }
+    std::memcpy(out, &c0, 2);
+    std::memcpy(out + 2, &c1, 2);
+    std::memcpy(out + 4, &w, 4);
+}
+
+struct Bc4State {
+    uint8_t ep[2] = {};
+    uint8_t ix[16] = {};
+};
+
+inline bool decode_bc4_blocks(const std::vector<uint16_t>& symbols, size_t num_blocks,
+                              uint8_t* output, size_t output_capacity) {
+    if (output_capacity < num_blocks * 8) return false;
+    size_t target = num_blocks;
+    Bc4State hist[256] = {};
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        uint16_t d_sym = symbols[0 * target + i];
+        uint16_t x_sym = symbols[1 * target + i];
+        int32_t delta = unzigzag(d_sym);
+        size_t er = static_cast<size_t>((x_sym + delta) & 0xFF);
+        size_t xr = static_cast<size_t>(x_sym & 0xFF);
+
+        auto get_source = [&](size_t r, Bc4State& st) {
+            if (r == 0) {
+                st = {};
+            } else if (r <= i) {
+                st = hist[(i - r) & 255];
+            } else {
+                size_t dict_idx = r - i - 1;
+                if (dict_idx < 255) {
+                    const auto& entry = BC4_DICTIONARY[dict_idx];
+                    std::memcpy(st.ep, entry.ep, 2);
+                    std::memcpy(st.ix, entry.ix, 16);
+                } else {
+                    st = {};
+                }
+            }
+        };
+
+        Bc4State er_state, xr_state;
+        get_source(er, er_state);
+        get_source(xr, xr_state);
+
+        Bc4State st = {};
+        st.ep[0] = static_cast<uint8_t>((er_state.ep[0] + residual(symbols[2 * target + i], 8)) & 0xFF);
+        st.ep[1] = static_cast<uint8_t>((er_state.ep[1] + residual(symbols[3 * target + i], 8)) & 0xFF);
+
+        for (size_t k = 0; k < 8; ++k) {
+            uint16_t sym = symbols[(4 + k) * target + i] & 63;
+            uint8_t pa = RANK_PAIR_BC4[sym][0];
+            uint8_t pb = RANK_PAIR_BC4[sym][1];
+            st.ix[2 * k + 0] = static_cast<uint8_t>((xr_state.ix[2 * k + 0] + pa) & 7);
+            st.ix[2 * k + 1] = static_cast<uint8_t>((xr_state.ix[2 * k + 1] + pb) & 7);
+        }
+
+        pack_alpha(st.ep[0], st.ep[1], st.ix, output + i * 8);
+        hist[i & 255] = st;
+    }
+    return true;
+}
+
+struct Bc5State {
+    uint8_t ep[4] = {};
+    uint8_t ix[32] = {};
+};
+
+inline bool decode_bc5_blocks(const std::vector<uint16_t>& symbols, size_t num_blocks,
+                              uint8_t* output, size_t output_capacity) {
+    if (output_capacity < num_blocks * 16) return false;
+    size_t target = num_blocks * 2;
+    Bc5State hist[256] = {};
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        uint16_t d0 = symbols[0 * target + 2 * i];
+        uint16_t d1 = symbols[0 * target + 2 * i + 1];
+        uint16_t x0 = symbols[1 * target + 2 * i];
+        uint16_t x1 = symbols[1 * target + 2 * i + 1];
+
+        uint8_t d_byte = interleave(d0, d1);
+        uint8_t x_byte = interleave(x0, x1);
+        int32_t delta = unzigzag(d_byte);
+        size_t er = static_cast<size_t>((x_byte + delta) & 0xFF);
+        size_t xr = static_cast<size_t>(x_byte);
+
+        auto get_source = [&](size_t r, Bc5State& st) {
+            if (r == 0) {
+                st = {};
+            } else if (r <= i) {
+                st = hist[(i - r) & 255];
+            } else {
+                size_t dict_idx = r - i - 1;
+                if (dict_idx < 255) {
+                    const auto& entry = BC5_DICTIONARY[dict_idx];
+                    std::memcpy(st.ep, entry.ep, 4);
+                    std::memcpy(st.ix, entry.ix, 32);
+                } else {
+                    st = {};
+                }
+            }
+        };
+
+        Bc5State er_state, xr_state;
+        get_source(er, er_state);
+        get_source(xr, xr_state);
+
+        Bc5State st = {};
+        for (size_t c = 0; c < 2; ++c) {
+            uint16_t a = symbols[(2 + c) * target + 2 * i];
+            uint16_t b = symbols[(2 + c) * target + 2 * i + 1];
+            st.ep[2 * c + 0] = static_cast<uint8_t>((er_state.ep[2 * c + 0] + residual(a, 8)) & 0xFF);
+            st.ep[2 * c + 1] = static_cast<uint8_t>((er_state.ep[2 * c + 1] + residual(b, 8)) & 0xFF);
+
+            size_t base = 16 * c;
+            for (size_t l = 0; l < 4; ++l) {
+                uint16_t sa = symbols[(4 + 4 * c + l) * target + 2 * i] & 63;
+                uint16_t sb = symbols[(4 + 4 * c + l) * target + 2 * i + 1] & 63;
+                uint8_t pa0 = RANK_PAIR_BC5[sa][0];
+                uint8_t pa1 = RANK_PAIR_BC5[sa][1];
+                uint8_t pb0 = RANK_PAIR_BC5[sb][0];
+                uint8_t pb1 = RANK_PAIR_BC5[sb][1];
+                st.ix[base + 4 * l + 0] = static_cast<uint8_t>((xr_state.ix[base + 4 * l + 0] + pa0) & 7);
+                st.ix[base + 4 * l + 1] = static_cast<uint8_t>((xr_state.ix[base + 4 * l + 1] + pa1) & 7);
+                st.ix[base + 4 * l + 2] = static_cast<uint8_t>((xr_state.ix[base + 4 * l + 2] + pb0) & 7);
+                st.ix[base + 4 * l + 3] = static_cast<uint8_t>((xr_state.ix[base + 4 * l + 3] + pb1) & 7);
+            }
+        }
+
+        pack_alpha(st.ep[0], st.ep[1], st.ix, output + i * 16);
+        pack_alpha(st.ep[2], st.ep[3], st.ix + 16, output + i * 16 + 8);
+        hist[i & 255] = st;
+    }
+    return true;
+}
+
+struct Bc3State {
+    uint8_t ep[8] = {};
+    uint8_t ix[32] = {};
+};
+
+inline bool decode_bc3_blocks(const std::vector<uint16_t>& symbols, size_t num_blocks,
+                              uint8_t* output, size_t output_capacity) {
+    if (output_capacity < num_blocks * 16) return false;
+    size_t target = num_blocks * 2;
+    Bc3State hist[256] = {};
+
+    for (size_t i = 0; i < num_blocks; ++i) {
+        uint16_t d0 = symbols[0 * target + 2 * i];
+        uint16_t d1 = symbols[0 * target + 2 * i + 1];
+        uint16_t x0 = symbols[1 * target + 2 * i];
+        uint16_t x1 = symbols[1 * target + 2 * i + 1];
+
+        uint8_t d_byte = interleave(d0, d1);
+        uint8_t x_byte = interleave(x0, x1);
+        int32_t delta = unzigzag(d_byte);
+        size_t er = static_cast<size_t>((x_byte + delta) & 0xFF);
+        size_t xr = static_cast<size_t>(x_byte);
+
+        auto get_source = [&](size_t r, Bc3State& st) {
+            if (r == 0) {
+                st = {};
+            } else if (r <= i) {
+                st = hist[(i - r) & 255];
+            } else {
+                size_t dict_idx = r - i - 1;
+                if (dict_idx < 255) {
+                    const auto& entry = BC3_DICTIONARY[dict_idx];
+                    std::memcpy(st.ep, entry.ep, 8);
+                    std::memcpy(st.ix, entry.ix, 32);
+                } else {
+                    st = {};
+                }
+            }
+        };
+
+        Bc3State er_state, xr_state;
+        get_source(er, er_state);
+        get_source(xr, xr_state);
+
+        Bc3State st = {};
+        // Alpha endpoints
+        uint16_t a_e0 = symbols[2 * target + 2 * i];
+        uint16_t a_e1 = symbols[2 * target + 2 * i + 1];
+        st.ep[0] = static_cast<uint8_t>((er_state.ep[0] + residual(a_e0, 8)) & 0xFF);
+        st.ep[1] = static_cast<uint8_t>((er_state.ep[1] + residual(a_e1, 8)) & 0xFF);
+
+        // Alpha indices
+        for (size_t l = 0; l < 4; ++l) {
+            uint16_t sa = symbols[(3 + l) * target + 2 * i] & 63;
+            uint16_t sb = symbols[(3 + l) * target + 2 * i + 1] & 63;
+            uint8_t pa0 = RANK_PAIR_BC3_ALPHA[sa][0];
+            uint8_t pa1 = RANK_PAIR_BC3_ALPHA[sa][1];
+            uint8_t pb0 = RANK_PAIR_BC3_ALPHA[sb][0];
+            uint8_t pb1 = RANK_PAIR_BC3_ALPHA[sb][1];
+            st.ix[4 * l + 0] = static_cast<uint8_t>((xr_state.ix[4 * l + 0] + pa0) & 7);
+            st.ix[4 * l + 1] = static_cast<uint8_t>((xr_state.ix[4 * l + 1] + pa1) & 7);
+            st.ix[4 * l + 2] = static_cast<uint8_t>((xr_state.ix[4 * l + 2] + pb0) & 7);
+            st.ix[4 * l + 3] = static_cast<uint8_t>((xr_state.ix[4 * l + 3] + pb1) & 7);
+        }
+
+        // Colour endpoints (RGB565: R=5, G=6, B=5)
+        for (size_t c = 0; c < 3; ++c) {
+            uint16_t sa = symbols[(7 + c) * target + 2 * i];
+            uint16_t sb = symbols[(7 + c) * target + 2 * i + 1];
+            uint32_t bits = (c == 1) ? 6 : 5;
+            uint8_t mask = static_cast<uint8_t>((1u << bits) - 1);
+            st.ep[2 + c] = static_cast<uint8_t>((er_state.ep[2 + c] + residual(sa, bits)) & mask);
+            st.ep[5 + c] = static_cast<uint8_t>((er_state.ep[5 + c] + residual(sb, bits)) & mask);
+        }
+
+        // Colour indices (2-bit quadrants)
+        uint16_t tl = symbols[10 * target + 2 * i] & 255;
+        uint16_t tr = symbols[10 * target + 2 * i + 1] & 255;
+        uint16_t bl = symbols[11 * target + 2 * i] & 255;
+        uint16_t br = symbols[11 * target + 2 * i + 1] & 255;
+        const uint16_t quads[4] = { tl, tr, bl, br };
+        for (size_t q = 0; q < 4; ++q) {
+            uint16_t s = quads[q];
+            size_t ox = (q & 1) * 2;
+            size_t oy = (q >> 1) * 2;
+            const size_t dx[4] = { 0, 1, 0, 1 };
+            const size_t dy[4] = { 0, 0, 1, 1 };
+            for (size_t k = 0; k < 4; ++k) {
+                size_t p = 16 + 4 * (oy + dy[k]) + (ox + dx[k]);
+                uint8_t qval = RANK_QUAD_BC3_COLOUR[s][k];
+                st.ix[p] = static_cast<uint8_t>((xr_state.ix[p] + qval) & 3);
+            }
+        }
+
+        pack_alpha(st.ep[0], st.ep[1], st.ix, output + i * 16);
+        pack_colour(st.ep + 2, st.ix + 16, output + i * 16 + 8);
+        hist[i & 255] = st;
+    }
+    return true;
+}
+
 inline bool decode_bcpack(const unsigned char* input, size_t input_size, unsigned bc_format,
                           unsigned char* output, size_t output_size, size_t* produced) {
     if (!input || !output || !produced) return false;
@@ -1190,6 +1448,48 @@ inline bool decode_bcpack(const unsigned char* input, size_t input_size, unsigne
             return false;
         }
         if (!decode_bc1_blocks(symbols, num_blocks, output, output_size)) {
+            return false;
+        }
+        *produced = output_size;
+        return true;
+    } else if (bc_format == 4) {
+        if (output_size % 8 != 0) return false;
+        size_t num_blocks = output_size / 8;
+        size_t target_per_lane = num_blocks;
+        const uint8_t ab[12] = { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 };
+        std::vector<uint16_t> symbols;
+        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
+            return false;
+        }
+        if (!decode_bc4_blocks(symbols, num_blocks, output, output_size)) {
+            return false;
+        }
+        *produced = output_size;
+        return true;
+    } else if (bc_format == 5) {
+        if (output_size % 16 != 0) return false;
+        size_t num_blocks = output_size / 16;
+        size_t target_per_lane = num_blocks * 2;
+        const uint8_t ab[12] = { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 };
+        std::vector<uint16_t> symbols;
+        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
+            return false;
+        }
+        if (!decode_bc5_blocks(symbols, num_blocks, output, output_size)) {
+            return false;
+        }
+        *produced = output_size;
+        return true;
+    } else if (bc_format == 3) {
+        if (output_size % 16 != 0) return false;
+        size_t num_blocks = output_size / 16;
+        size_t target_per_lane = num_blocks * 2;
+        const uint8_t ab[12] = { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 };
+        std::vector<uint16_t> symbols;
+        if (!decode_lanes(input, input_size, ab, 12, target_per_lane, symbols)) {
+            return false;
+        }
+        if (!decode_bc3_blocks(symbols, num_blocks, output, output_size)) {
             return false;
         }
         *produced = output_size;

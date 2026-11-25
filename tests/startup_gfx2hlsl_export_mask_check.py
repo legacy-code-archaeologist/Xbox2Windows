@@ -148,6 +148,7 @@ for label, words, formats, want in refusals:
 # 6. A partial compressed export to a vertex output has no write mask to carry it.
 stage = G.Stage.__new__(G.Stage)
 stage.kind, stage.exec_known, stage.lines, stage.exports, stage.write_masks = 'vs', True, [], {}, {}
+stage.compr_params = set()
 stage.used_s, stage.used_v = set(), set()
 stage.pipe = None
 try:

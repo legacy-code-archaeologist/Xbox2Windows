@@ -1226,6 +1226,40 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-load-d16 <r16_unorm|rgba32f> <vs.cso> <ps.cso> <expected.bin>: draws an 8x2 full-screen
+// pair to an R32G32B32A32_UINT target against an 8x2 R16_UNORM or R32G32B32A32_FLOAT source texture and
+// compares all 64 little-endian words with expected.bin.
+OperationResult run_startup_image_load_d16(const OperationContext& ctx)
+{
+    const bool depth16 = std::strcmp(ctx.argv[3], "r16_unorm") == 0;
+    if (!depth16 && std::strcmp(ctx.argv[3], "rgba32f") != 0)
+        return {OutcomeKind::fail, "image_load d16 source mode must be r16_unorm or rgba32f"};
+    std::uint32_t expected[64]{};
+    std::ifstream file(ctx.argv[6], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected), sizeof(expected));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold 64 words"};
+    std::uint32_t actual[64]{};
+    check_startup_image_load_d16(ctx.device, ctx.argv[4], ctx.argv[5], depth16, actual);
+    unsigned differing = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        const std::uint32_t* want = &expected[i * 4];
+        const std::uint32_t* got = &actual[i * 4];
+        if (std::memcmp(want, got, 4 * sizeof(std::uint32_t)) == 0) continue;
+        if (differing++ == 0) {
+            std::fprintf(stderr,
+                         "startup_image_load_d16 (%s) pixel (%u,%u) mismatch: expected %08x,%08x,%08x,%08x actual %08x,%08x,%08x,%08x\n",
+                         ctx.argv[3], i % 8, i / 8, want[0], want[1], want[2], want[3], got[0], got[1], got[2], got[3]);
+        }
+    }
+    if (differing) {
+        std::fprintf(stderr, "%u of 16 pixels differ\n", differing);
+        return {OutcomeKind::fail, "image_load d16 readback differs"};
+    }
+    std::printf("startup_image_load_d16 %s: all 16 pixels (64 words) matched\n", ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_startup_packed_position(const OperationContext& ctx)
 {
     constexpr UINT width = 13, height = 7;
@@ -1418,6 +1452,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},

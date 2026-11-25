@@ -9,6 +9,7 @@ Stops at the first second-chance exception, at a breakpoint inside the main imag
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import struct
 import sys
 import time
@@ -20,6 +21,17 @@ k32.CreateFileW.restype = wt.HANDLE
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
+
+
+class MemoryBasicInformation(ctypes.Structure):
+    _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
+                ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
+                ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_uint32),
+                ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
+
+
+k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+k32.VirtualQueryEx.restype = ctypes.c_size_t
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -34,11 +46,59 @@ MOVIE_MODULE = "bink2scarlett.dll"
 MOVIE_CALL_HOOKS = ("BinkOpenWithOptions", "BinkClose", "BinkNextFrame", "BinkRegisterFrameBuffers", "BinkPause",
                     "BinkShouldSkip")
 REGS = ["Rax", "Rcx", "Rdx", "Rbx", "Rsp", "Rbp", "Rsi", "Rdi", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "Rip"]
+LOG_REGS = {reg.lower(): reg for reg in REGS[:-1]}
+LOG_HEX = r"(?:0x)?[0-9a-f]+"
+LOG_ITEM = re.compile(rf"\[([a-z0-9]+)([+-]{LOG_HEX})\]")
 
 
 def read_qword(read, address):
     data = read(address, 8)
     return int.from_bytes(data, "little") if len(data) == 8 else None
+
+
+def parse_log_at(value, log):
+    points = {}
+    for entry in value.split(",") if value else ():
+        site, colon, items = entry.strip().lower().partition(":")
+        address, at, limit = site.partition("@")
+        try:
+            if not re.fullmatch(LOG_HEX, address):
+                raise ValueError("expected a hexadecimal RVA")
+            rva = int(address, 16)
+            if rva > 0xffffffff:
+                raise ValueError("RVA exceeds 32 bits")
+            max_hits = 16
+            if at:
+                if not re.fullmatch(r"[0-9]+", limit) or (max_hits := int(limit)) <= 0:
+                    raise ValueError("expected a positive decimal hit limit")
+            if rva in points:
+                raise ValueError("duplicate RVA")
+            fields = []
+            for item in items.split(";") if colon else LOG_REGS:
+                item = item.strip()
+                if item in LOG_REGS:
+                    field = (item, LOG_REGS[item], None)
+                else:
+                    memory = LOG_ITEM.fullmatch(item)
+                    if not memory or memory[1] not in LOG_REGS:
+                        raise ValueError(f"invalid item {item!r}")
+                    field = (item, LOG_REGS[memory[1]], int(memory[2], 16))
+                # Compare the register and offset, so [rcx+8] and [rcx+0x8] are the same item.
+                if any(field[1:] == earlier[1:] for earlier in fields):
+                    raise ValueError(f"duplicate item {item!r}")
+                fields.append(field)
+            points[rva] = (max_hits, fields)
+        except ValueError as error:
+            log(f"X2W_LOG_AT ignored {entry!r}: {error}")
+    return points
+
+
+def read_stack(read, rsp, words):
+    """Return `words` qwords read from `rsp`, zero-padded. The full read fails when it crosses past
+    the stack's last committed page; then read only to the end of RSP's page, which is committed."""
+    size = 8 * words
+    data = read(rsp, size) or read(rsp, min(size, 0x1000 - (rsp & 0xfff))) or b""
+    return data.ljust(size, b"\0")
 
 
 def final_path(handle):
@@ -81,6 +141,9 @@ def main():
     def log(text):
         events.write(text + "\n")
         events.flush()
+
+    log_at = parse_log_at(os.environ.get("X2W_LOG_AT", ""), log)
+    logged_hits = {}
 
     k32.SetErrorMode(0x8003)
     job = k32.CreateJobObjectW(None, None)
@@ -140,6 +203,11 @@ def main():
         got = ctypes.c_size_t()
         ok = k32.ReadProcessMemory(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), buf, size, ctypes.byref(got))
         return bytes(buf[:got.value]) if ok or got.value else b""
+
+    def query_region(addr):
+        mbi = MemoryBasicInformation()
+        if k32.VirtualQueryEx(wt.HANDLE(pi.hProcess), addr, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            return mbi
 
     def write(addr, data):
         buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
@@ -228,10 +296,13 @@ def main():
     ctx_addr = (ctypes.addressof(ctx_raw) + 15) & ~15
     ctx_view = (ctypes.c_ubyte * 1232).from_address(ctx_addr)
 
+    ctx_error = [0]  # GetLastError of the last failed get_ctx
+
     def get_ctx(tid):
         thread = k32.OpenThread(0x0008 | 0x0010 | 0x0002, False, tid)  # GET | SET_CONTEXT | SUSPEND
         struct.pack_into("<I", ctx_view, 0x30, 0x10000B)
         if not thread or not k32.GetThreadContext(wt.HANDLE(thread), ctypes.c_void_p(ctx_addr)):
+            ctx_error[0] = k32.GetLastError()  # before CloseHandle can change it
             if thread:
                 k32.CloseHandle(wt.HANDLE(thread))
             return None, None
@@ -350,22 +421,36 @@ def main():
         print(f"  bink luma plane -> bink_luma.png (pointer {pointer:#x}, pitch {pitch})")
 
     breakpoints = {}  # addr -> original byte
+    retired = set()  # X2W_LOG_AT breakpoints removed at their hit limit
+    late_hits = {}  # retired addr -> INT3 events that arrived after the removal
     returns = {}  # addr -> list of (tid, rsp after return, description)
     stepping = {}  # tid -> addr to re-arm
-    file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace else None
+    file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
 
-    def arm(addr):
-        if addr in breakpoints:
-            return
-        original = read(addr, 1)
-        if original and write(addr, b"\xcc"):
-            breakpoints[addr] = original
+    def arm(addr, *, skip_int3=False):
+        if addr not in breakpoints:
+            original = read(addr, 1)
+            if original and (not skip_int3 or original != b"\xcc") and write(addr, b"\xcc"):
+                breakpoints[addr] = original
+        return addr in breakpoints and (not skip_int3 or breakpoints[addr] != b"\xcc")
 
     def handle_breakpoint(tid, addr):
         thread, ctx = get_ctx(tid)
         if not thread:
             return False
         regs = dict(zip(REGS, struct.unpack_from("<16Q", ctx, 0x78) + struct.unpack_from("<Q", ctx, 0xF8)))
+        rva = addr - main_base if log_at else None
+        point = log_at.get(rva)
+        if point and logged_hits.get(rva, 0) < point[0]:
+            hit = logged_hits[rva] = logged_hits.get(rva, 0) + 1
+            values = []
+            for item, reg, offset in point[1]:
+                value = regs[reg]
+                if offset is not None:
+                    value = read_qword(read, (value + offset) & 0xffffffffffffffff)
+                values.append(f"{item}={'unreadable' if value is None else hex(value)}")
+            file_log.write(f"{time.time() - start:7.3f} LOG_AT tid={tid} rva={rva:#x} hit={hit} {' '.join(values)}\n")
+            file_log.flush()
         rsp = regs["Rsp"]
         if addr in hooks:
             name, arg = hooks[addr]
@@ -380,7 +465,7 @@ def main():
                     requested = "unreadable" if base is None else hex(base)
                     stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
                     kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
-                    words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
+                    words = struct.unpack_from("<200Q", read_stack(read, rsp, 200))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                     file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "
@@ -445,8 +530,16 @@ def main():
                 returns[addr].remove(item)
                 file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
                 file_log.flush()
-        # Step over the original instruction, then re-arm.
         struct.pack_into("<Q", ctx, 0xF8, addr)
+        # After the final logged hit, let the restored instruction run at full speed unless
+        # another hook still owns this breakpoint.
+        if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.get(addr)
+                and write(addr, breakpoints[addr])):
+            del breakpoints[addr]
+            retired.add(addr)
+            set_ctx(thread)
+            return True
+        # Step over the original instruction, then re-arm.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
@@ -595,6 +688,18 @@ def main():
                 handle_breakpoint(tid, ex_addr)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
+            if ex_code == 0x80000003 and ex_addr in retired:
+                # Another thread executed this INT3 before the hit limit restored the original byte,
+                # and its event arrived after that. Rewind and run the restored instruction.
+                thread, ctx = get_ctx(tid)
+                if thread:
+                    struct.pack_into("<Q", ctx, 0xF8, ex_addr)
+                    set_ctx(thread)
+                    late_hits[ex_addr] = late_hits.get(ex_addr, 0) + 1
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
+                log(f"{time.time() - start:7.3f} X2W_LOG_AT late hit at {where(ex_addr)} on thread {tid}: "
+                    f"thread context unavailable (error {ctx_error[0]}), handled as a breakpoint")
             if ex_code == 0x80000004 and tid in stepping:
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
@@ -626,6 +731,15 @@ def main():
                 loader_break_seen = True  # the loader's initial breakpoint
                 for addr in hooks:
                     arm(addr)
+                for rva in tuple(log_at):
+                    addr = main_base + rva
+                    region = query_region(addr)
+                    # PAGE_EXECUTE variants use bits 4–7. Leave guard pages and other images alone.
+                    if (region and region.AllocationBase == main_base and region.Protect & 0xf0
+                            and not region.Protect & 0x100 and arm(addr, skip_int3=True)):
+                        continue
+                    log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
+                    del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
                   and sum(asserts_seen.values()) < skip_asserts and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
@@ -704,16 +818,10 @@ def main():
             sys.stdout.flush()
             if ex_code == 0xC0000005 and len(params) >= 2:
                 # Region around the faulting address and the allocations just below it.
-                class MBI(ctypes.Structure):
-                    _fields_ = [("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
-                                ("AllocationProtect", ctypes.c_uint32), ("PartitionId", ctypes.c_uint16),
-                                ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_uint32),
-                                ("Protect", ctypes.c_uint32), ("Type", ctypes.c_uint32)]
-                k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
                 probe = params[1] & ~0xFFFF
                 for _ in range(3):
-                    mbi = MBI()
-                    if not k32.VirtualQueryEx(wt.HANDLE(pi.hProcess), probe, ctypes.byref(mbi), ctypes.sizeof(mbi)):
+                    mbi = query_region(probe)
+                    if not mbi:
                         break
                     print(f"  region base={mbi.BaseAddress:#x} alloc={mbi.AllocationBase:#x} size={mbi.RegionSize:#x} "
                           f"state={mbi.State:#x} protect={mbi.Protect:#x} type={mbi.Type:#x}")
@@ -749,6 +857,11 @@ def main():
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
                                            for item in os.environ["X2W_COUNT"].split(",") if item))
+    if log_at:
+        print("  LOG_AT hit counts: " + ", ".join(f"+{rva:x} x{logged_hits.get(rva, 0)}" for rva in log_at))
+        if late_hits:
+            print("  LOG_AT late hits resumed after the limit: " +
+                  ", ".join(f"+{addr - main_base:x} x{n}" for addr, n in sorted(late_hits.items())))
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))

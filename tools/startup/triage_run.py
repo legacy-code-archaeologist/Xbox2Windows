@@ -446,7 +446,11 @@ def summarize_shader_cache(cache_dir: Path | None) -> Counter[str]:
                 break
         if not first_line:
             first_line = "(empty .fail)"
-        reasons["(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)] += 1
+        reason = "(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)
+        # A device slot 67 compute request (req_<key>.c67) gets its own class, so graphics counts do not move.
+        if (cache_dir / ("req_" + fail_path.stem + ".c67")).is_file():
+            reason = "compute: " + reason
+        reasons[reason] += 1
     return reasons
 
 

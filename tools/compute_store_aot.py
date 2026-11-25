@@ -339,17 +339,21 @@ DESCRIPTOR_LEGACY_FIXED = DESCRIPTOR_IDENTITY_SEL
 # raw VGPR bits for raw32 and the 16-bit integer forms. A d16 opcode converts each half to
 # binary32 first. 16-bit UINT/SINT with d16 is not a defined conversion, so those stores
 # are skipped rather than guessed. Codes absent from this table are refused the same way.
+# AMD format names list the fields from the most significant bit: Mesa's gfx10_format_table.py reverses
+# them ("Keep the bit sizes in little-endian order"), and radeonsi and radv map R10G10B10A2 (x in bits
+# 9:0, w in bits 31:30) to 2_10_10_10. So unorm10 is BUF_FMT_2_10_10_10_UNORM (50, legacy DFMT 9), and
+# BUF_FMT_10_10_10_2_UNORM (44, legacy DFMT 8), whose x is the 2-bit field in bits 1:0, is not handled.
 DESCRIPTOR_STORE_FORMATS = {
     20: ("raw32", 1), 22: ("raw32", 1),
     62: ("raw32", 2), 64: ("raw32", 2),
     72: ("raw32", 3), 74: ("raw32", 3),
     75: ("raw32", 4), 77: ("raw32", 4),
-    56: ("unorm8", 4), 23: ("unorm16x2", 2), 44: ("unorm10", 4),
+    56: ("unorm8", 4), 23: ("unorm16x2", 2), 50: ("unorm10", 4),
     29: ("f16x2", 2), 71: ("f16x4", 4),
     7: ("unorm16", 1), 8: ("snorm16", 1),
     11: ("uint16", 1), 12: ("sint16", 1), 13: ("f16", 1),
 }
-# Legacy (DFMT << 3) | NFMT for the same packers. DFMT: 16=2, 32=4, 16_16=5, 10_10_10_2=8,
+# Legacy (DFMT << 3) | NFMT for the same packers. DFMT: 16=2, 32=4, 16_16=5, 2_10_10_10=9,
 # 8_8_8_8=10, 32_32=11, 16_16_16_16=12, 32_32_32=13, 32_32_32_32=14.
 # NFMT: UNORM=0, SNORM=1, UINT=4, SINT=5, FLOAT=7.
 def _legacy_field(dfmt, nfmt):
@@ -361,7 +365,7 @@ LEGACY_DESCRIPTOR_FORMATS = {
     _legacy_field(11, 4): 62, _legacy_field(11, 7): 64,
     _legacy_field(13, 4): 72, _legacy_field(13, 7): 74,
     _legacy_field(14, 4): 75, _legacy_field(14, 7): 77,
-    _legacy_field(10, 0): 56, _legacy_field(5, 0): 23, _legacy_field(8, 0): 44,
+    _legacy_field(10, 0): 56, _legacy_field(5, 0): 23, _legacy_field(9, 0): 50,
     _legacy_field(5, 7): 29, _legacy_field(12, 7): 71,
     _legacy_field(2, 0): 7, _legacy_field(2, 1): 8,
     _legacy_field(2, 4): 11, _legacy_field(2, 5): 12, _legacy_field(2, 7): 13,
@@ -601,12 +605,57 @@ def descriptor_load_hlsl():
     )
 
 
+HEAP_VIEW_RECORD_BYTES = 32
+HEAP_VIEW_LIVE = 1
+HEAP_VIEW_MAX = 64
+
+
+def heap_view_hlsl(table_offset, view_count, buffer_bytes):
+    """Retrieve the guest V# of one heap view from a side record table and bound the read by it.
+
+    The runtime writes one 32-byte record per heap view: V# words 0 to 3 (base byte offset, stride in
+    word 1 bits 29:16, num_records, format word), then a state word that is 1 only while the view is live,
+    then three reserved words. Words 1 to 3 follow the GFX10 V# layout of the public LLVM AMDGPU
+    documentation and Mesa's ac_build_buffer_descriptor; the record around them is this project's own.
+
+    load_heap_view_format sets valid to false, and returns zeros, for a slot beyond the table, a record that is not live, a zero stride, a base, stride or instruction offset that is not DWORD aligned, or an unhandled format. lower() makes an
+    invalid load suppress every store, as for the constant format word. A live view whose index is not below
+    num_records, whose opcode needs more than one stride, or whose bytes leave the buffer_bytes of t0, reads as zero
+    and stays valid: the buffer-format unit's out-of-range result is zero (RDNA 2 ISA, buffer addressing).
+    """
+    return (
+        "uint4 load_heap_view_format(uint slot, uint index, uint instOffset, uint channels, out bool valid) {\n"
+        "    valid = false;\n"
+        "    uint4 zero = uint4(0u, 0u, 0u, 0u);\n"
+        f"    const uint length = {buffer_bytes}u;\n"
+        f"    if (slot >= {view_count}u) return zero;\n"
+        f"    uint record = {table_offset}u + slot * {HEAP_VIEW_RECORD_BYTES}u;\n"
+        f"    if (inputData.Load(record + 16u) != {HEAP_VIEW_LIVE}u) return zero;\n"
+        "    uint4 v = inputData.Load4(record);\n"
+        "    uint stride = (v.y >> 16u) & 0x3fffu;\n"
+        "    if (stride == 0u) return zero;\n"
+        "    if (((v.x | stride | instOffset) & 3u) != 0u) return zero;\n"
+        "    bool inRange = index < v.z && instOffset + 4u * channels <= stride && v.x <= length;\n"
+        "    uint addr = 0u;\n"
+        "    if (inRange) {\n"
+        "        uint left = length - v.x;\n"
+        "        inRange = index <= left / stride;\n"
+        "        uint start = inRange ? index * stride : 0u;\n"
+        "        inRange = inRange && instOffset + 4u * channels <= left - start;\n"
+        "        addr = v.x + start + instOffset;\n"
+        "    }\n"
+        "    uint4 r = load_descriptor_format(v.w, inRange ? addr : 0u, channels, valid);\n"
+        "    return inRange ? r : zero;\n"
+        "}\n"
+    )
+
+
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
           lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
-          descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None):
+          descriptor_format_constant=None, rsrc2=None, wave_size=None, load_format_constant=None, heap_view=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -623,6 +672,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     V# word 3. An unknown format or a channel count that does not match the opcode does not store.
     load_format_constant does the same for gfx1013 buffer_load_format_{x,xy,xyz,xyzw} through t0: one b0
     word index per formatted load, in program order, read by load_descriptor_format (see descriptor_load_hlsl).
+    heap_view=(slot_word, table_offset, view_count, buffer_bytes) makes the same loads take the V# from a run-time view record
+    instead of a constant format word (see heap_view_hlsl). It excludes load_format_constant.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     A full-mask 2D D16 image_store requires an RGBA16 FLOAT UAV.
@@ -749,6 +800,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 or any(not isinstance(index, int) or isinstance(index, bool)
                        or index not in range(CONSTANT_WORDS) for index in load_format_words)):
             raise ValueError("Invalid buffer load format constant")
+    heap_slot_word = heap_table = heap_count = None
+    if heap_view is not None:
+        if (load_format_words is not None or cpu != "gfx1013" or constant_descriptor is None
+                or source_descriptor is None or source_stride is not None or source_format is not None
+                or not isinstance(heap_view, (tuple, list)) or len(heap_view) != 4
+                or any(not isinstance(v, int) or isinstance(v, bool) for v in heap_view)):
+            raise ValueError("Invalid heap view binding")
+        heap_slot_word, heap_table, heap_count, heap_bytes = heap_view
+        if (heap_slot_word not in range(CONSTANT_WORDS) or heap_table % 4 or not 0 <= heap_table < 1 << 20
+                or not 1 <= heap_count <= HEAP_VIEW_MAX or heap_bytes % 4
+                or not heap_table + HEAP_VIEW_RECORD_BYTES * heap_count <= heap_bytes < 1 << 30):
+            raise ValueError("Invalid heap view binding")
     format_load_index = 0
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
@@ -1966,6 +2029,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not any(tag == ("constant_word", descriptor_load) and reg not in pending
                            for reg, tag in scalar.items()):
                     raise ValueError("Formatted buffer load format constant is not ready")
+            elif resource_channels and heap_view is not None:
+                # The V# comes from the view record at the slot named by a constant word (heap_view_hlsl).
+                if packed:
+                    raise ValueError("Descriptor-format d16 loads are not lowered")
+                if not idxen or offen:
+                    raise ValueError("Unsupported formatted buffer read target or address mode")
+                descriptor_load = heap_slot_word
+                format_load_index += 1
+                if not any(tag == ("constant_word", descriptor_load) and reg not in pending
+                           for reg, tag in scalar.items()):
+                    raise ValueError("Heap view slot constant is not ready")
             elif resource_channels:
                 if cpu != "gfx1030" or not idxen or offen:
                     raise ValueError("Unsupported formatted buffer read target or address mode")
@@ -2003,14 +2077,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
                 addresses = [f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"]
-            elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
-                  and tag[0] == "thread"):
+            elif (idxen and not offen and (source_stride is not None or heap_view is not None)
+                  and isinstance(tag, tuple) and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 # A formatted load selects a prefix of a complete four-component texel.
                 # A descriptor-format load uses at most four bytes per channel of the opcode.
                 read_bytes = (4 * components if descriptor_load is not None
                               else source_texel_bytes if resource_channels else width * count)
-                if offset + read_bytes > source_stride:
+                # A heap view's stride is a run time value; the shader's range check covers it.
+                if heap_view is None and offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
                 addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
@@ -2018,10 +2093,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unsupported read address")
             if descriptor_load is not None:
                 result = f"format_load_{format_load_index - 1}"
+                slot = hlsl_word(('constant_word', descriptor_load))
+                call = (f"load_heap_view_format({slot}, tid.{AXES[tag[1]]}, {aligned}u, {components}u, "
+                        f"format_valid_{format_load_index - 1})" if heap_view is not None else
+                        f"load_descriptor_format({slot}, {addresses[0]}, {components}u, "
+                        f"format_valid_{format_load_index - 1})")
                 staged_steps.append((None, f"    bool format_valid_{format_load_index - 1};\n"
-                                           f"    uint4 {result} = load_descriptor_format("
-                                           f"{hlsl_word(('constant_word', descriptor_load))}, {addresses[0]}, "
-                                           f"{components}u, format_valid_{format_load_index - 1});"))
+                                           f"    uint4 {result} = {call};"))
                 for reg in range(dst, dst + count):
                     vector.pop(reg, None)
                     loading[reg] = ("alu", f"{result}.{'xyzw'[reg - dst]}")
@@ -2487,10 +2565,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unused buffer descriptor format constant")
     if load_format_words is not None and format_load_index != len(load_format_words):
         raise ValueError("Unused buffer load format constant")
-    if load_format_words is not None:
+    if heap_view is not None and not format_load_index:
+        raise ValueError("Unused heap view binding")
+    if load_format_words is not None or heap_view is not None:
         # Every load is staged before the stores. The format words are uniform constants, so an invalid
         # format leaves the whole dispatch unwritten rather than publishing a placeholder result.
-        valid = " && ".join(f"format_valid_{index}" for index in range(len(load_format_words)))
+        valid = " && ".join(f"format_valid_{index}" for index in range(format_load_index))
         staged_steps.append((None, f"    if (!({valid})) return;"))
     if not stores:
         raise ValueError("Expected at least one observable store")
@@ -2532,8 +2612,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     # The helper reads outputData, so it follows the UAV declaration.
     descriptor_hlsl = descriptor_store_hlsl() if "store_descriptor_format(" in body else ""
-    if "load_descriptor_format(" in body:
+    if "load_descriptor_format(" in body or "load_heap_view_format(" in body:
         descriptor_hlsl += descriptor_load_hlsl()
+    if heap_view is not None:
+        descriptor_hlsl += heap_view_hlsl(heap_table, heap_count, heap_bytes)
     return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
             f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
@@ -2570,6 +2652,10 @@ def main():
                         help="b0 word index holding V# word 3 for one formatted store, in program order")
     parser.add_argument("--load-format-constant", action="append", type=lambda n: int(n, 0),
                         help="b0 word index holding the t0 V# word 3 for one gfx1013 formatted load, in program order")
+    parser.add_argument("--heap-view", nargs=4, type=lambda n: int(n, 0),
+                        metavar=("SLOT_WORD", "TABLE_OFFSET", "COUNT", "BUFFER_BYTES"),
+                        help="gfx1013 formatted loads take the V# from the run-time view record at the slot in b0 word "
+                             "SLOT_WORD; the record table is at byte TABLE_OFFSET of the BUFFER_BYTES-byte t0 and holds COUNT views")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
@@ -2610,7 +2696,8 @@ def main():
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
                    descriptor_format_constant=args.descriptor_format_constant,
-                   rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant)
+                   rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant,
+                   heap_view=tuple(args.heap_view) if args.heap_view else None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
