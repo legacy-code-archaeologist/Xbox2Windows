@@ -27,6 +27,12 @@ NAMES = {0x80000003: "breakpoint", 0x80000004: "single step", 0xC0000005: "acces
          0xC000001D: "illegal instruction", 0xC0000409: "fast fail", 0xE06D7363: "C++ exception",
          0x406D1388: "thread name", 0xC0000374: "heap corruption", 0x4000001F: "wow breakpoint",
          0xC0000094: "integer divide by zero", 0xC00000FD: "stack overflow", 0x40010006: "debug print"}
+# --trace-calls 1: the exports hooked in each module, matched by the module's file name at load.
+RUNTIME_MODULE = "xgameruntime.dll"
+RUNTIME_CALL_HOOKS = ("QueryApiImpl", "InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "XErrorReport")
+MOVIE_MODULE = "bink2scarlett.dll"
+MOVIE_CALL_HOOKS = ("BinkOpenWithOptions", "BinkClose", "BinkNextFrame", "BinkRegisterFrameBuffers", "BinkPause",
+                    "BinkShouldSkip")
 REGS = ["Rax", "Rcx", "Rdx", "Rbx", "Rsp", "Rbp", "Rsi", "Rdi", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "Rip"]
 
 
@@ -59,6 +65,8 @@ def main():
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
+    host_cpu_rewritten = set()  # sites replaced in place; a thread may still fault on one (see the handler)
+    host_cpu_resumed = set()  # (site, thread) pairs continued once for that reason
     flushopt_missing = [False]  # set when a CLFLUSHOPT faults: CLWB then becomes a NOP instead
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
@@ -249,6 +257,12 @@ def main():
         return (f"[root {root:#x}]" if root else "") + text
 
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
+    # --trace-calls 1: also break on gaming-runtime and movie-player calls. Every hit stops the whole
+    # process, so these hooks are off by default; the movie-player report (bink_report) needs them.
+    # The call hooks are armed with the file hooks, so without file tracing (--trace-files 1, or offline
+    # mode, the default) --trace-calls 1 arms nothing; the summary says so.
+    calls_requested = opts.get("--trace-calls") == "1"
+    trace_calls = trace and calls_requested
     k32.GetModuleHandleW.restype = wt.HMODULE
     ntdll = k32.GetModuleHandleW("ntdll.dll")
     k32.GetProcAddress.restype = ctypes.c_void_p
@@ -535,22 +549,21 @@ def main():
             name = final_path(h_file) if h_file else "?"
             modules[base] = name
             log(f"{time.time() - start:7.3f} load {name} at {base:#x}")
-            if trace and name.lower() == "xgameruntime.dll":
+            if trace_calls and name.lower() == RUNTIME_MODULE:
                 # Gaming runtime: log which API interfaces the title asks for and the result.
                 k32.LoadLibraryExW.restype = wt.HMODULE
                 local = k32.LoadLibraryExW(r"C:\Windows\System32\xgameruntime.dll", None, 1)
-                for export in ("QueryApiImpl", "InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "XErrorReport"):
+                for export in RUNTIME_CALL_HOOKS:
                     address = k32.GetProcAddress(local, export.encode()) if local else 0
                     if address:
                         hooks[base + (address - local)] = (export, "runtime")
                         if loader_break_seen:
                             arm(base + (address - local))
-            if trace and name.lower() == "bink2scarlett.dll":
+            if trace_calls and name.lower() == MOVIE_MODULE:
                 # Movie player: log opens/closes/frames and remember the registered frame buffers.
                 k32.LoadLibraryExW.restype = wt.HMODULE
                 local = k32.LoadLibraryExW(os.path.join(os.path.dirname(exe), name), None, 1)
-                for export in ("BinkOpenWithOptions", "BinkClose", "BinkNextFrame", "BinkRegisterFrameBuffers",
-                               "BinkPause", "BinkShouldSkip"):
+                for export in MOVIE_CALL_HOOKS:
                     address = k32.GetProcAddress(local, export.encode()) if local else 0
                     if address:
                         hooks[base + (address - local)] = (export, "bink")
@@ -591,8 +604,16 @@ def main():
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
                     and main_base <= ex_addr < main_base + 0x10000000):
                 name = rewrite_for_host(ex_addr)
-                if not name and sha_for_host(tid, ex_addr):
+                if name:
+                    host_cpu_rewritten.add(ex_addr)
+                elif sha_for_host(tid, ex_addr):
                     name = "sha (per hit)"
+                elif ex_addr in host_cpu_rewritten and (ex_addr, tid) not in host_cpu_resumed:
+                    # Another thread ran the old instruction before the rewrite and its fault arrived after:
+                    # continued, it runs the replacement. Once per thread, so a fault that stays is reported.
+                    host_cpu_resumed.add((ex_addr, tid))
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
                 if name:
                     host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
                     if sum(host_cpu_sites.values()) <= 40:
@@ -612,6 +633,7 @@ def main():
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
                                                   main_base <= ex_addr < main_base + 0x10000000):
                 stop = (ex_code, ex_addr, tid, first, params)
+                log(f"debugger stop {ex_code:#010x} {'first' if first else 'second'}-chance")
                 break
             elif ex_code in (0x406D1388, 0x40010006):
                 status = DBG_CONTINUE
@@ -721,6 +743,8 @@ def main():
             print("  asserts continued: " + ", ".join(f"{where(a)} x{n}" for a, n in asserts_seen.items()))
     if host_cpu_sites:
         print("  host-cpu sites rewritten: " + ", ".join(f"{name} x{n}" for name, n in sorted(host_cpu_sites.items())))
+    if host_cpu_resumed:
+        print(f"  host-cpu threads resumed at a site another thread had rewritten: {len(host_cpu_resumed)}")
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
@@ -728,6 +752,12 @@ def main():
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
+    if trace_calls:
+        print("  call tracing: on (runtime and movie-player call hooks; --trace-calls 1)")
+    elif calls_requested:
+        print("  call tracing: off: --trace-calls 1 needs file tracing (--trace-files 1, or offline mode, the default)")
+    else:
+        print("  call tracing: off (runtime and movie-player call hooks; --trace-calls 1)")
 
     def capture_window():
         """Saves what the title's window currently shows on screen (client area) as window.png."""

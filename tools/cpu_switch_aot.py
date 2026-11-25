@@ -39,9 +39,10 @@ count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
 SAR), so O, NO, L, GE, LE and G are refused after a larger count.
 
 BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
-a register or immediate bit offset. The offset is taken modulo the operand
-width, except that a register offset into memory addresses a bit string
-outside the operand, which is refused. CF is the selected bit before the
+a register or immediate bit offset. Register bases and immediate offsets use
+the offset modulo the operand width. A register offset into ordinary memory is
+signed and addresses a bit string; frame, image-relative and 32-bit-address
+forms are refused. CF is the selected bit before the
 write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
 only the B and AE conditions may read it.
 
@@ -1247,7 +1248,29 @@ class Lifter:
             return line, reads, writes
         if mnemonic in BIT_TESTS:
             if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
-                raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+                # Frame and image proofs cover the nominal address only; the dynamic bit offset
+                # can reach outside that range. Address-size overrides need separate wrap proof.
+                if (ins.ip in self.frame or ins.memory_base in (R.RIP, R.EIP)
+                        or RegisterExt.is_gpr32(ins.memory_base)):
+                    raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+                note(0, 1)
+                bits = width * 8
+                shift = bits.bit_length() - 1
+                raw = self.operand(ins, 1, width)
+                # Unsigned arithmetic implements a sign-extended arithmetic shift without
+                # signed overflow or an implementation-defined right shift of a negative value.
+                lines = [f"const std::uint64_t bit_index = {raw};",
+                         f"const std::uint64_t sign = 0ull - (bit_index >> {bits - 1});",
+                         f"const std::uint64_t word_index = (bit_index >> {shift}) | (sign << {bits - shift});",
+                         f"const word address = {self.address(ins)} + word_index * {width}ull;",
+                         f"const {unsigned(width)} value = load_always<{unsigned(width)}>(address);",
+                         f"const std::uint64_t bit = bit_index & {bits - 1}u;"]
+                if sets_flags:
+                    self.flags = True
+                    lines.append("fb = (static_cast<std::uint64_t>(value) >> bit) & 1u;")
+                if mnemonic != M.BT:
+                    lines.append(f"store<{unsigned(width)}>(address, static_cast<{unsigned(width)}>(value {BIT_TESTS[mnemonic]}(1ull << bit)));")
+                return "{ " + " ".join(lines) + " }", reads, writes
             note(0, 1)
             bits = width * 8
             a = self.operand(ins, 0, width)

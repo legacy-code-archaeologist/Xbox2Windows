@@ -19,7 +19,8 @@ Rules:
   of each line of every program tools/pixel_aot.py lowered without an error, in the file CTest names
   in FORM_COVERAGE_RECORD (<build>/form_coverage/<test>.txt). Programs a check expects to be rejected
   raise before they are recorded. A record not written during the JUnit file's run is ignored, so a
-  record and a test status always come from the same run.
+  record and a test status always come from the same run. A --records path that is not a directory is an
+  error (exit 2); a directory whose records all come from another run is measured with a warning.
 - Reference lists (denominators) live in docs/coverage/ and are produced by tools/form_reference.py.
 Python standard library only.
 """
@@ -332,7 +333,19 @@ def main(argv):
     except (OSError, ET.ParseError, ValueError) as error:
         print(f"form_coverage: {args.junit}: {error}", file=sys.stderr)
         return 2
-    m = measure(results, records=read_records(args.records, window), gaps_for=args.gaps)
+    # Reading nothing from a mistyped or wrong --records path would silently count every record-mode and shader
+    # form as uncovered, so a path that is not a directory is an error.
+    if not args.records.is_dir():
+        problem = "records path is not a directory" if args.records.exists() else "records directory does not exist"
+        print(f"form_coverage: {args.records}: {problem}", file=sys.stderr)
+        return 2
+    records = read_records(args.records, window)
+    stored = sum(1 for _ in args.records.glob("*.txt"))
+    if stored and not records:
+        # For example the records of another preset's build directory: valid, but nothing from this run counts.
+        print(f"form_coverage: {args.records}: none of the {stored} records here was written during this JUnit "
+              "run, so no record-mode or shader form is counted", file=sys.stderr)
+    m = measure(results, records=records, gaps_for=args.gaps)
     if args.gaps:
         gaps = m[args.gaps].pop("gaps")
     if args.json:

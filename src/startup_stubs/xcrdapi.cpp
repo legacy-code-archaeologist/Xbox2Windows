@@ -303,13 +303,17 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
 {
     char id[48];
     guid_text(riid, id, sizeof(id));
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!path) {
+        log("x2w-dstorage Factory::OpenFile path=(null) riid=%s -> E_INVALIDARG", id);
+        return E_INVALIDARG;
+    }
     HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
     const DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     log("x2w-dstorage Factory::OpenFile path=\"%ls\" riid=%s -> %s (err %lu)", path ? path : L"(null)", id,
         handle == INVALID_HANDLE_VALUE ? "fail" : "ok", error);
-    if (!out) return E_POINTER;
-    *out = nullptr;
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
     auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
@@ -355,8 +359,10 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
     log("x2w-dstorage Factory::CreateQueue desc=[%s] name=\"%s\" riid=%s", bytes,
         name && x2w_local::readable(name, 1) ? name : "?", id);
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
     Object* object = make(queue);
-    object->capacity = desc ? *reinterpret_cast<const std::uint16_t*>(desc + 8) : 0;
+    object->capacity = *reinterpret_cast<const std::uint16_t*>(desc + 8);
     *out = object;
     return S_OK;
 }
@@ -373,9 +379,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder
@@ -451,6 +458,18 @@ StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 cou
     const bool known = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
                        GetFileSizeEx(file_object->handle, &length) && length.QuadPart >= 0;
     return read_failure_cause(known, known ? static_cast<u64>(length.QuadPart) : 0, offset, count);
+}
+
+// The status HRESULT a failed request reports, by cause. A destination too small for the data and a
+// read at or past the end of the file are told apart; every other cause stays E_FAIL.
+HRESULT failure_result(StorageFailure cause) noexcept
+{
+    switch (cause) {
+    case StorageFailure::destination_capacity: return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    case StorageFailure::read_at_or_past_eof:
+    case StorageFailure::read_crossing_eof: return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    default: return E_FAIL;
+    }
 }
 
 // The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
@@ -612,19 +631,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
-                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
-                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
-                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
-                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
-                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
-                if (bcpack) target_size = target_size * 2 + 0x10000;
+                // The public DSTORAGE_REQUEST layout has SourceSize at +0x30, IntermediateSize at +0x34 (the
+                // number of BCPack bytes when zlib and BCPack are both requested) and CancellationTag at
+                // +0x38. The tag is an arbitrary value, not a size, so no buffer is sized from it. A zlib-only
+                // request inflates to DestinationSize; with BCPack after it the inflated size is
+                // IntermediateSize, and the earlier destination-based bound is kept as the minimum.
+                const unsigned intermediate_size = *reinterpret_cast<const unsigned*>(request + 0x34);
+                std::size_t target_size = destination_size;
+                if (bcpack) {
+                    target_size = target_size * 2 + 0x10000;
+                    if (intermediate_size > target_size) target_size = intermediate_size;
+                }
                 output.resize(target_size);
                 std::size_t produced = 0;
                 bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
                 if (!ok && output.size() < 0x80000) {
-                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
-                    // expand up to 512 KiB to accommodate larger chunks.
+                    // If destination_size was smaller than the uncompressed stream, expand up to 512 KiB to
+                    // accommodate larger chunks.
                     std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
                     if (big_size < 0x80000) big_size = 0x80000;
                     std::vector<unsigned char> big(big_size);
@@ -809,9 +832,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     }
     const bool empty = std::strcmp(outcome, "empty") == 0;
     const bool failed = (data == nullptr || !written) && !empty;
-    if (failed) count_failure(failure, self, request);
+    const HRESULT result = failure_result(failure);
+    if (failed) count_failure(failure, self, request, result);
     if (!empty) count_page_request(request, failed);
-    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(result));
     static LONG summaries, failures;
     if (x2w_local::first_calls(summaries, 12) || (failed && x2w_local::first_calls(failures, 12)))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
@@ -1235,13 +1259,18 @@ void push(Object* self, Entry&& entry)
     start_worker(self, work);  // a failure shows at Submit
     bool recorded = false;
     bool full = false;
-    try {
+    {
         const std::lock_guard guard(work->mutex);
-        entry.id = ++work->next_entry_id;
-        work->waiting.push_back(std::move(entry));
-        recorded = true;
-        full = self->capacity && work->waiting.size() >= self->capacity;
-    } catch (const std::bad_alloc&) {
+        // The handler sits inside the lock's scope, like every other growth of these lists: a
+        // std::bad_alloc must not unwind through the guard (the MSVC build under test then leaves
+        // the mutex locked, and the next Submit throws std::system_error on its own lock).
+        try {
+            entry.id = ++work->next_entry_id;
+            work->waiting.push_back(std::move(entry));
+            recorded = true;
+            full = self->capacity && work->waiting.size() >= self->capacity;
+        } catch (const std::bad_alloc&) {
+        }
     }
     if (!recorded) {
         defer_unrecorded(self, entry);

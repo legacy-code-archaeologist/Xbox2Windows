@@ -44,6 +44,7 @@ jobs:
           SPIRV = ["spirv-as", "spirv-val", "spirv-cross"]
           CHECKS = [
               (["tests/compute_store_check.py", *COMMON_LLVM], {}),
+              (["tests/compute_load_format_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_aot_check.py", *COMMON_LLVM], {}),
               (["tests/sampled_coverage_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
@@ -65,6 +66,8 @@ jobs:
               (["tests/pixel_attribute_sampled_check.py", *COMMON_LLVM], {}),
               (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_mimg_float_store_d16_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_image_atomics_gfx1013_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_multi_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_descriptor_swap_check.py", *COMMON_LLVM], {}),
@@ -182,11 +185,13 @@ jobs:
             tests/rdna2_tools_check.py \
             tests/mesh_dynamic_geometry_check.py \
             tests/mesh_dynamic_aot_check.py \
+            tests/mesh_lane_spill_check.py \
             tests/pso_readiness_check.py \
             tests/xmem_attribute_scan_check.py \
             tests/xgameruntime_table_check.py \
             tests/docs_links_check.py \
             tests/bidi_controls_check.py \
+            tests/pixel_denorm_vulkan_check.py \
             tests/gpu_report_format_check.py \
             tests/hardware_reports_check.py \
             tests/rectlist_topology_check.py \
@@ -203,11 +208,15 @@ jobs:
             tests/startup_live_telemetry_check.py \
             tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_int_med3_check.py \
+            tests/startup_gfx2hlsl_cselect_mask_check.py \
+            tests/startup_gfx2hlsl_mask_overwrite_check.py \
             tests/startup_gfx2hlsl_capture_check.py \
+            tests/startup_gfx2hlsl_watch_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
+            tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
@@ -217,20 +226,29 @@ jobs:
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
+            tests/startup_gfx2hlsl_sdwa_cvt_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
+            tests/startup_gfx2hlsl_sopk_accum_check.py \
             tests/startup_gfx2hlsl_f32_lg_check.py \
             tests/startup_gfx2hlsl_f32_nan_check.py \
+            tests/startup_gfx2hlsl_root_check.py \
+            tests/startup_gfx2hlsl_sopk_signext_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
+            tests/startup_stream_interface_check.py \
+            tests/compute_alu_cmp_ne_check.py \
             tests/compute_entry_layout_check.py \
+            tests/compute_alu_bcnt64_check.py \
+            tests/compute_load_format_check.py \
             tests/startup_ngg_slice_check.py \
+            tests/startup_gfx2hlsl_handler_arity_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
@@ -292,7 +310,7 @@ jobs:
             cmake --build --preset dev
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
-            ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+            ctest --preset dev --no-tests=error --parallel 4 -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
           }
           exit $LASTEXITCODE
       - name: Require the SPIR-V bridge WARP tests
@@ -332,7 +350,7 @@ jobs:
     name: Build and test on Windows at /O2
     if: github.event_name != 'pull_request'
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
@@ -387,7 +405,7 @@ jobs:
           cmake --build --preset release
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
-          ctest --preset release --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
+          ctest --preset release --no-tests=error --parallel 4 -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
       - name: Require the SPIR-V bridge WARP tests at /O2
         if: ${{ !cancelled() }}
         shell: pwsh

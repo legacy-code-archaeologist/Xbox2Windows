@@ -15,6 +15,7 @@ void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 int check_startup_cb_blend(ID3D12Device* device, bool swapped);
+int check_startup_export_write_mask(ID3D12Device* device, bool unmasked);
 int check_startup_composite_provenance(ID3D12Device* device);
 int check_startup_range_provenance(ID3D12Device* device);
 void check_dynamic_sampler_index(ID3D12Device* device);

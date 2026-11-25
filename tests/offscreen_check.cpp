@@ -1135,6 +1135,17 @@ OperationResult run_startup_cb_blend(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-export-write-mask: a manifest 'wmask' line keeps the unwritten channels of the target (#1674).
+// --startup-export-write-mask-unmasked: without the mask every channel is written, so every case differs.
+template<bool Unmasked>
+OperationResult run_startup_export_write_mask(const OperationContext& ctx)
+{
+    const int mismatches = check_startup_export_write_mask(ctx.device, Unmasked);
+    if (Unmasked ? mismatches == 0 : mismatches != 0)
+        return {OutcomeKind::fail, Unmasked ? "unmasked draws still kept the unwritten channels" : "a channel outside the export mask was written"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-composite-provenance: source, destination before and destination after a composite draw on one
 // list distinguish a drawn centre, a clipped centre and a UV that selects the source corner (#1628).
 OperationResult run_startup_composite_provenance(const OperationContext& ctx)
@@ -1508,6 +1519,8 @@ const OperationSpec kOperations[] = {
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
+    {"--startup-export-write-mask", 3, 3, nullptr, kNoGate, run_startup_export_write_mask<false>},
+    {"--startup-export-write-mask-unmasked", 3, 3, nullptr, kNoGate, run_startup_export_write_mask<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
     {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},

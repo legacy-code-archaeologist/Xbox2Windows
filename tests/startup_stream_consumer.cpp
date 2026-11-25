@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <cstdio>
 #include <cctype>
@@ -88,6 +89,63 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
            pipeline;
 }
 
+// Binds the pipeline on a guest list and records `calls` ExecuteIndirect calls (list slot 61) with a Draw or a
+// Dispatch signature. No root or target is bound, so every call is refused and nothing is drawn.
+static bool bind_and_execute_indirect(void* device, void* pipeline, bool dispatch, int calls)
+{
+    auto* guest = static_cast<ID3D12Device*>(device);
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = dispatch ? D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{
+        dispatch ? UINT{sizeof(D3D12_DISPATCH_ARGUMENTS)} : UINT{sizeof(D3D12_DRAW_ARGUMENTS)}, 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> signature;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    if (FAILED(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature))) ||
+        FAILED(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))) return false;
+    const auto slots = [](void* object) { return *static_cast<void***>(object); };
+    using CreateList = HRESULT (WINAPI*)(void*, const void*, void*, void*, REFIID, void**);
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    void* list = nullptr;
+    if (FAILED(reinterpret_cast<CreateList>(slots(device)[73])(device, list_desc, allocator.Get(), nullptr,
+                                                                 __uuidof(ID3D12GraphicsCommandList), &list)) || !list) return false;
+    using Reset = HRESULT (WINAPI*)(void*, void*, void*, void*);
+    using Bind = void (WINAPI*)(void*, void*);
+    using Execute = void (WINAPI*)(void*, void*, UINT, void*, UINT64, void*, UINT64);
+    using Close = HRESULT (WINAPI*)(void*);
+    if (FAILED(reinterpret_cast<Reset>(slots(list)[139])(list, allocator.Get(), nullptr, nullptr))) return false;
+    reinterpret_cast<Bind>(slots(list)[25])(list, pipeline);
+    for (int i = 0; i < calls; ++i) reinterpret_cast<Execute>(slots(list)[61])(list, signature.Get(), 1, nullptr, 0, nullptr, 0);
+    const bool closed = SUCCEEDED(reinterpret_cast<Close>(slots(list)[9])(list));
+    static_cast<IUnknown*>(list)->Release();
+    return closed;
+}
+
+// A slot-86 pipeline with desktop shaders that use no resources, over the stream root: a desktop pipeline.
+static void* desktop_pipeline(void* device)
+{
+    static const char vs_text[] = "float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }";
+    static const char ps_text[] = "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
+    ComPtr<ID3DBlob> vs, ps;
+    if (FAILED(D3DCompile(vs_text, sizeof(vs_text) - 1, nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vs, nullptr)) ||
+        FAILED(D3DCompile(ps_text, sizeof(ps_text) - 1, nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &ps, nullptr)))
+        return nullptr;
+    struct alignas(void*) Root { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; void* value; };
+    struct alignas(void*) Code { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_SHADER_BYTECODE value; };
+    struct alignas(void*) Formats { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_RT_FORMAT_ARRAY value; };
+    struct alignas(void*) Topology { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_PRIMITIVE_TOPOLOGY_TYPE value; };
+    struct { Root root; Code vs, ps; Formats targets; Topology topology; } stream{
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, stream_root_signature()},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs->GetBufferPointer(), vs->GetBufferSize()}},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps->GetBufferPointer(), ps->GetBufferSize()}},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, {{DXGI_FORMAT_R8G8B8A8_UNORM}, 1}},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE}};
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    using Create = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    void* pipeline = nullptr;
+    return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[86])(device, &desc, __uuidof(ID3D12PipelineState),
+                                                                                   &pipeline)) ? pipeline : nullptr;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 4 && (argc < 6 || argc > 8) && argc != 10) return 2;
@@ -112,6 +170,18 @@ int main(int argc, char** argv)
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
     bool two_targets = false;
+    if (argc == 7 && std::strncmp(argv[6], "indirect-", 9) == 0) {
+        // A pipeline used only through slot 61. slot57-draw: three refused Draw calls; slot57-bound: bound, no call;
+        // slot57-dispatch: one refused Dispatch call; desktop-draw: a desktop pipeline and one refused Draw call.
+        const std::string mode(argv[6] + 9);
+        if (mode == "desktop-draw") pso = desktop_pipeline(device);
+        else if (mode == "slot57-draw" || mode == "slot57-bound" || mode == "slot57-dispatch") {
+            if (!create_slot57(device, argv[1], argv[2], argv[3], "", pso)) return 10;
+        } else return 2;
+        if (!pso) return 10;
+        const int calls = mode == "slot57-draw" ? 3 : mode == "slot57-bound" ? 0 : 1;
+        return bind_and_execute_indirect(device, pso, mode == "slot57-dispatch", calls) ? 0 : 11;
+    }
     if (argc == 8 && std::strncmp(argv[6], "slot57", 6) == 0) {
         // The same shaders and root through device slot 57, with the given words in state block A.
         // "slot57-mrt" binds a second RGBA8 target.

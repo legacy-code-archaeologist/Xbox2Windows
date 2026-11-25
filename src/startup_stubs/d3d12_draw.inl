@@ -18,6 +18,7 @@ struct Translation {
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
+    x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -33,6 +34,9 @@ struct BoundPipeline {
     D3D12_BLEND_DESC blend{};
     bool has_depth_stencil = false;
     D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    bool depth_from_registers = false;  // X2W_DEPTH_STATE: depth_stencil was decoded from state block A (slot 57)
+    bool has_stencil_ref = false;       // ... and its stencil test is on: stencil_ref goes on the list with each draw
+    std::uint8_t stencil_ref = 0;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
@@ -167,6 +171,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (line.compare(0, 6, "wmask ") == 0) {
+            if (!tr.write_masks.read_manifest_line(line)) {
+                log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
@@ -198,7 +207,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-7";
+    constexpr char revision[] = "x2w-startup-shader-9";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -383,6 +392,29 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         }
         bound->dsv_format = info->stream_dsv_format;
     }
+    // X2W_DEPTH_STATE=1 (#1999, item A): the depth-stencil registers of a slot 57 pipeline's state block A. A slot 57
+    // pipeline has no desktop DEPTH_STENCIL subobject, so has_depth_stencil can only be set here; the test keeps any
+    // desktop state that was found first. A block the decoder refuses leaves the desktop default (depth and stencil off).
+    if (info && info->path == 57 && !bound->has_depth_stencil && x2w_local::env_on("X2W_DEPTH_STATE")) {
+        const auto chosen = x2w_pipeline_state::select_depth_stencil(true, info->state_a.data(), info->state_a.size());
+        static LONG logged_applied, logged_refused;
+        if (chosen.applied) {
+            bound->depth_stencil = chosen.desc;
+            bound->has_depth_stencil = bound->depth_from_registers = true;
+            bound->has_stencil_ref = chosen.has_stencil_ref;
+            bound->stencil_ref = chosen.stencil_ref;
+        }
+        if (first_calls(chosen.applied ? logged_applied : logged_refused, 24)) {
+            if (chosen.applied)
+                log("x2w-draw pipeline %p: depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
+                    static_cast<void*>(pipeline), chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
+                    chosen.desc.StencilEnable, chosen.stencil_ref, chosen.depth_bounds ? "; depth bounds not applied" : "",
+                    chosen.masks_differ ? "; back-face masks or reference differ, front used" : "");
+            else
+                log("x2w-draw pipeline %p: depth-stencil registers not used (%s); keeping the desktop state", static_cast<void*>(pipeline),
+                    chosen.reason);
+        }
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -404,6 +436,22 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     }
     by_pipeline[pipeline] = bound;
     return bound;
+}
+
+// The request translation_for writes on a direct draw, for a pipeline that slot 61 refuses. Only direct draws poll
+// for the manifest afterwards. Count first lookups separately from published request files.
+LONG indirect_first_lookups;
+void request_translation(Wrapper* pipeline)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    const bool known = translation_by_pipeline().count(pipeline) != 0;
+    translation_for(pipeline);
+    ReleaseSRWLockExclusive(&draw_lock);
+    if (!known) InterlockedIncrement(&indirect_first_lookups);
+    static LONG lookups;
+    if (first_calls(lookups, 16))
+        log("x2w-render ExecuteIndirect looks up translation for pipeline %p (%s)", static_cast<void*>(pipeline),
+            known ? "already known" : "new");
 }
 
 bool needs_rtv_variant(DXGI_FORMAT format)
@@ -455,13 +503,21 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
+// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
+{
+    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+}
+
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
-    const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+    // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
+    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -474,7 +530,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
-    if (bound.has_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
+    // Channels the translated exports leave unwritten stay out of the write mask (#1674).
+    if (!x2w_startup::apply_export_write_masks(desc.BlendState, tr.write_masks, pass.target_count)) {
+        log("x2w-draw export write masks incompatible with shared logic op for %016llx", tr.key);
+        bound.pipelines[key] = nullptr;
+        return nullptr;
+    }
+    if (use_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -688,7 +750,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+    // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
+    const bool single = resource->own().tiled_address_srv && x2w_startup::single_element_bytes(desc) != 0;
+    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || single ||
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
     {
         static LONG reasons;
@@ -729,13 +793,14 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return;
     }
-    if (tiled && !tiled_chain && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !tiled_chain && !single && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size() : stride * (slices - 1) + slice_total;
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
-        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
+    const bool recheck = single || ((tiled_address || tiled_chain) ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
     if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
@@ -766,7 +831,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 plan.upload(list, texture, upload_ring, mips, slices, slice, i, offset);
             }
         }
-    } else if (tiled) {
+    } else if (tiled && !single) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
@@ -1146,6 +1211,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     list->SetPipelineState(pipeline);
+    // X2W_DEPTH_STATE: the reference of the decoded stencil test is list state in D3D12. It replaces the one a
+    // preceding OMSetStencilRef set, for draws of this pipeline only when a depth view is bound.
+    const bool scoped_stencil_ref = bound->depth_from_registers && bound->has_stencil_ref &&
+                                    pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN &&
+                                    bound->stencil_ref != pass.stencil_reference;
+    if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
     list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
     if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
@@ -1173,6 +1244,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         drawn = true;
     }
+    if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) draw_dump_after(self, list, tr->key, count);
     ReleaseSRWLockExclusive(&draw_lock);
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {

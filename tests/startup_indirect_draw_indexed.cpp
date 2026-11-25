@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -405,14 +407,55 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     std::printf("%s: %u/%u non-clear pixels, argument guards intact\n", label, painted, width * height);
     return pixels_match;
 }
+// Calls refused before any argument is read: one per counted reason, and one with two commands, which is
+// counted as other under its signature's kind. The list is closed and dropped.
+void refuse_each_reason(ID3D12Device* guest, ID3D12CommandSignature* draw_indexed)
+{
+    D3D12_INDIRECT_ARGUMENT_DESC dispatch{};
+    dispatch.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    const D3D12_COMMAND_SIGNATURE_DESC dispatch_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &dispatch, 0};
+    ComPtr<ID3D12CommandSignature> dispatch_signature;
+    check(guest->CreateCommandSignature(&dispatch_desc, nullptr, IID_PPV_ARGS(&dispatch_signature)), "create guest dispatch signature");
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "create guest allocator");
+    const auto list = begin_guest_list(guest, allocator.Get());
+    using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
+    const auto execute = slot<Execute>(list.Get(), 61);
+    execute(list.Get(), nullptr, 1, nullptr, 0, nullptr, 0);                    // placeholder signature
+    execute(list.Get(), draw_indexed, 1, nullptr, 0, nullptr, 0);               // no desktop graphics pipeline bound
+    execute(list.Get(), dispatch_signature.Get(), 1, nullptr, 0, nullptr, 0);   // no desktop compute pipeline bound
+    execute(list.Get(), draw_indexed, 2, nullptr, 0, nullptr, 0);               // two commands
+    check(slot<HRESULT (WINAPI*)(IUnknown*)>(list.Get(), 9)(list.Get()), "close refusal list");
+}
+
+// 300 empty console presents (queue slot 32) reach the render-totals heartbeat; nothing is shown.
+std::string indirect_line(ID3D12Device* guest, const std::wstring& log_path)
+{
+    const D3D12_COMMAND_QUEUE_DESC desc{};
+    ComPtr<IUnknown> queue;
+    check(guest->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(queue.GetAddressOf())),
+          "create guest queue");
+    using Present = HRESULT (WINAPI*)(IUnknown*, UINT, const void*, const void*);
+    const std::array<unsigned char, 0x50> planes{};
+    const std::array<unsigned char, 0x40> present{};
+    for (int frame = 0; frame < 300; ++frame) slot<Present>(queue.Get(), 32)(queue.Get(), 0, planes.data(), present.data());
+    std::ifstream file(log_path, std::ios::binary);
+    std::string line, found;
+    while (std::getline(file, line))
+        if (line.rfind("x2w-render indirect:", 0) == 0) found = line;
+    while (!found.empty() && (found.back() == '\r' || found.back() == '\n')) found.pop_back();
+    return found;
+}
 }  // namespace
 
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
+    // "count-control" is the negative control: it expects one forwarded call too many.
+    const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if (argc == 3 && std::strcmp(argv[2], "draw") == 0) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "mesh") == 0) kind = DrawKind::mesh;
-    else if (argc != 2) return 2;
+    else if (argc != 2 && !count_control) return 2;
     const bool indexed = kind == DrawKind::indexed;
     const bool mesh = kind == DrawKind::mesh;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
@@ -442,6 +485,14 @@ int main(int argc, char** argv) try
             if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe))) &&
                 (!mesh || supports_mesh(probe.Get()))) break;
         }
+    }
+    wchar_t directory[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, directory)) return 4;
+    const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
+    if (indexed) {
+        DeleteFileW(log_path.c_str());
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
+        SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
     }
     DXGI_ADAPTER_DESC1 desc{};
     check(adapter->GetDesc1(&desc), "get selected adapter description");
@@ -510,6 +561,20 @@ int main(int argc, char** argv) try
         !verify(left.Get(), false, Refusal::short_argument, "short argument range")) return 1;
     if (indexed ? !verify(left.Get(), false, Refusal::invalid_index, "invalid index range")
                 : !verify(left.Get(), false, Refusal::missing_viewport, "missing viewport")) return 1;
+    if (indexed) {
+        // Forwarded: the three unrefused runs. Other reasons: the short argument range, the invalid index range and two commands.
+        refuse_each_reason(guest.Get(), signature.Get());
+        const std::string line = indirect_line(guest.Get(), log_path);
+        DeleteFileW(log_path.c_str());
+        const std::string expected = std::string("x2w-render indirect: forwarded: drawindexed ") + (count_control ? "4" : "3") +
+            "; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; "
+            "other: drawindexed 3";
+        if (line != expected) {
+            std::fprintf(stderr, "indirect line mismatch:\n  got      '%s'\n  expected '%s'\n", line.c_str(), expected.c_str());
+            return 1;
+        }
+        std::printf("%s\n", line.c_str());
+    }
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;

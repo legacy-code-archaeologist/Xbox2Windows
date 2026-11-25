@@ -108,7 +108,7 @@ def check_scanner_tracks_pixel_aot():
         "v_cvt_off_f32_i4_e32 v12, v13",
         "v_ldexp_f32_e64 v12, v13, s44",
         "v_cubeid_f32_e64 v12, v13, v14, v15",
-        "v_fma_mix_f32 v12, v13, v14, v15 op_sel:[1,1,0]",
+        "v_fma_mix_f32 v12, v13, v14, v15 op_sel_hi:[1,1,0]",
         "v_dot4_i32_i8 v12, v13, v14, v15 clamp",
         "v_med3_i32_e64 v12, v13, v14, v15",
         "v_cmp_lt_u32_e64 s[4:5], v12, v13",

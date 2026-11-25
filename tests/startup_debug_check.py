@@ -3,12 +3,20 @@
 X2W_STOP_AT stops at a chosen main-image breakpoint while --continue-asserts steps over the
 others, X2W_DUMP_AT writes thread stacks at a time during the run, and X2W_VALLOC_MIN logs large
 virtual-memory allocations with their callers. The launcher also keeps the debug heap off unless
-the caller sets _NO_DEBUG_HEAP=0. tests/startup_debug_probe.cpp is the only input: it hits two
+the caller sets _NO_DEBUG_HEAP=0. tests/startup_debug_probe.cpp is the main input: it hits two
 breakpoints, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
+
+The gaming-runtime and movie-player call hooks are armed only with --trace-calls 1. For that case
+the probe and tests/startup_debug_calls.cpp are copied into one folder, the DLL under the
+movie-player module name the launcher hooks; the probe calls its export 7 times. The launcher's
+call count must be absent by default and exactly 7 with --trace-calls 1. The fixture's module and
+export names must be among the ones the launcher hooks, so the check cannot pass with nothing hooked,
+and --trace-calls 1 without file tracing must count nothing and say why.
 """
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,9 +50,28 @@ def text(path):
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
 
-def main(probe):
+HOOKED_MODULE = "bink2scarlett.dll"  # the movie-player module name debug_launch.py hooks
+HOOKED_EXPORT = "BinkNextFrame"
+CALLS = 7  # kCalls in tests/startup_debug_probe.cpp
+
+
+def require_hooked(module, export, hooked_module, hooked_exports):
+    """The fixture's DLL must stand in for a module the launcher hooks, and its export must be hooked."""
+    if module != hooked_module or export not in hooked_exports:
+        raise AssertionError(f"{module}!{export} is not hooked by debug_launch.py ({hooked_module}: {hooked_exports})")
+
+
+def main(probe, calls_dll):
     sys.path.insert(0, str(DEBUG.parent))
-    from debug_launch import read_qword
+    from debug_launch import MOVIE_CALL_HOOKS, MOVIE_MODULE, read_qword
+    require_hooked(HOOKED_MODULE, HOOKED_EXPORT, MOVIE_MODULE, MOVIE_CALL_HOOKS)
+    # Control: the guard rejects the fixture once its export is dropped from the hook list.
+    try:
+        require_hooked(HOOKED_MODULE, HOOKED_EXPORT, MOVIE_MODULE, tuple(e for e in MOVIE_CALL_HOOKS if e != HOOKED_EXPORT))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("the hook-list guard accepted an export the launcher does not hook")
     word = bytes.fromhex("ab cd ef 01 23 45 67 89")
     for readable in range(8):
         assert read_qword(lambda address, size: word[:readable], 0) is None
@@ -61,6 +88,7 @@ def main(probe):
         sites = [int(m, 16) for m in re.findall(r"breakpoint at %s\+0x([0-9a-f]+) first-chance" % re.escape(image),
                                                 text(logdir / "events.txt"))]
         assert len(sites) == 2 and sites[0] != sites[1], text(logdir / "events.txt")
+        assert "debugger stop " not in text(logdir / "events.txt")
         assert not (logdir / "threads_stop.txt").exists() and "VALLOC" not in text(logdir / "files.txt")
         # The launcher keeps the debug heap off by default ...
         assert "debug-probe heap flags 0x0\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
@@ -73,6 +101,7 @@ def main(probe):
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})
         assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out and "first chance" in out, out
         events = text(logdir / "events.txt")
+        assert events.splitlines().count("debugger stop 0x80000003 first-chance") == 1, events
         assert f"breakpoint at {image}+{sites[0]:#x}" in events, events
         stacks = text(logdir / "threads_stop.txt")
         assert image in stacks and "rip=" in stacks, stacks
@@ -101,9 +130,32 @@ def main(probe):
         out, logdir = run(probe, work, "valloc-empty", {"X2W_VALLOC_MIN": ""})
         assert "process exited with 0x00000000" in out and " VALLOC " not in text(logdir / "files.txt"), out
 
-    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log, debug heap off; 6 controls)")
+        # Call hooks: off by default, so the 7 export calls stop nothing; with --trace-calls 1 the
+        # launcher counts each of them (the positive control that the probe reaches the hook).
+        folder = work / "calls-bin"
+        folder.mkdir()
+        hooked_probe = Path(shutil.copy2(probe, folder / image))
+        dll = Path(shutil.copy2(calls_dll, folder / HOOKED_MODULE))
+        variables = {"STARTUP_DEBUG_PROBE_DLL": str(dll), "STARTUP_DEBUG_PROBE_EXPORT": HOOKED_EXPORT}
+        banners = {"calls-default": "call tracing: off (", "calls-on": "call tracing: on (",
+                   "calls-no-file-tracing": "call tracing: off: --trace-calls 1 needs file tracing"}
+        for name, extra, want in (("calls-default", (), None),
+                                  ("calls-on", ("--trace-calls", "1"), f"{HOOKED_EXPORT} x{CALLS}"),
+                                  # Requested without file tracing: nothing is armed, and the summary says why.
+                                  ("calls-no-file-tracing", ("--offline", "0", "--trace-calls", "1"), None)):
+            out, logdir = run(hooked_probe, work, name, variables, options=("--continue-asserts", "10", *extra))
+            assert "process exited with 0x00000000" in out, out
+            assert f"debug-probe calls {CALLS}\n" in text(logdir / "stdout.txt"), text(logdir / "stdout.txt")
+            events = text(logdir / "events.txt")
+            assert re.search(r" load %s at " % re.escape(HOOKED_MODULE), events, re.I), events
+            found = re.search(r"bink calls: (.*)", out)
+            assert (found.group(1).strip() if found else None) == want, (name, out)
+            assert banners[name] in out, (name, out)
+
+    print("startup_debug: PASS (stop at a chosen assert, timed thread dump, large-allocation log, debug heap off, "
+          "call hooks opt-in; 9 controls)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main(*sys.argv[1:3]))

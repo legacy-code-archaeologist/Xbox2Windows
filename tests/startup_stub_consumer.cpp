@@ -280,7 +280,7 @@ bool dstorage_error_record_checks()
     failing.enqueue(first);
     failing.enqueue(next);
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "event signaled before Submit")) return false;
-    if (!check(failing.submit() == E_FAIL && first_dest == sentinel && next_dest == sentinel,
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && first_dest == sentinel && next_dest == sentinel,
                "out-of-range requests failed and preserved their destinations")) return false;
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0 &&
                WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "failed request did not leave the error event signaled"))
@@ -317,7 +317,7 @@ bool dstorage_error_record_checks()
                "expected two failures and an intact guard") ||
         !check(rec::read<std::int32_t>(record, rec::command_type) == rec::command_request,
                "first failure's CommandType is not DSTORAGE_COMMAND_TYPE_REQUEST") ||
-        !check(rec::read<HRESULT>(record, rec::hresult) == E_FAIL && rec::read<u64>(record, rec::options) == first.options &&
+        !check(rec::read<HRESULT>(record, rec::hresult) == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) && rec::read<u64>(record, rec::options) == first.options &&
                rec::read<void*>(record, rec::destination) == first.destination &&
                rec::read<std::uint32_t>(record, rec::destination_size) == first.destination_size &&
                rec::read<u64>(record, rec::file_offset) == first.file_offset &&
@@ -340,12 +340,12 @@ bool dstorage_error_record_checks()
     static_assert(sizeof long_name - 1 == 70);
     const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, long_name};
     failing.enqueue(too_small);
-    if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
+    if (!check(failing.submit() == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && memory == sentinel, "short memory destination was not refused") ||
         !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
     const unsigned char* memory_failure = retrieve(failing);
     return check(rec::read<std::uint32_t>(memory_failure, rec::failure_count) == 1 &&
                  rec::read<std::int32_t>(memory_failure, rec::command_type) == rec::command_request &&
-                 rec::read<HRESULT>(memory_failure, rec::hresult) == E_FAIL &&
+                 rec::read<HRESULT>(memory_failure, rec::hresult) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
                  rec::read<u64>(memory_failure, rec::options) == too_small.options &&
                  rec::read<void*>(memory_failure, rec::destination) == too_small.destination &&
                  rec::read<std::uint32_t>(memory_failure, rec::destination_size) == too_small.destination_size &&
@@ -740,7 +740,7 @@ bool dstorage_checks() {
         bool bounds_ok = true;
         for (unsigned i = 0; i < 3; ++i) {
             const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
-            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            bounds_ok &= hr == (i == 1 ? HRESULT_FROM_WIN32(ERROR_HANDLE_EOF) : S_OK);
             for (unsigned j = 0; j < 6; ++j)
                 bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
         }
@@ -1836,7 +1836,8 @@ bool dstorage_directory_batches()
     const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
     for (unsigned i = 0; i < 2; ++i)
         if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
-    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    const unsigned char queue_description[0x28] = {};
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, queue_description, nullptr, &object)) return false;
     auto* queue = static_cast<Object*>(object);
     const unsigned count = static_cast<unsigned>(requests.size());
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;
@@ -1873,6 +1874,68 @@ bool dstorage_directory_batches()
     return readback.good();
 }
 
+using FileInformationFn = long(__stdcall*)(void*, BY_HANDLE_FILE_INFORMATION*);
+
+// File::GetFileInformation must return the Win32 error of its own failed call, not the error left by the
+// logging that follows. Runs the same sequence with the trap-log variable unset and set, because the stand-in's
+// logger calls GetEnvironmentVariableW (and CreateFileW when the variable is set), and both overwrite the
+// thread's last error. A closed file object keeps its vtable and holds INVALID_HANDLE_VALUE, so the call is
+// well defined and must fail with ERROR_INVALID_HANDLE.
+bool dstorage_file_information_checks()
+{
+    HMODULE library = LoadLibraryW(L"XCRDAPI.dll");
+    if (!library) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(library, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH], log_file[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp_dir) || !GetTempFileNameW(temp_dir, L"x2w", 0, temp_file) ||
+        !GetTempFileNameW(temp_dir, L"x2w", 0, log_file))
+        return false;
+    constexpr DWORD size = 1234;
+    HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> bytes(size, 0x5a);
+    DWORD written = 0;
+    const bool wrote = WriteFile(h, bytes.data(), size, &written, nullptr) && written == size;
+    CloseHandle(h);
+    if (!wrote) {
+        DeleteFileW(temp_file);
+        return false;
+    }
+
+    bool ok = true;
+    for (const bool log_set : {false, true}) {
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_set ? log_file : nullptr);
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            ok = false;
+            break;
+        }
+        auto* file = static_cast<Object*>(file_ptr);
+        auto information = reinterpret_cast<FileInformationFn>(file->vtable[4]);
+        BY_HANDLE_FILE_INFORMATION info{};
+        const long open_hr = information(file, &info);
+        const bool open_ok = open_hr == S_OK && info.nFileSizeHigh == 0 && info.nFileSizeLow == size;
+        reinterpret_cast<CloseFileFn>(file->vtable[3])(file);
+        SetLastError(0);
+        const long closed_hr = information(file, &info);
+        const long expected = HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
+        const bool closed_ok = closed_hr == expected;
+        std::printf("file-information log=%s open: hr=0x%08lx size=%lu %s; closed: hr=0x%08lx expected=0x%08lx %s\n",
+                    log_set ? "set" : "unset", static_cast<unsigned long>(open_hr), info.nFileSizeLow,
+                    open_ok ? "ok" : "MISMATCH", static_cast<unsigned long>(closed_hr),
+                    static_cast<unsigned long>(expected), closed_ok ? "ok" : "MISMATCH");
+        ok = ok && open_ok && closed_ok;
+    }
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
+    DeleteFileW(temp_file);
+    DeleteFileW(log_file);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1902,6 +1965,11 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage-file-information")) {
+        if (!dstorage_file_information_checks()) return 10;
+        std::puts("dstorage-file-information ok");
         return 0;
     }
     if (!std::strcmp(which, "dstorage-status-initial")) {

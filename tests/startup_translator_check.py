@@ -98,6 +98,9 @@ class StubPipeline:
     def manifest(self):
         return 'manifest\n'
 
+    def ps_profile(self):
+        return 'ps_5_1'
+
 
 @contextlib.contextmanager
 def fxc_environment(work, configured, kits, path=''):
@@ -210,7 +213,7 @@ def check_pending_manifest_upgrade(failures):
             return subprocess.CompletedProcess(command, 0, '', '')
 
         def pending(configured):
-            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {})
+            request = ({'vs': b'', 'ps': b''}, b'', (), '', None, {}, None)
             with fxc_environment(work, configured, os.path.join(work, 'none')), \
                  mock.patch.object(sys, 'argv', ['gfx2hlsl.py', '--pending', work]), \
                  mock.patch.object(gfx2hlsl, 'load_request', return_value=request), \
@@ -258,11 +261,9 @@ def check_pending_manifest_upgrade(failures):
         ps.unlink()
         with mock.patch.object(StubPipeline, 'manifest', return_value='updated bindings\n'):
             with mock.patch.object(os, 'replace', side_effect=reject_manifest_publish):
-                try:
-                    pending(str(fxc))
-                except PermissionError:
-                    pass
-                else:
+                # translate_one records unexpected I/O errors as <key>.fail instead of ending the scan.
+                result = pending(str(fxc))
+                if 'translator error: PermissionError' not in result:
                     failures.append('pending did not attempt to publish the changed manifest')
             if manifest.exists():
                 failures.append('failed publication left an old manifest beside the new bytecode')
