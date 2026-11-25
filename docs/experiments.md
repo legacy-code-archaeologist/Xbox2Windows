@@ -15004,4 +15004,13 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_off_vcchi$' -V
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_image_1d$' -V
+## Startup translator: v_mad_u32_u16
+
+[`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the unmodified gfx1013 VOP3A instruction `v_mad_u32_u16` (`0x373` in [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py)) via `VEC_U` as `({0} & 0xffffu) * ({1} & 0xffffu) + {2}` (unsigned 32-bit wraparound). In `Stage.lower`, `S0` and `S1` are read with `low16_only=True` because only bits `[15:0]` of those operands are consumed (allowing odd-dmask `d16` `image_load` results in `S0`/`S1` and clearing `low16_only_v` on the 32-bit destination), while `S2` is read with `low16_only=False` (refusing `low16_only_v` sources) so all 32 bits of the addend are preserved. Modifiers (`op_sel`, `clamp`, `omod`, `abs`, `neg`) and wrong operand counts remain refused.
+
+[`tests/startup_gfx2hlsl_mad_u32_u16_check.py`](../tests/startup_gfx2hlsl_mad_u32_u16_check.py) decodes synthetic gfx1013 VOP3A bytes for 4-lane VGPR forms as well as literal/inline-constant/SGPR forms (`v_mad_u32_u16 v1, 0x1f0, v15, 0`, `v_mad_u32_u16 v3, s4, -1, v9`, `v_mad_u32_u16 v2, v5, 7, 0x12345678`), evaluates the emitted HLSL expressions over 1,800 32-bit input triples (including upper-16 garbage bits `0xffff0000` in `S0`/`S1`, `0xffff * 0xffff`, 32-bit wraparound with `S2 = 0xffffffff`, and upper-bit preservation on `S2`) against `((s0 & 0xffff) * (s1 & 0xffff) + s2) & 0xffffffff`, checks the `low16_only` read/clear/refusal rules, checks `op_sel`/`clamp`/`omod`/`abs`/`neg`/arity refusals and the unlowered-table negative control, and verifies three HLSL mutations (`drop_s0_mask`, `drop_s1_mask`, `mask_s2`). In `draw` mode, both FXC (`vs_5_1`/`ps_5_1`, Windows SDK 10.0.26100) and DXC (`vs_6_0`/`ps_6_0`, Windows SDK 10.0.26100) passed 3 four-lane chunks and all 3 mutated draws on Microsoft WARP (`10.0.26100.9818`). Tests: `startup_gfx2hlsl_mad_u32_u16_controls`, `startup_gfx2hlsl_mad_u32_u16_warp`, `startup_gfx2hlsl_mad_u32_u16_hardware` (not run on physical hardware here).
+
+```powershell
+python -B tests/startup_gfx2hlsl_mad_u32_u16_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_u32_u16_' -V
 ```
