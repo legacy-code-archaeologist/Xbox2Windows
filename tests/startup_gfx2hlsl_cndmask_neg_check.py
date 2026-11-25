@@ -157,15 +157,10 @@ check('NEG on two immediates in the same instruction',
 check('a clamp on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, clamp=1)))
 check('a mul:2 on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, omod=1)))
 
-# 8. Source absolute values and a negated mask reach `u()`/`u_src()` as text they cannot model, and are
-#    refused. llvm-mc rejects all three spellings, so they are decoder-produced words only; the property
-#    under test is that production refuses the printed operand rather than translating it.
-check('an absolute value on the first source is refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1)))
-check('an absolute value on the second source is refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs1=1)))
-check('absolute values on both sources are refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1, abs1=1)))
+# 8. A negated mask, ABS on an immediate, and ABS on another integer op stay refused; source ABS on
+#    v_cndmask_b32_e64 registers is lowered and tested by startup_gfx2hlsl_cndmask_abs_check.py.
+check('an absolute value on another integer op stays refused',
+      refused(encode_vop2_e64(AND_B32, 1, V30, V30, abs1=1)))
 check('a negated mask is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, neg_mask=1)))
 
 check('ABS on an inline immediate is refused',
