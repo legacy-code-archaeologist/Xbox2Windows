@@ -267,6 +267,8 @@ class Expr:
             return v, True
         if name in ('asuint', 'uint'):
             return v, False
+        if name == 'abs':
+            return (-v if v & 0x80000000 else v) & MASK, True
         if name == 'min':
             assert not s and not rest[0][1]
             return min(v, rest[0][0]), False

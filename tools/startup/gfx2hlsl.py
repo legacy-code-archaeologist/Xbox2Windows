@@ -2640,12 +2640,13 @@ class Stage:
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
-        word_pack = (base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_flbit_i32_b32')
+        word_pack = (base in PACK_B16 or base in ('s_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_flbit_i32_b32')
                      or base in SCA_WORD_ONLY)
+        word_absdiff = base == 's_absdiff_i32'
         if base in SCA_RMW_DEST:
             # The old destination is the first source of the expression.
             srcs = [dname] + srcs
-        if shift_add or base == 's_xnor_b32' or word_pack or base == 's_ff0_i32_b32':
+        if shift_add or base == 's_xnor_b32' or word_pack or base == 's_ff0_i32_b32' or word_absdiff:
             # The per-lane mask cannot supply the full word needed by these operations. s_nand_b32 and
             # s_nor_b32 on a lane mask act on each lane's own bit, like s_and_b32 and s_or_b32.
             # s_mul_hi_u32 into an SGPR that held a mask replaces it with a plain word (set_s drops the
@@ -2688,7 +2689,7 @@ class Stage:
                 self.scc_effect = 'descriptor'
                 if self.tracks_uniformity():
                     self.scc_uniform = False
-            if shift_add or word_complement:
+            if shift_add or word_complement or word_absdiff:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
@@ -5781,6 +5782,7 @@ SCC_CARRY = {
 }
 SCC_CARRY_IN = frozenset(('s_addc_u32', 's_subb_u32'))
 
+PACK_B16 = frozenset(('s_pack_ll_b32_b16', 's_pack_lh_b32_b16', 's_pack_hh_b32_b16'))
 SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
     's_and_b32': ('{0} & {1}', '$ != 0'), 's_or_b32': ('{0} | {1}', '$ != 0'), 's_xor_b32': ('{0} ^ {1}', '$ != 0'),
@@ -5811,6 +5813,11 @@ SCA = {
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_flbit_i32_b32: leading zero count of S0, all ones when S0 is 0; SCC unchanged.
     's_flbit_i32_b32': ('({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))', None),
+    # s_pack_*_b32_b16: two halfwords of the sources into one word; SCC unchanged.
+    's_pack_ll_b32_b16': ('({0} & 0xffffu) | ({1} << 16)', None),
+    's_pack_lh_b32_b16': ('({0} & 0xffffu) | ({1} & 0xffff0000u)', None),
+    # s_absdiff_i32: D = S0 - S1 wrapped to 32 bits, negated if negative (INT_MIN stays); SCC = result != 0.
+    's_absdiff_i32': ('asuint(abs(asint({0} - {1})))', '$ != 0'),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
     # s_lshlN_add_u32: low 32 bits of (S0 << N) + S1. SHIFT_ADD also supplies SCC for wide overflow.
