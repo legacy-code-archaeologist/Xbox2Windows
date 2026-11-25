@@ -4741,6 +4741,8 @@ class Stage:
                               % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'null':
+            return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
             if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
                     or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
@@ -5789,7 +5791,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
 
 def classify_decoded(ins):
     text = ' '.join(x[3] for x in ins if x[2] == 'exp')
-    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'  # no export: a depth-only pixel shader
+    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or 'null' in text or not text else 'other'  # no export: a depth-only pixel shader
 
 
 def classify(blob):

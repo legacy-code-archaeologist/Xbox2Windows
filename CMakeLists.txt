@@ -2877,6 +2877,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # +-0, denormals, +-1, +-max, +-inf and NaNs against the ISA reference; the old != lowering must fail.
     add_test(NAME startup_gfx2hlsl_f32_lg COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_lg_check.py")
+    # exp null (#1723, Run 20 census #11): the null export writes nothing and keeps the vm discard.
+    add_test(NAME startup_gfx2hlsl_export_null COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_null_check.py")
     # f32 nlt/nle/ngt/nge, o and u hold under FXC's and DXC's rewrites of float compares without -Gis (#1936).
     add_test(NAME startup_gfx2hlsl_f32_nan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_nan_check.py")
