@@ -4196,7 +4196,7 @@ class Stage:
         # UNORM only changes how a sampler normalizes the address; a store addresses integer texels, and the RDNA 2 ISA
         # (MIMG fields) requires UNORM = 1 on image stores and atomics, so it is accepted like on image_load.
         # A16 on a 2D store packs x in bits 15:0 and y in bits 31:16 of one address VGPR (as for image_load).
-        packed_2d = not d16 and 'a16' in mods
+        packed_2d = self.kind == 'ps' and 'a16' in mods  # tested in the pixel stage only
         for m in mods:
             if d16 and m == 'd16':
                 continue
