@@ -5410,6 +5410,44 @@ VEC_U = {
 }
 SCA_RMW_DEST = ('s_bitset0_b32', 's_bitset1_b32')
 SCA_WORD_ONLY = SCA_RMW_DEST + ('s_ff1_i32_b32',)
+
+
+def _mul24_hi_i32():
+    """High 32 bits of the 48-bit product of two signed 24-bit fields, in 32-bit integer arithmetic.
+
+    With a = ah * 2^12 + al (al in 0..4095, ah the sign-extended top 12 bits) the product is
+    hh * 2^24 + mid * 2^12 + lo, so p >> 12 = hh * 2^12 + t with t = mid + (lo >> 12), and
+    p >> 32 = (hh + (t >> 12)) >> 8 exactly (floor division nests), which stays inside 32 bits.
+    """
+    def top(n):
+        return '(asint({%d} << 8) >> 20)' % n
+
+    def low(n):
+        return 'asint({%d} & 0xfffu)' % n
+    hh = '(%s * %s)' % (top(0), top(1))
+    mid = '(%s * %s + %s * %s)' % (top(0), low(1), low(0), top(1))
+    t = '(%s + ((%s * %s) >> 12))' % (mid, low(0), low(1))
+    return 'asuint(((%s + (%s >> 12)) >> 8))' % (hh, t)
+
+
+VEC_U.update({
+    # AMD RDNA 2 ISA reference: the 24-bit multiplies read the low 24 bits of each source, the signed forms as a
+    # two's complement field. The mul and mad forms keep the low 32 bits of the product; the hi forms keep bits 63..32
+    # of the 48-bit product. The 24-bit field is sign-extended with a left shift of 8 and an arithmetic right shift.
+    'v_mul_i32_i24': (2, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8))'),
+    'v_mad_i32_i24': (3, 'asuint((asint({0} << 8) >> 8) * (asint({1} << 8) >> 8)) + {2}'),
+    # v_mul_hi_u32_u24 is deliberately not lowered. Its result is at most 0xffff, so as a float output word it is
+    # always a binary32 denormal, and FXC 10.0.26100 at ps_5_1 (the startup path) folds a float output whose
+    # provable range lies below 0x00800000 to a constant zero (any form tried, even a plain shift without a
+    # product). The same words through a uint4 output survive, and DXC keeps them. v_mul_hi_i32_i24 can reach
+    # the whole 32-bit range, so FXC keeps it. A refusal is visible; zeros are not.
+    'v_mul_hi_i32_i24': (2, _mul24_hi_i32()),
+    'v_xnor_b32': (2, '~({0} ^ {1})'),
+    # v_alignbit_b32 takes bits [S2[4:0] + 31 : S2[4:0]] of the 64-bit value {S0, S1}; a zero shift returns S1 and
+    # the guard avoids a shift by 32. v_alignbyte_b32 does the same with S2[1:0] * 8 bits.
+    'v_alignbit_b32': (3, '(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))'),
+    'v_alignbyte_b32': (3, '(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - ({2} & 3u) * 8u))))'),
+})
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
 # no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
