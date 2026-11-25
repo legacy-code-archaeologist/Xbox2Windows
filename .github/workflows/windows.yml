@@ -83,6 +83,7 @@ jobs:
               (["tests/startup_gfx2hlsl_scalar_m0_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_cmp16_check.py", "binary", "llvm-mc-15", "llvm-objcopy-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_b_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_lod_check.py", "binary", "llvm-mc-15"], {}),
@@ -252,6 +253,7 @@ jobs:
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
+            tests/startup_gfx2hlsl_cmp16_check.py \
             tests/startup_gfx2hlsl_sdwa_cvt_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_gfx2hlsl_sopk_accum_check.py \

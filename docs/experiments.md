@@ -13309,6 +13309,37 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_control
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_add_sub_co_controls$' -V
 ```
 
+## Startup translator: 16-bit integer compares
+
+`tools/startup/gfx2hlsl.py` matched only the f32, i32 and u32 VOPC compares, so `v_cmp_*_i16`, `v_cmp_*_u16`, `v_cmpx_*_i16` and `v_cmpx_*_u16` were refused as unknown instructions. It now lowers the six relations `lt`, `eq`, `le`, `gt`, `ne` and `ge` (gfx10 has no 16-bit `f` or `t`) in the `_e32` and `_e64` encodings: 24 `v_cmp` and 24 `v_cmpx` forms. Following the AMD RDNA 2 ISA guide, each source is bits 15:0 of the operand, compared as `S0.i16` or `S0.u16`. An i16 register reads as `asint(x << 16u) >> 16u` and a u16 register as `x & 0xffffu`. LLVM 15 models the same: for gfx1013, `icmp slt i16` of two truncated 32-bit values selects `v_cmp_lt_i16_e32` on the whole VGPRs, and it encodes the literal `0xffff` on these operands as the inline constant -1. Sources are a VGPR, an SGPR, an inline integer from -16 to 64, or a literal up to `0xffff`. The destinations are the same as for the 32-bit integer compares: `vcc`, an SGPR lane mask, or EXEC for `v_cmpx`, intersected with EXEC when EXEC is not known.
+
+The following are refused:
+
+- Inline float constants. On a 16-bit operand they are binary16 values (LLVM 15 prints inline `1.0` there as `0x3c00`), while the translator would read the binary32 word.
+- Wider literals, register ranges, and `vcc`, `exec` or `m0` as a source.
+- `op_sel` and `clamp`.
+- The NEG and ABS bits of the `_e64` form, checked in the raw word. The disassembler prints NEG on inline 1 as `-1`, the same text as inline -1.
+- The SDWA forms. `tools/pixel_aot.py` keeps its own lowering of these compares, including SDWA (see the VOPC SDWA and 16-bit integer comparison paragraphs under [Pixel color without a texture sample](#pixel-color-without-a-texture-sample)); the startup translator does not use it.
+
+`tests/startup_gfx2hlsl_cmp16_check.py` has three modes:
+
+- **Controls.** It decodes 60 synthetic cases (12 `v_cmp` e32 into `vcc`, 12 e64 into `vcc_lo`, 12 e64 into `s4`, 24 `v_cmpx` into EXEC) and evaluates the emitted HLSL with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`. The inputs are words whose high halves carry junk and whose low halves include `0x8000`, `0x7fff`, `0xffff` and equal halves. The references are written with plain integer arithmetic from the ISA meaning. It also checks SGPR, inline and literal operands, the EXEC intersection and 71 refusals. A last control covers the unused `s0` that the disassembler prints for an `_e64` `v_cmpx`: a value set in `s0` before the compare still reads back after it, as for the 32-bit form.
+- **`binary`.** It assembles all 105 control forms and five fixtures with LLVM (`-filetype=obj`, `.text` extracted with `llvm-objcopy`) and compares the words. It also pins that LLVM encodes the literal `0xffff` on an i16 operand as inline -1.
+- **`draw`.** It draws three source-built pixel programs on 16 x 16 pixels, with FXC `ps_5_1` and DXC `ps_6_0`. The programs derive two words from the packed position, the second with junk in the high half and sometimes bit 15 and low bits flipped. They are a `v_cmpx_le_i16_e32` kill, a `v_cmpx_gt_u16_e64` kill, and all six relations of the i16 and u16 e32 forms and of the e64 forms with the constants -16 and `0x8000`, folded into mask words. Two mutated translations must each fail against the reference and match their own image: an i16 register read zero-extended, and a u16 register read as the whole word.
+
+On `43608f2e` plus the changes described here, the controls and draws passed on Windows 11 build 10.0.26100 with the debug layer unavailable. The binary mode passed locally with the official LLVM 15.0.7 Windows build, which ships no `llvm-mc`: a local wrapper passed the `llvm-mc` arguments to that build's integrated assembler (`clang -cc1as`), and its `llvm-objcopy` extracted `.text`. The CI LLVM 15 job runs the same mode with `llvm-mc-15`; that run is not measured yet. The draws ran on:
+
+- WARP (Microsoft Basic Render Driver 10.0.26100.8972).
+- NVIDIA Quadro M1000M (driver 32.0.15.7371), the default hardware adapter.
+- Intel HD Graphics 530 (driver 31.0.101.2111), selected with `XBOX2WINDOWS_ADAPTER=Intel`.
+
+On `417a101c` without the translator change, the controls stop at the first translated case with `Unsupported: v_cmp_eq_i16`. The draws check the translated HLSL on desktop adapters against the reference. No gfx1013 hardware run checks these instructions. Tests: `startup_gfx2hlsl_cmp16_controls`, `startup_gfx2hlsl_cmp16_warp` and `startup_gfx2hlsl_cmp16_hardware`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp16_' -V
+python -B tests/startup_gfx2hlsl_cmp16_check.py binary <llvm-mc> <llvm-objcopy>
+```
+
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)

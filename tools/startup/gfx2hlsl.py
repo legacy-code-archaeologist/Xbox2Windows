@@ -342,6 +342,13 @@ def check_encoding(code, off, n, name, asm):
             raise Unsupported('image_load_mip tfe')
         if word1 & (1 << 30):
             raise Unsupported('image_load_mip a16')
+    if re.fullmatch(r'v_cmpx?_(lt|eq|le|gt|ne|ge)_[iu]16_e64', name):
+        # The decoder prints NEG on an inline integer as a sign (inline 1 with NEG reads `-1`, the same text as
+        # inline -1), and LLVM 15 rejects `-v1` and `|v1|` on these sources: refuse either bit (VOP3 w0[10:8] ABS,
+        # w1[31:29] NEG) so a printed -N is always a genuine inline integer.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        if word0 & 0x700 or word1 & 0xe0000000:
+            raise Unsupported('%s with neg/abs: not a 16-bit integer source modifier' % name)
     if name == 'v_cndmask_b32_e64':
         # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -3977,6 +3984,30 @@ class Stage:
                 reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
             raise Unsupported('%s into %s' % (base, ops[0]))
 
+    def _low16_source(self, base, tok, signed):
+        """A source of a 16-bit integer compare: bits 15:0 of the operand, sign- or zero-extended (RDNA 2 VOPC
+        S0.i16 / S0.u16). A float token is refused: on a 16-bit operand the inline constants 240-248 are binary16
+        values (LLVM 15 prints inline 1.0 there as 0x3c00), while u() would give the binary32 word."""
+        if tok in FLOATS:
+            raise Unsupported('%s source %s: inline float constants are binary16 on 16-bit operands' % (base, tok))
+        reg = reg_range(tok)
+        if reg:
+            if reg[1] != reg[2]:
+                raise Unsupported('%s source %s' % (base, tok))
+            x = self.u(tok, low16_only=True)
+            return '(asint(%s << 16u) >> 16u)' % x if signed else '(%s & 0xffffu)' % x
+        try:
+            value = int(tok, 0)
+        except ValueError:
+            # vcc, exec, m0 and modifier spellings: not a source this lowering reads.
+            raise Unsupported('%s source %s' % (base, tok))
+        # The decoder prints inline integers -16..64 in decimal and a literal in hex; LLVM 15 accepts only 16-bit
+        # literals on these operands.
+        if not -16 <= value <= 0xffff:
+            raise Unsupported('%s source %s: wider than 16 bits' % (base, tok))
+        low = value & 0xffff
+        return '%d' % (low - 0x10000 if low & 0x8000 else low) if signed else '0x%04xu' % low
+
     def compare(self, base, ops, mods=()):
         # A comparison reads its two operands directly, so a modifier that arrives here is one this
         # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
@@ -4052,10 +4083,14 @@ class Stage:
                 self.masks.add(d)
             return None
 
-        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
+        # The 16-bit integer compares have the six relations only (gfx10 has no 16-bit f or t). Their SDWA forms
+        # are not lowered here (tools/pixel_aot.py has its own lowering of them).
+        if typ in ('i16', 'u16') and (sdwa or cond not in ('lt', 'eq', 'le', 'gt', 'ne', 'ge')):
+            raise Unsupported(base)
         # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
         # tested on their bits. DXC marks float compares fast unless -Gis, and a driver may then fold
@@ -4085,6 +4120,8 @@ class Stage:
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
+        elif typ in ('i16', 'u16'):
+            x, y = (self._low16_source(base, t, typ == 'i16') for t in (a, b))
         else:
             x, y = self.u(a), self.u(b)
         def word(tok):

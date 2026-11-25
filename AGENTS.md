@@ -226,6 +226,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sgpr_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
