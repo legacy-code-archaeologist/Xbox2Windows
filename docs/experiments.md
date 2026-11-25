@@ -14425,3 +14425,13 @@ that names one value (a pointer only if no add touched it), is read at run time 
 read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.
+
+## `src_scc` as a scalar source
+
+`s_mul_i32 s28, 1.0, src_scc` was refused as `operand 'src_scc'` (issue #1820), one of the refused shaders
+in the loading-screen cache (#870). Scalar source code 253 reads the SCC bit as the integer value 0 or 1, and
+the generated shader already carries SCC as a `bool scc`, so the source lowers to `(scc ? 1u : 0u)` -
+`s28 = 0x3f800000u * (scc ? 1u : 0u);` for the census form, which multiplies the raw bits of the inline
+float 1.0 by that bit. It works in either source position and through the same path for every scalar
+operate that reads its sources as integers. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc$' -V`.
