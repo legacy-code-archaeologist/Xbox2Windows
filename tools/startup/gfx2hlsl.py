@@ -2639,6 +2639,9 @@ class Stage:
                               for t in srcs) and base.split('_')[1] in ('mov', 'and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor', 'xnor', 'not', 'cselect')
         if base in ('s_mov_b32', 's_mov_b64', 's_movk_i32') and re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', srcs[0]) and srcs[0] not in FLOATS:
             value = int(srcs[0], 0)
+            if base == 's_movk_i32' and 0x8000 <= value <= 0xffff:
+                value -= 0x10000  # the 16-bit immediate is sign-extended into the SGPR
+                values = ['0x%08xu' % (value & 0xffffffff)] + list(values[1:])
             self.set_s(d, values[0], ('const', value & 0xffffffff))
             if pair:
                 self.set_s(d + 1, '0x%08xu' % ((value >> 32) & 0xffffffff), ('const', (value >> 32) & 0xffffffff))
@@ -2928,6 +2931,18 @@ class Stage:
                 self.used_s = saved
         raise Unsupported('operand %r' % tok)
 
+    def const_soffset(self, tok):
+        """The constant held by an SMEM offset register s0..s105, or None (m0 and unknown values)."""
+        r = reg_range(tok)
+        # Symbols are not merged at control-flow joins, so a constant proves the runtime value only without branches.
+        if getattr(self, 'has_branches', True):
+            return None
+        if r and r[0] == 's' and r[1] == r[2] and r[1] <= 105:
+            value = self.is_const(r[1])
+            if value is not None and 0 <= value <= 0xfffff:
+                return value
+        return None
+
     def op_s_load_dwordx4(self, ops, mods, count=4):
         imm = smem_mods(mods)
         if len(ops) != 3:
@@ -2950,6 +2965,14 @@ class Stage:
         base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
+        known = self.const_soffset(token) if p[1] != ('smpheap',) else None
+        if known is not None:
+            # A register offset that holds a known constant (s_movk before the load) is that literal byte
+            # offset; the modifier adds to it. This reaches descriptors in a bindless heap (#1723).
+            total = known + (imm or 0)
+            if total > 0xfffff:
+                raise Unsupported('SMEM register offset %#x' % total)
+            token, imm = str(total), None
         if re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|\d+)', token):
             off = int(token, 0)
             if off < 0 or off > 0xfffff:
