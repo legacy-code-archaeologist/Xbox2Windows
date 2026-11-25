@@ -14992,4 +14992,16 @@ Translation-only checks, no GPU run, so the draw result with a partial write mas
 ```bash
 python3 -B tests/startup_gfx2hlsl_off_vcchi_check.py
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_off_vcchi$' -V
+## Explicit-level 1D image sampling in the startup translator
+
+[The startup translator](../tools/startup/gfx2hlsl.py) now lowers 1D `image_sample_lz` and `image_sample_l` onto `Texture1D.SampleLevel` alongside the existing implicit-level `image_sample` path (#1721):
+
+- `image_sample_lz` takes one address dword (`u`) and lowers to `tex.SampleLevel(smp, F(u), 0)`.
+- `image_sample_l` takes two address dwords (`u`, then the explicit `lod`) and lowers to `tex.SampleLevel(smp, F(u), F(lod))`.
+- Both explicit-level forms require a non-empty `dmask` and accept only `dim:SQ_RSRC_IMG_1D`, `dmask:*`, and the cache-policy modifiers (`glc`, `slc`, `dlc`). Plain `image_sample` on 1D keeps its existing rule (still refusing cache-policy bits), and layout or address modifiers (`unorm`, `r128`, `a16`, `d16`, `tfe`, `lwe`, reserved bits), wrong address counts, empty `dmask`, `image_sample_b`, and `image_load` on 1D stay refused.
+
+[The 1D image check](../tests/startup_gfx2hlsl_image_1d_check.py) builds synthetic MIMG instructions against the decoder layout and verifies `image_sample_lz`, `image_sample_l`, plain `image_sample`, 2D separation, cache-policy equivalence, empty `dmask`, and refused forms. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_image_1d$' -V
 ```
