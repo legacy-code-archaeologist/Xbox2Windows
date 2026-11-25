@@ -2740,6 +2740,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+    if(STARTUP_FXC)
+        # The v_fma_mix* translations from startup_gfx2hlsl_fma_mix, compiled for ps_5_1.
+        add_test(NAME startup_gfx2hlsl_fma_mix_fxc COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py" fxc "${STARTUP_FXC}")
+    endif()
     # gfx2hlsl conversion operations: translation controls, then a draw of the translated pairs with
     # reference words and one mutated lowering per operation (v_cvt_f16_f32 through DXC only).
     # Compute translator: integer inequality lane guards.

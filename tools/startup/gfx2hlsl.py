@@ -3020,12 +3020,12 @@ class Stage:
                 raise Unsupported('fma_mix modifier %s' % m)
 
         def operand(tok, is_half, is_hi):
+            if not is_half and is_hi:
+                raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)
             if tok == '-0':
                 # neg on inline 0 is -0.0 in either format; f() would print +0.0, which changes a -0 product.
                 return '(-0.0)'
             if not is_half:
-                if is_hi:
-                    raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)
                 if tok.startswith('--') and tok[1:] in FLOATS:
                     # neg on a negative inline float prints as `--0.5`; `(--0.5)` is an HLSL decrement.
                     return '(-(%s))' % self.f(tok[1:])
@@ -3044,7 +3044,8 @@ class Stage:
             if tok == '0':
                 text = '0.0'
             elif r and r[1] == r[2]:
-                # ponytail: binary16 literals and inline floats stay refused; their half encoding is unverified.
+                # Binary16 literals and inline floats stay refused: their half encoding is unverified.
+                # Only a high-half read needs the upper 16 bits defined.
                 text = 'f16tof32(%s%s)' % (self.u(tok, low16_only=not is_hi), ' >> 16' if is_hi else '')
             else:
                 raise Unsupported('binary16 fma_mix source %s' % tok)

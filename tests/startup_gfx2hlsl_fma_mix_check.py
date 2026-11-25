@@ -1,6 +1,9 @@
 """Mixed-precision VOP3P FMA (`v_fma_mix_f32`, `v_fma_mix{lo,hi}_f16`) in tools/startup/gfx2hlsl.py.
 
-usage: startup_gfx2hlsl_fma_mix_check.py
+usage: startup_gfx2hlsl_fma_mix_check.py [fxc <path to fxc.exe>]
+
+With `fxc`, every translated line is also compiled for ps_5_1 (the profile the startup tools use),
+so emitted text that is not valid HLSL fails here and not only in a later draw.
 
 `v_fma_mix_f32` was refused outright (58 code pairs in the #1723 refusal snapshot). It now shares
 `Stage.mix()` with the two binary16-destination forms.
@@ -18,8 +21,11 @@ The instruction bytes are **constructed here** from the VOP3P layout the checked
   w1: [8:0] src0, [17:9] src1, [26:18] src2, [28:27] op_sel_hi[1:0], [31:29] neg (neg_lo)
 """
 import os
+import re
 import struct
+import subprocess
 import sys
+import tempfile
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -27,6 +33,7 @@ sys.path.insert(0, os.path.join(here, '..', 'tools', 'startup'))
 import gfx2hlsl as G  # noqa: E402
 
 failures = []
+translated = []   # every emitted line, compiled together in fxc mode
 
 MIX_F32, MIXLO_F16, MIXHI_F16 = 0x20, 0x21, 0x22
 V = 0x100            # VGPR source base
@@ -68,34 +75,36 @@ class Pipeline:
 class Stage(G.Stage):
     """A Stage with no pipeline: enough state for a decoded instruction to be translated."""
 
-    def __init__(self):
+    def __init__(self, low16_only_v=()):
         self.lines, self.sym = [], {}
+        self.low16_only_v = set(low16_only_v)
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.exec_known = True
         self.exports = {}
         self.pipe = Pipeline()
 
 
-def translate(code):
+def translate(code, low16_only_v=()):
     decoded = G.decode(code)
-    stage = Stage()
+    stage = Stage(low16_only_v)
     for _offset, _size, name, asm in decoded:
         stage.one(name, asm)
     return ' | '.join(asm for _o, _s, _n, asm in decoded), ' '.join(stage.lines)
 
 
-def expect(label, code, asm, hlsl):
-    got_asm, got = translate(code)
+def expect(label, code, asm, hlsl, low16_only_v=()):
+    got_asm, got = translate(code, low16_only_v)
+    translated.append(got)
     check(label + ' (decode)', got_asm == asm, f'got {got_asm!r}')
     check(label, got == hlsl, f'got {got!r}\n  want {hlsl!r}')
     return got
 
 
-def expect_refused(label, code, asm):
+def expect_refused(label, code, asm, low16_only_v=()):
     decoded = G.decode(code)
     check(label + ' (decode)', decoded[0][3] == asm, f'got {decoded[0][3]!r}')
     try:
-        _asm, got = translate(code)
+        _asm, got = translate(code, low16_only_v)
     except G.Unsupported as e:
         check(label + ' refused', True)
         return str(e)
@@ -169,7 +178,22 @@ expect('mixhi writes the high half from a high-half source',
        'v_fma_mixhi_f16 v1, v2, v3, v4 op_sel:[0,0,1] op_sel_hi:[0,0,1]',
        'v1 = (v1 & 0xffffu) | (f32tof16(F(v2) * F(v3) + f16tof32(v4 >> 16)) << 16);')
 
+# A register whose upper 16 bits are undefined (odd-dmask D16 image_load) can feed a low-half read.
+expect('low half of a register with undefined upper bits',
+       encode(MIX_F32, 1, (v2, v3, v4), op_sel_hi=(1, 0, 0)),
+       'v_fma_mix_f32 v1, v2, v3, v4 op_sel_hi:[1,0,0]',
+       'v1 = U(f16tof32(v2) * F(v3) + F(v4));', low16_only_v={2})
+
 # --- refusals -------------------------------------------------------------------------------------
+expect_refused('high half of a register with undefined upper bits',
+               encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(1, 0, 0)),
+               'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]', low16_only_v={2})
+expect_refused('binary32 use of a register with undefined upper bits',
+               encode(MIX_F32, 1, (v2, v3, v4)),
+               'v_fma_mix_f32 v1, v2, v3, v4', low16_only_v={2})
+expect_refused('op_sel on a binary32 negated inline 0',
+               encode(MIX_F32, 1, (v2, v3, ZERO), op_sel=(0, 0, 1), neg=(0, 0, 1)),
+               'v_fma_mix_f32 v1, v2, v3, -0 op_sel:[0,0,1]')
 expect_refused('op_sel without op_sel_hi (high half of a binary32 source)',
                encode(MIX_F32, 1, (v2, v3, v4), op_sel=(1, 0, 0)),
                'v_fma_mix_f32 v1, v2, v3, v4 op_sel:[1,0,0]')
@@ -199,6 +223,33 @@ expect_refused('neg on inline 17 (binary32)',
 expect_refused('neg on a literal (binary32)',
                encode(MIX_F32, 1, (LITERAL, v3, v4), neg=(1, 0, 0), literal=0x3f800000),
                'v_fma_mix_f32 v1, -0x3f800000, v3, v4')
+
+
+
+def compile_translated(fxc):
+    """Compile every translated line in one ps_5_1 entry point; returns FXC's exit status and output."""
+    regs = sorted({int(n) for line in translated for n in re.findall(r'\bv(\d+)\b', line)})
+    body = ['#define F asfloat', '#define U asuint',
+            'uint main(nointerpolation uint4 p : TEXCOORD0) : SV_Target {',
+            '    uint s5 = p.y;']
+    body += ['    uint v%d = p.x + %du;' % (r, r) for r in regs]
+    body += ['    ' + line for line in translated]
+    body += ['    return %s;' % ' ^ '.join('v%d' % r for r in regs), '}']
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, 'fma_mix.hlsl')
+        with open(src, 'w') as fh:
+            fh.write('\n'.join(body) + '\n')
+        run = subprocess.run([fxc, '/nologo', '/T', 'ps_5_1', '/E', 'main', '/Fo', os.path.join(d, 'fma_mix.cso'), src],
+                             capture_output=True, text=True)
+    return run.returncode, (run.stdout + run.stderr).strip()
+
+
+if len(sys.argv) == 3 and sys.argv[1] == 'fxc':
+    status, output = compile_translated(sys.argv[2])
+    check(f'fxc ps_5_1 compiles all {len(translated)} translated lines', status == 0, output)
+elif len(sys.argv) != 1:
+    print(__doc__)
+    sys.exit(2)
 
 if failures:
     print(f'FAILED: {len(failures)} check(s): {", ".join(failures)}')
