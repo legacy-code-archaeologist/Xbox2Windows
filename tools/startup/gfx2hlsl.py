@@ -5823,7 +5823,7 @@ VEC_U = {
     'v_bfrev_b32': (1, 'reversebits({0})'),
 }
 SCA_RMW_DEST = ('s_bitset0_b32', 's_bitset1_b32')
-SCA_WORD_ONLY = SCA_RMW_DEST + ('s_ff1_i32_b32',)
+SCA_WORD_ONLY = SCA_RMW_DEST + ('s_ff1_i32_b32', 's_abs_i32')
 
 
 def _mul24_hi_i32():
@@ -5900,6 +5900,8 @@ SCA = {
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
+    # s_abs_i32: D = |S0| as a signed word (0x80000000 stays 0x80000000), SCC = D != 0.
+    's_abs_i32': ('((int({0}) < 0) ? (0u - {0}) : {0})', '$ != 0'),
     # s_bitset0/1_b32 read-modify-write the destination: {0} is the old D, {1} is S0; SCC unchanged.
     's_bitset0_b32': ('({0} & ~(1u << ({1} & 31)))', None), 's_bitset1_b32': ('({0} | (1u << ({1} & 31)))', None),
     # s_ff1_i32_b32: index of the lowest set bit, -1 when none; SCC unchanged.
