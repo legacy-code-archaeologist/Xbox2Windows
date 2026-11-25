@@ -110,7 +110,7 @@ def operand_class(self, tok):
 
 
 def wrap_scalar(original):
-    def scalar(self, base, ops):
+    def scalar(self, base, ops, *rest, **kw):
         if base in ('s_nand_b32', 's_nor_b32'):
             def low(t):
                 r = G.reg_range(t)
@@ -120,7 +120,7 @@ def wrap_scalar(original):
                 dest = 'dest mask' if self.is_lane_mask(operands[0]) else 'dest word'
                 NAND.append('%s %s; %s; srcs %s' % (getattr(self, 'kind', '?'), base, dest,
                                                      ' | '.join(operand_class(self, t) for t in operands[1:])))
-        return original(self, base, ops)
+        return original(self, base, ops, *rest, **kw)
     return scalar
 
 
