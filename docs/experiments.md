@@ -14588,6 +14588,19 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_range_provenance' -V
 ```
 
+## Startup scalar bit counts and scans
+
+`tools/startup/gfx2hlsl.py` lowers eight scalar bit operations that it used to refuse with `Unsupported`: `s_bcnt0_i32_b32`, `s_bcnt1_i32_b32`, `s_bcnt0_i32_b64`, `s_bcnt1_i32_b64`, `s_ff0_i32_b64`, `s_ff1_i32_b64`, `s_flbit_i32_b64` and `s_flbit_i32_i64`. Each writes one 32-bit SGPR. The counts set `SCC` to `result != 0`. The scans return `0xffffffff` when no bit qualifies and leave `SCC` alone. `s_flbit_i32_i64` counts the leading bits equal to the sign bit, so it complements a negative value before it counts. The 32-bit scan forms were already covered elsewhere and are not changed.
+
+Scope: the source is a register only (`s0` to `s105`, an aligned or unaligned pair for the `b64` forms). Literals, inline constants, `exec`, `vcc`, `m0`, a pair that crosses `s105`, source or destination modifiers and a wrong operand count are refused. A source that holds a lane mask is refused with `... on a lane mask`; a destination that held a mask stops being one. The destination must be one SGPR in `s0..s105`.
+
+`tests/startup_gfx2hlsl_s_bit_scan_check.py` builds the SOP1 words, translates them, runs the emitted HLSL on the integer evaluator of `startup_gfx2hlsl_bit_alu_check.py` and compares every result with a loop-and-string reference written from the ISA description. This is a CPU-only check: it does not compile the HLSL or draw it on a GPU. A D3D12 WARP readback of these eight forms has not been run.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_s_bit_scan_check.py
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bit_scan$' -V
+```
+
 ## Vulkan subnormal preservation in a pixel shader
 
 `tests/pixel_denorm_vulkan_check.py` compiles one source-built `ps_6_2` pixel shader with DXC for Vulkan 1.2 and draws it with `tests/vk_pixel_draw.c`. Seven operations (`1 * 2^-149`, `0x007fffff + 0`, `minnorm * 0.5`, `minnorm - 2^-149`, `2^-149 + 2^-149`, `-0x00000003 * 1` and `2^-149 * 2^23`) take or produce binary32 subnormals. The inputs come from a constant buffer so DXC cannot fold them, and each result word is read back from an RGBA32UI pixel. The reference is IEEE binary32 arithmetic in Python. `-denorm preserve` must match it on all seven; `-denorm ftz` is the negative control and must differ on at least one, which shows that the probe separates preserve from flush. A device with `shaderDenormPreserveFloat32` false is a capability skip, and a module that `spirv-val` or the driver refuses is a validation refusal; both are reported apart from mismatches. The check shows how a driver treats subnormals in this one shader. It does not show that translated shaders from `tools/pixel_aot.py` render the same bits under Vulkan.

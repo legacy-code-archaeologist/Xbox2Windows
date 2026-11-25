@@ -5389,6 +5389,52 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
             return handler
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
+# Scalar bit counts and scans with a 32-bit result. `lo`/`hi` are the uint words of the source: a 32-bit source has only
+# `lo`. The scans return 0xffffffff (-1) when no bit qualifies. Only the counts set SCC (result != 0).
+def _clz64(lo, hi):
+    return ('(%(h)s != 0u ? 31u - firstbithigh(%(h)s) : (%(l)s != 0u ? 63u - firstbithigh(%(l)s) : 0xffffffffu))'
+            % {'l': lo, 'h': hi})
+
+
+def _ctz64(lo, hi):
+    return ('(%(l)s != 0u ? firstbitlow(%(l)s) : (%(h)s != 0u ? 32u + firstbitlow(%(h)s) : 0xffffffffu))'
+            % {'l': lo, 'h': hi})
+
+
+def _flbit_i64(lo, hi):
+    # first bit that differs from the sign bit: complement a negative value, then count leading zeros
+    neg = '((%s & 0x80000000u) != 0u)' % hi
+    return _clz64('(%s ? ~%s : %s)' % (neg, lo, lo), '(%s ? ~%s : %s)' % (neg, hi, hi))
+
+
+# name -> (source is a register pair, expression over (lo, hi), SCC rule or None)
+SCALAR_BITS = {
+    's_bcnt0_i32_b32': (False, lambda lo, hi: '(32u - countbits(%s))' % lo, '$ != 0'),
+    's_bcnt1_i32_b32': (False, lambda lo, hi: 'countbits(%s)' % lo, '$ != 0'),
+    's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
+    's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
+    's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
+    's_ff1_i32_b64': (True, _ctz64, None),
+    's_flbit_i32_b64': (True, _clz64, None),
+    's_flbit_i32_i64': (True, _flbit_i64, None),
+}
+for _name, (_pair, _expr, _scc) in SCALAR_BITS.items():
+    def _make_scalar_bits(name=_name, pair=_pair, expr=_expr, scc=_scc):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('%s requires two unmodified operands' % name)
+            dst, src = reg_range(ops[0]), reg_range(ops[1])
+            if dst is None or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+                raise Unsupported('%s destination %s' % (name, ops[0]))
+            if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != (1 if pair else 0):
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            if any(r in self.masks for r in range(src[1], src[2] + 1)):
+                raise Unsupported('%s on a lane mask' % name)
+            lo, hi = self.S(src[1]), self.S(src[2])
+            self.masks.discard(dst[1])
+            self.set_s(dst[1], expr(lo, hi), scc=scc)
+        return handler
+    setattr(Stage, 'op_' + _name, _make_scalar_bits())
 # s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
 for _bit in (0, 1):
     def _make_bitcmp(bit=_bit):

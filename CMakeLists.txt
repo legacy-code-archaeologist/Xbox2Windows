@@ -3164,6 +3164,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(raster_winding_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # s_bcnt0/1_i32_b32/b64, s_ff0/ff1_i32_b64 and s_flbit_i32_b64/i64 against an integer reference (#1723).
+    add_test(NAME startup_gfx2hlsl_s_bit_scan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bit_scan_check.py")
     # gfx2hlsl per-lane bit operations: CPU evaluation of the translated text against an independent
     # reference with mutation controls, then a desktop draw of the translated pairs (FXC 5_1 and DXC 6_0).
     add_test(NAME startup_gfx2hlsl_bit_alu_controls COMMAND "${INTAKE_PYTHON}" -B
