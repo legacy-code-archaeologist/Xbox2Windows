@@ -14,6 +14,12 @@ The store runs under the lane's exec bit. Two variants put v_cmpx_eq_u32 before 
 known at translation time: with 1 == v0 the lane stays on and the texel is written, with 2 == v0 every lane
 is off and the texel keeps its starting value. A control draws the exec-off variant with the guard removed
 from the store and must see the texel written.
+
+UNORM and A16 (the census form `image_store ... dim:SQ_RSRC_IMG_2D unorm a16`): the RDNA 2 ISA requires UNORM = 1 on
+image stores, and a store addresses integer texels, so UNORM leaves the line unchanged. With A16 the 2D address is one
+VGPR, x in bits 15:0 and y in bits 31:16 (LLVM 15 assembles the form with a single vaddr register). The A16 program
+packs (1, 2) as 0x00020001 into v0; its draw must write the same texel, and a control that swaps the halves must
+write (2, 1) instead.
 """
 import struct
 import subprocess
@@ -51,6 +57,12 @@ SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
+A16_SOURCE = SOURCE.replace('v_mov_b32 v0, 1\n', 'v_mov_b32 v0, 0x20001\n').replace(
+    'image_store v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\n',
+    'image_store v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D unorm a16\n')
+A16_STORE = bytes.fromhex('081f20f000040440')   # STORE with UNORM (w0 bit 12) and A16 (w1 bit 30)
+A16_WORDS = PREFIX.replace(bytes.fromhex('8102007e'), bytes.fromhex('ff02007e01000200')) + A16_STORE + SUFFIX
+A16_LINE = 'w0[uint2((v0 & 0xffffu), (v0 >> 16))] = asfloat(uint4(v4, v5, v6, v7));'
 
 
 def cmpx_eq(constant):
@@ -105,11 +117,30 @@ def controls():
         assert STORE_LINE in translate(with_store(store)).hlsl_ps(), name
     print('glc, slc and dlc accepted')
 
-    # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor, unorm,
-    # a partial channel mask and other image dimensions.
-    cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
+    # UNORM does not change the store (integer texel address); A16 packs x and y into one VGPR.
+    unorm = patched(1, 0x10)
+    assert D.decode_instruction(unorm, 0)[2].endswith(' unorm'), D.decode_instruction(unorm, 0)
+    assert STORE_LINE in translate(with_store(unorm)).hlsl_ps()
+    text = D.decode_instruction(A16_STORE, 0)[2]
+    assert text == 'image_store v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D unorm a16', text
+    ps = translate(A16_WORDS).hlsl_ps()
+    assert '    ' + A16_LINE in ps and STORE_LINE not in ps, ps
+    print('unorm accepted; a16 store: %s' % A16_LINE)
+    # The handler refuses an A16 store with two address registers (the packed form has one) and A16 on a 3D image.
+    for address, dim, needle in (('v[0:1]', 'SQ_RSRC_IMG_2D', 'one packed x, y expected'),
+                                 ('v0', 'SQ_RSRC_IMG_3D', 'only 2D images')):
+        try:
+            pipe.ps.op_image_store(['v[4:7]', address, 's[16:23]'], ['dmask:0xf', 'dim:' + dim, 'unorm', 'a16'])
+        except G.Unsupported as error:
+            assert needle in str(error), error
+        else:
+            raise AssertionError('a16 store with %s on %s accepted' % (address, dim))
+    print('refused a16 with two address registers and a16 on a 3D image')
+
+    # Refusals, each by name: packed data, fault-status returns, a 128-bit descriptor, a partial channel mask and
+    # other image dimensions.
+    cases = (('d16', patched(7, 0x80)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
-             ('unorm', patched(1, 0x10)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
              ('SQ_RSRC_IMG_2D_ARRAY', bytes.fromhex('280f20f000040400')),
              ('SQ_RSRC_IMG_1D', bytes.fromhex('000f20f000040400')))
@@ -193,7 +224,10 @@ def check_binary(llvm_mc):
     built = assemble(llvm_mc, SOURCE)
     if built != WORDS:
         raise AssertionError('assembled %s, recorded %s' % (built.hex(), WORDS.hex()))
-    print('fixture words match llvm-mc')
+    built = assemble(llvm_mc, A16_SOURCE)
+    if built != A16_WORDS:
+        raise AssertionError('a16: assembled %s, recorded %s' % (built.hex(), A16_WORDS.hex()))
+    print('fixture words match llvm-mc (plain and unorm a16)')
 
 
 def mismatch_line(stderr):
@@ -229,6 +263,19 @@ def check_draw(dxc, renderer, adapter):
             if run.returncode == 0 or 'texel_mismatch ' + needle not in run.stderr:
                 raise AssertionError('control %s was not detected\n%s\n%s' % (label, run.stdout, run.stderr))
             print('control %s: fails as expected (%s)' % (label, mismatch_line(run.stderr)))
+
+        # A16: the packed address writes the same texel; swapping the halves writes (2, 1) and must be detected.
+        a16 = translate(A16_WORDS).hlsl_ps()
+        run = draw(a16, 'a16')
+        if run.returncode:
+            raise AssertionError('a16 store draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw a16: texel (1, 2) = %s, all other texels untouched' % expected)
+        swapped = a16.replace('uint2((v0 & 0xffffu), (v0 >> 16))', 'uint2((v0 >> 16), (v0 & 0xffffu))')
+        assert swapped != a16
+        run = draw(swapped, 'a16_swapped')
+        if run.returncode == 0 or 'texel_mismatch ' not in run.stderr:
+            raise AssertionError('control a16 halves swapped was not detected\n%s\n%s' % (run.stdout, run.stderr))
+        print('control a16 halves swapped: fails as expected (%s)' % mismatch_line(run.stderr))
 
         # Exec after v_cmpx: an active lane writes the texel, an inactive one leaves it at its starting value.
         untouched_bits = ','.join(['bf800000'] * 4)

@@ -4169,10 +4169,16 @@ class Stage:
             raise Unsupported('%s outside a pixel stage' % name)
         if len(ops) != 3:
             raise Unsupported('%s with %d operands' % (name, len(ops)))
+        # UNORM only changes how a sampler normalizes the address; a store addresses integer texels, and the RDNA 2 ISA
+        # (MIMG fields) requires UNORM = 1 on image stores and atomics, so it is accepted like on image_load.
+        # A16 on a 2D store packs x in bits 15:0 and y in bits 31:16 of one address VGPR (as for image_load).
+        packed_2d = not d16 and 'a16' in mods
         for m in mods:
             if d16 and m == 'd16':
                 continue
-            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+            if packed_2d and m == 'a16':
+                continue
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc', 'unorm')):
                 raise Unsupported('%s modifier %s' % (name, m))
         dims = [m[4:] for m in mods if m.startswith('dim:')]
         masks = [m[6:] for m in mods if m.startswith('dmask:')]
@@ -4196,8 +4202,9 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
-        if len(cs) != 2:
-            raise Unsupported('%s with %d address registers: x and y expected' % (name, len(cs)))
+        if len(cs) != (1 if packed_2d else 2):
+            raise Unsupported('%s with %d address registers: %s expected' % (name, len(cs),
+                                                                          'one packed x, y' if packed_2d else 'x and y'))
         words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
         if d16:
             if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 for c in cs):
@@ -4210,7 +4217,12 @@ class Stage:
             key = self.descriptor(ops[2])
             value = 'asfloat(uint4(%s))' % ', '.join(words)
         image = self.pipe.uav(key, 'tex2d')
-        body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
+        if packed_2d:
+            packed = self.u(cs[0])
+            x, y = '(%s & 0xffffu)' % packed, '(%s >> 16)' % packed
+        else:
+            x, y = self.u(cs[0]), self.u(cs[1])
+        body = '%s[uint2(%s, %s)] = %s;' % (image, x, y, value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
