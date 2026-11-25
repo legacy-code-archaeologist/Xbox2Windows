@@ -2,6 +2,8 @@
 
 1. "... joined at a branch target": for the register named in the refusal, how the paths into the join differed.
 2. "s_nand_b32/s_nor_b32 mixes a lane mask with an unprojected scalar word": what the non-mask operand was.
+3. "v_writelane_b32/v_readlane_b32 needs straight-line code": where the lane writes and reads sit relative to the
+   branches (before the first branch, inside a loop, inside an s_cbranch_execz block).
 
 Read-only on the cache, like --refusals. The output holds only aggregate counts, symbol kinds and opcode names:
 no keys, paths, offsets, operands, disassembly or generated HLSL.
@@ -122,6 +124,59 @@ def wrap_scalar(original):
     return scalar
 
 
+SPILL = []       # shape classes of the current request's 'needs straight-line code' spill refusals
+
+
+def spill_shape(self, vreg):
+    """Where the lane writes and reads of v<vreg> sit relative to the program's branches (no offsets kept)."""
+    ins = getattr(self, 'ins', [])
+    branches = []
+    for off, _, name, asm in ins:
+        if name.startswith(('s_cbranch', 's_branch')):
+            try:
+                to = int(G.parse(asm)[1][0].split('_')[1], 16)
+            except Exception:
+                to = None
+            branches.append((off, to, name))
+    first_ctrl = min([b for b, _, _ in branches] + [t for _, t, _ in branches if t is not None] + [1 << 30])
+    writes, reads, vector = [], [], False
+    for off, _, name, asm in ins:
+        base = re.sub(r'_e(32|64)$', '', name)
+        hit = any(int(lo or s) <= vreg <= int(hi or s)
+                  for lo, hi, s in re.findall(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', asm))
+        if not hit:
+            continue
+        if base == 'v_writelane_b32':
+            writes.append(off)
+        elif base == 'v_readlane_b32':
+            reads.append(off)
+        else:
+            vector = True
+    loops = [(t, b) for b, t, _ in branches if t is not None and t <= b]
+    execz = [(b, t) for b, t, n in branches if n == 's_cbranch_execz' and t is not None and t > b]
+    flags = [
+        'writes %s first branch' % ('all before' if writes and max(writes) < first_ctrl else 'not all before'),
+        'reads %s last write' % ('all after' if writes and reads and min(reads) > max(writes) else 'not all after'),
+        'write in loop' if any(t <= w <= b for w in writes for t, b in loops) else 'no write in loop',
+        'write in execz block' if any(b < w < t for w in writes for b, t in execz) else 'no write in execz block',
+        'vreg also vector' if vector else 'spill-only vreg',
+    ]
+    return '; '.join(flags)
+
+
+def wrap_spill(original):
+    def spill_operands(self, name, ops, mods):
+        try:
+            return original(self, name, ops, mods)
+        except G.Unsupported as error:
+            if 'needs straight-line code' in str(error):
+                v = G.reg_range(ops[0] if name == 'v_writelane_b32' else ops[1])
+                if v:
+                    SPILL.append('%s %s: %s' % (getattr(self, 'kind', '?'), name, spill_shape(self, v[1])))
+            raise
+    return spill_operands
+
+
 REG = re.compile(r'\bs\[?(\d+)')
 
 
@@ -131,14 +186,17 @@ def main(argv):
         raise SystemExit(__doc__)
     G = load_patched()
     G.Stage.scalar = wrap_scalar(G.Stage.scalar)
+    G.Stage.spill_operands = wrap_spill(G.Stage.spill_operands)
     out_dir = argv[0]
     tallies = {'graphics': collections.Counter(), 'compute': collections.Counter()}
     nand = {'graphics': collections.Counter(), 'compute': collections.Counter()}
+    spill = {'graphics': collections.Counter(), 'compute': collections.Counter()}
     for compute in (False, True):
         side = 'compute' if compute else 'graphics'
         for key in dict.fromkeys(G.request_keys(out_dir, compute=compute)):
             EVENTS.clear()
             NAND.clear()
+            SPILL.clear()
             try:
                 sites = G.compute_refusals(out_dir, key) if compute else G.request_refusals(out_dir, key, [])
             except Exception as error:  # keep going; count the crash class only
@@ -159,8 +217,11 @@ def main(argv):
                     tallies[side]['%s <- %s' % item] += 1
             for item in set(NAND):
                 nand[side][item] += 1
+            for item in set(SPILL):
+                spill[side][item] += 1
     print(json.dumps({side: {'joined (requests per class)': dict(tallies[side].most_common()),
-                             'nand/nor mixed (requests per class)': dict(nand[side].most_common())}
+                             'nand/nor mixed (requests per class)': dict(nand[side].most_common()),
+                             'lane spill needs straight-line (requests per class)': dict(spill[side].most_common())}
                       for side in tallies}, indent=1))
 
 
