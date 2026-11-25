@@ -3371,8 +3371,16 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if one and (how != 'sample' or len(cs) != 1 or not dmask or any(not m.startswith(('dim:', 'dmask:')) for m in mods)):
-            raise Unsupported('unverified 1D image sample address or modifiers')
+        # A 1D image has one coordinate. sample_lz and sample_l carry the explicit level in the next
+        # address dword, so their address is x then level; Texture1D.SampleLevel takes the location as a
+        # float, which is what the `one` branch below builds. Anything else stays refused by name.
+        if one:
+            expected = {'sample': 1, 'lz': 1, 'l': 2}.get(how)
+            if expected is None or len(cs) != expected or not dmask:
+                raise Unsupported('unverified 1D image %s address or modifiers' % how)
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or (how != 'sample' and m in ('dlc', 'glc', 'slc'))):
+                    raise Unsupported('1D image %s modifier %s' % (how, m))
         lod = bias = None
         if how in ('l', 'b'):
             # image_sample_l: the address dwords are the coordinates and then the explicit level. image_sample_b:
@@ -3388,7 +3396,8 @@ class Stage:
                     raise Unsupported('%s modifier %s' % (name, m))
             if dmask == 0:
                 raise Unsupported('%s with an empty dmask' % name)
-            if len(cs) != (4 if three else 3):
+            expected = 4 if three else (2 if one else 3)
+            if len(cs) != expected:
                 raise Unsupported('%s with %d address registers' % (name, len(cs)))
             if how == 'l':
                 lod, cs = cs[-1], cs[:-1]

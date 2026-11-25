@@ -453,7 +453,7 @@ def controls():
     refused('gather', 'image_gather4_b')
     refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
-    refused('dim1d', 'unverified 1D image sample address or modifiers')
+    refused('dim1d', 'unverified 1D image b address or modifiers')
     refused('unorm', 'image_sample_b modifier unorm')
     refused('tfe', 'image_sample_b modifier tfe')
     refused('a16', 'image_sample_b modifier a16')
