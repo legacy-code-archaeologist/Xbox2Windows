@@ -14272,6 +14272,24 @@ case. The three mutations mismatched 32, 8 and 16 words respectively on both ada
 ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V
 ```
 
+### Startup compute formatted 16-bit single-channel buffer stores
+
+[The startup translator](../tools/startup/gfx2hlsl.py) (`op_buffer_store_format_d16_x`, refs `#2274`) lowers compute MUBUF `buffer_store_format_d16_x` (`0x84`) through four untouched words of a fixed native table descriptor (`uav <slot> table <param> <offset>`), requesting `udsrc` entries `uav_descword3`, `uav_stride` (unmasked `DW1 >> 16`, so `stride > 0x3fffu` rejects nonzero `CACHE_SWIZZLE`/`SWIZZLE_ENABLE` bits 31:30) and `uav_numrecords` for that UAV slot. After a branch, the descriptor must come from a local table load with a proven entry root pointer; non-compute stages, modified descriptors (including stride clears), shared load/store descriptors, lane-mask `soffset`, illegal binary `lds`/reserved MUBUF bits, and unsupported modifiers (`glc`, `slc`, `dlc`, `tfe`, `lds`) are refused with `Unsupported`.
+
+Supported 1-channel formats (`BUF_FMT_32_FLOAT` 22, `BUF_FMT_16_FLOAT` 13, `BUF_FMT_16_UNORM` 7, `BUF_FMT_16_SNORM` 8, `BUF_FMT_16_UINT` 11, `BUF_FMT_16_SINT` 12, in both GFX10 unified and legacy `DFMT`/`NFMT` encodings) extract the low 16 bits of `vdata`, enforce `DST_SEL_X == 4`, zero reserved/swizzle/`ADD_TID_ENABLE`/`TYPE` bits, and RDNA 2 ISA §8.1.5 Table 35 bounds modes: `OOB_SELECT == 0` (`SQ_OOB_INDEX_AND_OFFSET`, requires `stride != 0`, checks `idx < num_records` and `rec_off + elem_bytes <= stride` where `rec_off = voff + imm_off`, while `soffset` adds to base address) and `OOB_SELECT == 3` (`SQ_OOB_COMPLETE` raw mode, requires `stride == 0`, checks `soffset + rec_off + elem_bytes <= num_records`). `OOB_SELECT` `1` (`INDEX_ONLY`) and `2` (`NUM_RECORDS_0` / disabled bounds), mismatched `stride`/`OOB_SELECT`, 32-bit address overflow, misaligned addresses, and OOB lanes are no-ops. Stores use 4-byte aligned `Store` for `32_FLOAT` and a lock-free `InterlockedCompareExchange` CAS loop for 2-byte aligned 16-bit formats, under an `if (exec & 1)` lane guard when `EXEC` is not proven entry-full.
+
+[The `buffer_store_format_d16_x` check](../tests/startup_compute_store_d16_x_check.py) covers pure-Python unit/manifest/encoding/provenance/refusal checks and dispatches five source-built `gfx1013` compute programs: `F` (all six formats + legacy encodings + 7 no-op descriptor/OOB/swizzle checks), `P` (`OOB_SELECT=3` raw bounds + `stride=0` + `offen` + SGPR `soffset` + concurrent adjacent halves), `S` (`OOB_SELECT=0` structured with `soffset=16 > stride=8`), `E` (`idxen offen` + local descriptor reload after `s_cbranch_execz` + inner `s_and_saveexec_b32` EXEC guard), and `C` (256 concurrent threads hammering the same low/high 16-bit halfwords to verify atomic CAS without bitwise-OR or torn corruption). On both WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`) and `NVIDIA GeForce RTX 4070 SUPER` (`10de:2783`, driver `32.0.16.2114`) with the D3D12 debug layer enabled, all 16 deterministic dispatch cases matched all `320` words (`mismatches=0`, `debug_errors=0 debug_warnings=0`), Case `C` produced valid atomic halfword values with 319 untouched sentinels (`debug_errors=0 debug_warnings=0`), and all eight shader mutants rejected cleanly on both adapters (`f32-drop-store`, `f32-wrong-half`, `f32-drop-oob`, `unorm16-trunc`, `p-drop-soffset`, `p-drop-keep`, `s-fold-soff-stride`, `e-drop-exec`).
+
+```powershell
+. .\tools\dev.ps1
+cmake --preset release
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -j 1 -R "^startup_compute_store_d16_x" -V
+python -B tests/startup_compute_store_d16_x_check.py binary llvm-mc-15
+```
+
+Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), `OOB_SELECT=3` with nonzero stride, multi-channel `buffer_store_format_d16_{xy,xyz,xyzw}`, `buffer_store_format_d16_hi_x`, and live runtime slot-67 dispatch binding of `uav_descword3`/`uav_stride`/`uav_numrecords`.
+
 ### First active lane at compute entry
 
 The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
