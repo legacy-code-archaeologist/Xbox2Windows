@@ -2458,6 +2458,11 @@ class Stage:
                     raise Unsupported('%s source %s' % (base, source))
         if pair and ('m0' in srcs or dname == 'm0'):
             raise Unsupported('64-bit scalar operand m0')
+        if base in SCC_CARRY_IN and any(
+                t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or
+                (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
+                for t in [dname] + srcs):
+            raise Unsupported('%s on a lane mask' % base)
         def src_sym(t):
             if t == 'm0':
                 return self.sym.get('m0')
@@ -2519,10 +2524,19 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        carry_in_uniform = True
         if shift_add:
             # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
             n = SHIFT_ADD[base]
             self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
+        elif base in SCC_CARRY:
+            # The carry is read from the sources and the old scc, so it is emitted before the destination
+            # is written (which may be one of the sources) and the carry-in is copied out first.
+            if base in SCC_CARRY_IN:
+                # `w` hides the incoming scc from the uniformity proof: keep it for the result.
+                carry_in_uniform = not self.tracks_uniformity() or self.scc_uniform
+                self.emit('w = scc ? 1u : 0u;')
+            self.set_scc(SCC_CARRY[base].format(*values))
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -2590,7 +2604,10 @@ class Stage:
             high_source = 's%d' % high if high is not None else srcs[0]
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
-        self.set_s(d, expr, scc=scc)
+        result_uniform = None
+        if base in SCC_CARRY_IN and self.tracks_uniformity():
+            result_uniform = carry_in_uniform and self.scalar_expr_uniform(expr)
+        self.set_s(d, expr, scc=scc, uniform=result_uniform)
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
@@ -5134,6 +5151,15 @@ SCA_WORD_ONLY = SCA_RMW_DEST + ('s_ff1_i32_b32',)
 # trusting it.
 SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
                             's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+# Carry and borrow out of the 32-bit add and subtract forms, written over the two sources ({0}, {1}) and
+# the SCC read before the instruction. The carry-in forms take their input from scc as well.
+SCC_CARRY = {
+    's_add_u32': '({0} + {1}) < {0}',
+    's_sub_u32': '{0} < {1}',
+    's_addc_u32': 'scc ? ({0} + {1} + 1u) <= {0} : ({0} + {1}) < {0}',
+    's_subb_u32': 'scc ? {0} <= {1} : {0} < {1}',
+}
+SCC_CARRY_IN = frozenset(('s_addc_u32', 's_subb_u32'))
 
 SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
@@ -5146,6 +5172,7 @@ SCA = {
     's_lshl_b32': ('{0} << ({1} & 31)', '$ != 0'), 's_lshr_b32': ('{0} >> ({1} & 31)', '$ != 0'),
     's_ashr_i32': ('uint(int({0}) >> ({1} & 31))', '$ != 0'),
     's_add_i32': ('{0} + {1}', None), 's_add_u32': ('{0} + {1}', None), 's_sub_i32': ('{0} - {1}', None), 's_sub_u32': ('{0} - {1}', None),
+    's_addc_u32': ('{0} + {1} + w', None), 's_subb_u32': ('{0} - {1} - w', None),
     's_mul_i32': ('{0} * {1}', None), 's_min_u32': ('min({0}, {1})', None), 's_max_u32': ('max({0}, {1})', None),
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
