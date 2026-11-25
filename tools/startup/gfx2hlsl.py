@@ -1035,6 +1035,10 @@ class Stage:
 
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
+        if tok == 'src_scc':
+            # Source code 253 reads the SCC bit as the integer value 0 or 1 (used by e.g. s_mul_i32).
+            return '(scc ? 1u : 0u)'
+
         if tok in ('vcc_lo', 'vcc'):
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
