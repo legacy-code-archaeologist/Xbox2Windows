@@ -204,8 +204,9 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-14`. Older translations evaluate `s_brev_b32` of a
-constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
+constant at run time instead of folding it into a known word, which changes the emitted HLSL, and
+lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after

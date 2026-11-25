@@ -170,8 +170,8 @@ check('both files spell a x2w-startup-shader revision', seed is not None and lit
       repr((seed and seed.group(1), literal and literal.group(1))))
 check('the two literals are identical', seed and literal and seed.group(1) == literal.group(1),
       repr((seed and seed.group(1), literal and literal.group(1))))
-check('the revision is x2w-startup-shader-8, after the fix to the cap',
-      bool(seed and seed.group(1) == 'x2w-startup-shader-8'), repr(seed and seed.group(1)))
+check('the revision is x2w-startup-shader-15, after the fix to the cap',
+      bool(seed and seed.group(1) == 'x2w-startup-shader-15'), repr(seed and seed.group(1)))
 
 
 def key_from_seed(word):
@@ -183,8 +183,8 @@ if seed:
     check('pipeline_key hashes the seed the source spells',
           G.pipeline_key(b'vs', b'ps', b'root') == key_from_seed(seed.group(1)),
           '%016x vs %016x' % (G.pipeline_key(b'vs', b'ps', b'root'), key_from_seed(seed.group(1))))
-    old, new = key_from_seed('x2w-startup-shader-7'), key_from_seed('x2w-startup-shader-8')
-    check('the -7 seed produces a different key, so the pre-fix entries are out of the cache', old != new,
+    old, new = key_from_seed('x2w-startup-shader-14'), key_from_seed('x2w-startup-shader-15')
+    check('the -14 seed produces a different key, so the pre-fix entries are out of the cache', old != new,
           '%016x vs %016x' % (old, new))
 
 if failures:
