@@ -2407,7 +2407,11 @@ class Stage:
             if not ops or not ops[0].strip().startswith('hwreg('):
                 raise Unsupported('%s %s: hardware register not decoded' % (base, ', '.join(ops)))
             return None
-        if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
+        # s_waitcnt_depctr only delays the wave until the named dependency counters reach their thresholds. LLVM
+        # defines it with one immediate and no register definition, use or side effect (SOPInstructions.td,
+        # S_WAITCNT_DEPCTR) and inserts it only as a hazard delay (GCNHazardRecognizer.cpp,
+        # fixVMEMtoScalarWriteHazards). This model has no outstanding operation a counter could count.
+        if base in ('s_inst_prefetch', 's_waitcnt', 's_waitcnt_depctr', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':

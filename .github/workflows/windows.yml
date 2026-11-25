@@ -82,6 +82,7 @@ jobs:
               (["tests/startup_sampler_heap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_scalar_m0_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_sdwa_cndmask_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_waitcnt_depctr_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cmp16_check.py", "binary", "llvm-mc-15", "llvm-objcopy-15"], {}),
@@ -242,6 +243,7 @@ jobs:
             tests/startup_compute_request_offline_check.py \
             tests/compute_container_index_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
+            tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_gfx2hlsl_loop_constants_check.py \
