@@ -2128,10 +2128,12 @@ class Stage:
         With ``with_cfg=True``, returns ``(joined, forward_splits, div_targets)`` where ``forward_splits`` keeps only
         writes on non-dominating forward arms between a target's dominators and the target (excluding loop back edges)
         and ``div_targets`` maps each ``s_cbranch_*`` offset to ``(writes, affected_targets)`` inside its divergent
-        CFG region (between the branch and its immediate post-dominator, or over the loop range for a backward edge)."""
+        CFG region (between the branch and its immediate post-dominator, or over the loop range for a backward edge).
+        A fourth item, ``(bounds, block_of, succ, div_blocks)``, is the block graph and that region's blocks per
+        ``s_cbranch_*`` offset, for the spill-slot proof (spill_reaching)."""
         ins = self.ins
         if not ins:
-            return ({}, {}, {}) if with_cfg else {}
+            return ({}, {}, {}, ([], {}, [], {})) if with_cfg else {}
         index = {off: i for i, (off, *_) in enumerate(ins)}
         calculated = getattr(self, 'calculated_pc', {})  # unit probes build a Stage without translate()
         branch = lambda name: name.startswith('s_cbranch') or name in ('s_branch', 's_setpc_b64')
@@ -2217,7 +2219,7 @@ class Stage:
                 new = {b} | set.intersection(*(pdom[s] for s in succ[b]))
                 if new != pdom[b]:
                     pdom[b], changed = new, True
-        div_targets = {}
+        div_targets, div_blocks = {}, {}
         for b, (lo, hi) in enumerate(bounds):
             off, _n, name, asm = ins[hi - 1]
             if not name.startswith('s_cbranch'):
@@ -2230,6 +2232,7 @@ class Stage:
                 loop_blks = range(min(t_blk, b), b + 1)
                 regs = set().union(*(writes[w] for w in loop_blks))
                 affected = {off_of[w] for w in loop_blks} & all_targets
+                div_blocks[off] = set(loop_blks)
             else:
                 stop = pdom[b] - {b}
                 ipd = max(stop, key=lambda x: len(pdom[x])) if stop else None
@@ -2242,9 +2245,10 @@ class Stage:
                     dtodo += succ[w]
                 regs = set().union(*(writes[w] for w in div)) if div else set()
                 affected = ({off_of[w] for w in div} | ({off_of[ipd]} if ipd is not None else set())) & all_targets
+                div_blocks[off] = div
             div_targets[off] = (regs, affected)
         self.flow = (index, block_of, succ, dom, writes, {})
-        return joined, forward_splits, div_targets
+        return joined, forward_splits, div_targets, (bounds, block_of, succ, div_blocks)
 
     def unjoined(self, target, last_write, regs):
         """The registers of regs whose program-order state is not proven at a branch target. A lane-mask mark or a
@@ -2298,7 +2302,8 @@ class Stage:
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         join_writes = self.join_writes(branches)
         refused = self.execz_refusals() if getattr(self, 'kind', None) == 'cs' else {}  # probes skip __init__
-        joined, forward_splits, div_targets = self.joined_registers(with_cfg=True)
+        joined, forward_splits, div_targets, self.spill_cfg = self.joined_registers(with_cfg=True)
+        self.spill_reach = self.spill_reaching(self.spill_cfg)
         init_sym = dict(self.sym)
         init_exec_known = getattr(self, 'exec_known', True)
         init_wqm_exec = getattr(self, 'wqm_exec', False)
@@ -2355,6 +2360,8 @@ class Stage:
             self.descriptor_block_first = 0
             self.vcc_events = {}
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
+            self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform)
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
@@ -2469,6 +2476,8 @@ class Stage:
                     if base.startswith('s_cbranch_'):
                         cond = base[10:]
                         cond_uniform = cond in ('scc0', 'scc1') and self.scc_uniform
+                        if cond_uniform:
+                            self.uniform_branches.add(off)
                         if not cond_uniform:
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
@@ -5448,7 +5457,81 @@ class Stage:
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
+    #
+    # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
+    # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
+    # s_cbranch_execz or _vccz the pixel takes alone, or an SCC branch on varying data), where the wave also runs
+    # the blocks this pixel skips. spill_reaching gives the writes that can supply a read, written on every path.
+    # One write: every path into the read ran it, so the slot is one more scalar register; it is accepted unless
+    # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
+    # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
+    # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
     SPILL_LANES = 32
+
+    def spill_reaching(self, cfg):
+        """Instruction index of each v_readlane_b32 -> the v_writelane_b32 indices that can supply its (VGPR, lane), or
+        None when some path from the entry reaches it with none. Forward must-dataflow over the blocks: a slot is
+        written at a join only if it is written on every incoming edge (intersection) and the writes that can supply
+        it are the union over those edges, iterated to a fixed point so a later write in a loop body reaches the loop
+        head through the back edge."""
+        bounds, _, succ, _ = cfg
+        lane_ops = {}
+        for i, (_, _, name, asm) in enumerate(self.ins):
+            base = re.sub(r'_e(32|64)$', '', name)
+            ops = parse(asm)[1] if base in ('v_writelane_b32', 'v_readlane_b32') else ()
+            if len(ops) == 3:
+                try:
+                    lane = int(ops[2], 0)  # 3 and 0x3 are one slot
+                except ValueError:
+                    lane = ops[2]  # an SGPR lane, refused by spill_operands
+                lane_ops[i] = (base == 'v_writelane_b32', ops[0 if base == 'v_writelane_b32' else 1], lane)
+        into = [{}] + [None] * (len(bounds) - 1)  # None: no path reaches the block yet
+        reach = {}
+        changed = True
+        while changed:
+            changed = False
+            for b, (lo, hi) in enumerate(bounds):
+                if into[b] is None:
+                    continue
+                state = dict(into[b])
+                for i in range(lo, hi):
+                    if i in lane_ops:
+                        write, vreg, lane = lane_ops[i]
+                        if write:
+                            state[vreg, lane] = frozenset([i])
+                        else:
+                            reach[i] = state.get((vreg, lane))
+                for t in succ[b]:
+                    new = state if into[t] is None else {k: into[t][k] | state[k] for k in into[t].keys() & state.keys()}
+                    if new != into[t]:
+                        into[t], changed = new, True
+        return reach
+
+    def spill_join(self, n, lane):
+        """(sym, uniform) of the slot a v_readlane_b32 reads in a program with branches, or a refusal naming what
+        failed (see the comment above SPILL_LANES)."""
+        i = self.descriptor_instruction_index
+        writes = self.spill_reach.get(i)
+        if writes is None:
+            raise Unsupported('v_readlane_b32 reads v%d lane %d with no v_writelane_b32 of it on some path' % (n, lane))
+        if max(writes) > i:
+            raise Unsupported('v_readlane_b32 reads v%d lane %d written later in a loop (loop-carried)' % (n, lane))
+        if any(w not in self.spill_writes for w in writes):
+            raise Unsupported('v_readlane_b32 reads v%d lane %d from a v_writelane_b32 that was not translated' % (n, lane))
+        _, block_of, _, div_blocks = self.spill_cfg
+        here = block_of[i]
+        for off, blocks in sorted(div_blocks.items()):
+            if off in self.uniform_branches or not any(block_of[w] in blocks for w in writes):
+                continue
+            if len(writes) > 1:
+                raise Unsupported('v_readlane_b32 joins %d writes of v%d lane %d, one inside the region of the branch at '
+                                  '%#x, which is not proven uniform' % (len(writes), n, lane, off))
+            if here not in blocks:
+                raise Unsupported('v_readlane_b32 reads v%d lane %d outside the region of the branch at %#x that writes '
+                                  'it, which is not proven uniform' % (n, lane, off))
+        stored = [self.spill_writes[w] for w in sorted(writes)]
+        sym = stored[0][0] if all(s == stored[0][0] for s, _ in stored) else None
+        return sym, len(stored) == 1 and stored[0][1]
 
     def spill_operands(self, name, ops, mods):
         if mods or len(ops) != 3:
@@ -5466,7 +5549,8 @@ class Stage:
             raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
         if getattr(self, 'kind', None) != 'ps':
             raise Unsupported('%s is lowered in pixel stages only' % name)
-        if getattr(self, 'has_branches', True) or not self.tracks_uniformity():
+        if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
+                                            getattr(self, 'spill_reach', None) is None):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
         return vreg[1], sreg, lane
@@ -5497,6 +5581,8 @@ class Stage:
             uniform = self.uniform_source(ops[1])
         slots = self.__dict__.setdefault('spill_slots', {})
         slots[(n, lane)] = (sym, uniform)
+        if getattr(self, 'spill_reach', None) is not None:
+            self.spill_writes[self.descriptor_instruction_index] = (sym, uniform)
         self.emit('sp%d_%d = %s;' % (n, lane, value))
 
     def op_v_readlane_b32(self, ops, mods):
@@ -5505,10 +5591,13 @@ class Stage:
         n, dst, lane = self.spill_operands('v_readlane_b32', ops, mods)
         if dst is None:
             raise Unsupported('v_readlane_b32 requires an SGPR destination')
-        slot = getattr(self, 'spill_slots', {}).get((n, lane))
-        if slot is None:
-            raise Unsupported('v_readlane_b32 reads v%d lane %d before any v_writelane_b32 wrote it' % (n, lane))
-        sym, uniform = slot
+        if getattr(self, 'has_branches', False):
+            sym, uniform = self.spill_join(n, lane)
+        else:
+            slot = getattr(self, 'spill_slots', {}).get((n, lane))
+            if slot is None:
+                raise Unsupported('v_readlane_b32 reads v%d lane %d before any v_writelane_b32 wrote it' % (n, lane))
+            sym, uniform = slot
         self.set_s(dst[1], 'sp%d_%d' % (n, lane), sym=sym, uniform=uniform)
 
     def uniform_vgpr(self, name, tok):
