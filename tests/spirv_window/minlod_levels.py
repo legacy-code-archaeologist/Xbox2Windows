@@ -18,7 +18,9 @@ import tempfile
 
 # (clamp, accepted exact mips), listing nearest first.
 EXACT = (("0", (0,)), ("1", (1,)), ("2", (2,)), ("3", (3,)))
-FRACTIONAL = (("1.4375", (1,)), ("1.5", (2, 1)), ("1.5625", (2, 1)), ("3.75", (3,)))
+# Probe one 1/256 step below both observed point-filter transitions (1.5 and 2).
+FRACTIONAL = (("1.4375", (1,)), ("1.49609375", (1, 2)), ("1.5", (2, 1)), ("1.5625", (2, 1)),
+              ("1.99609375", (2, 1)), ("2", (2,)), ("3.75", (3,)))
 WRONG = ("1", 2)  # negative control: a clamp of 1 must not read mip 2
 WRONG_FRACTIONAL = ("1.5625", 0)  # neither observed rounding rule selects mip zero
 # Clamps for the mip-linear sampler: exact steps, a weight between 1/256 steps (1.3)

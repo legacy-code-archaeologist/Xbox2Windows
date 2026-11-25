@@ -281,6 +281,24 @@ def emit(folder, assembler, validator, cross, pixel=False, variant=None):
     return hlsl
 
 
+def check_missing_stores(folder, compiler, renderer, adapter):
+    shader = Path(__file__).resolve().parents[1] / "sampler_index_control.hlsl"
+    dxil = folder / "missing-stores.dxil"
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-D", "OMIT_STORES_ON_ORDINARY_SWAP",
+                    "-Fo", dxil, shader], check=True)
+    run = subprocess.run([renderer, adapter, "--spirv-sampler-views", dxil], capture_output=True, text=True)
+    if run.returncode == 77:
+        print(run.stdout + run.stderr, end="")
+        return 77
+    differences = [line for line in run.stdout.splitlines() if re.match(r"sampler swap \d+ word ", line)]
+    expected = ["sampler swap 1 word 2: expected=00000000 actual=c0400000",
+                "sampler swap 1 word 3: expected=3f800000 actual=c0800000"]
+    if run.returncode != 1 or differences != expected or "Split sampler readback mismatch" not in run.stderr:
+        raise AssertionError(f"missing comparison stores: exit {run.returncode}\n{run.stdout}{run.stderr}")
+    print("missing comparison stores detected:", *differences, sep="\n")
+    return 0
+
+
 if __name__ == "__main__":
     status = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -300,6 +318,11 @@ if __name__ == "__main__":
                 dxil = hlsl.with_suffix(".dxil")
                 subprocess.run([sys.argv[4], "-T", "cs_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
                 # The renamed table is read back exactly as the original is: same slots, same expected words.
-                status |= subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode
-    print("sampler views: plain and renamed tables and a level-of-detail query validated; controls passed")
+                print(f"sampler table: {variant or 'plain'}", flush=True)
+                result = subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode
+                if result and (result != 77 or status == 0):
+                    status = result
+        if len(sys.argv) > 4 and status == 0:
+            status = check_missing_stores(Path(tmp), *sys.argv[4:7])
+    print("sampler views: validated plain and renamed SPIR-V tables and the level-of-detail query")
     sys.exit(status)

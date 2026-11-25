@@ -1337,6 +1337,12 @@ Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_qword_' -V` f
 
 An optional experiment starts from the optional bridge fixture and compares a source-built subgroup compaction dispatch on a physical adapter and on WARP. The [SPIR-V module](../tests/spirv_window/compaction.spvasm) is one 64-thread group. It computes a sparse predicate from a 64-bit mask, ballots it with `OpGroupNonUniformBallot`, derives the first and last active lane and each lane's compaction rank, and writes the lane index, the observed lane width, the four ballot words, the active count, the selected lane's rank and the compacted payloads into separate output words. Compacted writes go to per-wave disjoint ranges keyed by rank, so the readback does not depend on workgroup or wave scheduling order; a repeated dispatch must be word-identical. The [direct desktop-HLSL control](../tests/spirv_window/compaction.hlsl) implements the same contract independently, so the bridge path and the direct path can be compared word for word. The CPU reference in `compaction.py` is recomputed with the lane width the shader observed, from an independent Python model of the ballot, first/last lanes, ranks and compaction.
 
+If two dispatch readbacks differ, the fixture reports the first differing word and field, both hexadecimal
+values, both observed lane widths and the number of differing words. This applies to a repeated dispatch
+and to the bridge/direct comparison. For a negative control it computes the mutated reference at the width
+reported by that control. A different width from the baseline still fails the test, with
+`mutated_reference=exact` if all 328 control words match at that width.
+
 Two deterministic masks are injected into the fixture constants. Every 4-bit nibble of both masks has one bit set, so every wave of every supported width (4, 8, 16, 32 and 64) has an active lane. The negative controls flip the predicate bit selection and shift the compaction write index by one; the first divergent word must be the wave-0 ballot word (65) and the first compacted payload (257) respectively, otherwise the test fails.
 
 The original SM 6.6 fixture was measured with SPIRV-Tools 2025.5 (`262bdab`), SPIRV-Cross `57e4efc`, DXC 1.9.2609.5 and MSVC 19.50 on Windows 11 build 26300, debug layer unavailable: the RTX 4060 (driver 32.0.16.2124) reports a 32-lane wave and WARP 10.0.26100.10068 reports a 4-lane wave (`D3D12_OPTIONS1.WaveLaneCountMin/Max` are 4/4). Each adapter matched its own width-aware CPU reference in all 328 words for both masks, on both the bridge and the direct-HLSL path, and both negative controls were caught at the predicted first word. The first difference between the adapters is output word 4 (the lane index each group thread observed): the RTX 4060 wrote 4 where WARP wrote 0, and 259 words differ in total. A CPU reference computed at width 32 reports the same word 4 as the first mismatch against the WARP readback, so the difference is the subgroup width the shader runs at, not WARP ballot or compaction arithmetic. Neither adapter exposes a 64-lane wave here, so an intra-wave 31/32 ballot-word boundary is a capability skip; the 31/32 mask-bit boundary is still exercised across the two 32-lane waves.
@@ -7735,6 +7741,12 @@ A sampled program can also read attr0.z/w, as plain values from a P1/P2 pair in 
 
 The integer readback profile declares the primary constant buffer as `uint4`. Integer consumers read its words directly, and floating-point consumers reinterpret the same bits. The byte layout is unchanged. The constant-index bitset draw checks copying `0xffffffff` through a VGPR and overwriting the destination with a floating-point result. On RTX 4060 Laptop (driver 32.0.16.1656), the previous float-typed load returned `0x7fffffff` for the immediate-index-31 copy; the integer load preserves `0xffffffff`. [Original report and independent reproduction](https://github.com/R0Y00/Xbox2Windows/pull/680#issuecomment-7099515543)
 
+The integer-copy and flat-scratch fixtures write expected UINT texels directly as
+four little-endian words. On Windows with CPython 3.11.9, converting the word
+`0xff812345` to a Python float and back writes `0xffc12345`. The copy fixture
+checks both signs and rejects changing just the quiet bit. The scratch fixtures
+carry the same payloads through their loads and stores.
+
 For normalized compressed whole-pair exports, the Python API can return `(source, mask)` via `return_write_mask=True`. The caller applies the returned RT0 mask (RG = `0x3`, BA = `0xC`, RGBA = `0xF`) in the PSO. Disabled components in the emitted `float4` are placeholders. The regular API still returns `float2` for its existing RG form and rejects a BA-only export. Because disassembly text can hide raw enable-bit differences, this API requires known whole-pair input. The draw fixture uses distinct clear sentinels and checks that a full PSO mask or incorrect enabled-channel values fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_compressed_export_(warp|hardware)$' -V`.
 
 The LLVM 15 binary fixture for #361 changes only the four EN bits of an assembled gfx1013 export and checks all 16 raw values. Reassembling the printed text keeps a packed pair when its first printed operand is enabled: raw 0x2 and 0xA reassemble as 0x0, and 0x5 reassembles as 0xF. Fully disabled source fields reassemble as zero. The normal lowering accepts 0x3, 0xC and 0xF through its explicit RT0-mask API. Other masks are rejected. These checks characterize the encoding and LLVM 15 behavior; they establish no gfx1013 channel-write semantics for non-pair masks.
@@ -7905,7 +7917,7 @@ Scalar ALU support also covers the 64-bit SOP1/SOP2 family (`s_cmov_b64`, `s_not
 
 The SDWA forms of the 16 `v_cmp_*_f32` predicates are lowered when both `src0_sel` and `src1_sel` are `DWORD`. With whole-dword selections they compare the operands exactly as the e32/e64 forms do; the translator emits identical HLSL for both, and a control asserts it. A byte or word selection would compare a zero-extended field as binary32 and is refused. The predicate draws are repeated with the SDWA compares for all four groups and the same five input pairs, including NaN on either side. A reference that inverts each group's unordered result must report a mismatch.
 
-The 46 non-`v_cmpx` VOPC SDWA comparisons left by lot 1a are lowered: the 16 binary16 predicates and `v_cmp_class_f16_sdwa`, `v_cmp_class_f32_sdwa`, the 8 signed and 8 unsigned 32-bit predicates and the 6 signed and 6 unsigned 16-bit predicates. VOPC SDWA encodes only `src0_sel` and `src1_sel`; `llvm-mc` rejects `dst_sel`/`dst_unused` on these instructions, so the destination stays `vcc`/`vcc_lo` or one SGPR and the translator refuses an SGPR pair and the destination fields. Sources accept `BYTE_0..3`, `WORD_0..1` and `DWORD`, with `sext()` where LLVM prints it. The selection is zero-extended, or sign-extended under `sext()`, before the existing table applies: binary16 uses the low 16 bits through `widen16`/`num16`, the 16-bit integer forms take the low 16 bits, the 32-bit integer forms compare the selected word as signed or unsigned, and the class forms feed the selected bits to `class16` or `class32`. The comparison result is tracked in the same VCC/SGPR lane-mask state as the e32 and e64 forms, so `v_cndmask_b32` consumes it unchanged. The source-built fixture `tests/pixel_aot_check.py draw-sdwa-cmp` puts all 46 forms in one program, folds each predicate into two exported `R32G32B32A32_UINT` words, and repeats the rows with selections on every field. Its wrong references must each report `pixel_mismatch`: selections ignored (whole dwords), every field reversed (`BYTE_0`/`BYTE_3`, `BYTE_1`/`BYTE_2`, `WORD_0`/`WORD_1`), signedness inverted on the rows containing `0x8000`/`0xffff`, and zero extension in place of `sext()`. A second program writes two comparisons to `s52` and `vcc_lo` before consuming both; a reference that uses the second mask for both channels must mismatch. `tests/form_coverage_check.py` isolates this fixture's accepted words and asserts the 46 forms count in both `gfx1013.tsv` and `rdna2.tsv`, while the non-SDWA `v_cmp_*` neighbours and the `v_cmpx_*_sdwa` forms stay out. The same program is part of `check_binary`, so the LLVM 15 `Assemble and translate gfx1013 fixtures` job assembles, disassembles and re-translates it. On base `0aa6522c` the measurement moved from 1255/1968 to 1301/1968 on gfx1013 and from 1246/1863 to 1292/1863 on gfx1030, exactly 46 forms in each reference. The new tests passed on WARP and on `pixel_aot_sdwa_cmp_hardware` on an AMD Radeon RX 9060 XT (driver 32.0.32029.2010), Windows 11 build 10.0.26300.10075, in 1.10 s; the debug layer was unavailable. The separate `pixel_aot_comparisons_hardware` entry still fails on this adapter in its pre-existing strict binary32 subnormal comparison ([issue #958](https://github.com/R0Y00/Xbox2Windows/issues/958)); that failure is outside this lot and does not affect the SDWA draw. This measures translated fixtures, not console behavior or full title execution. Reproduce with `ctest --preset dev --no-tests=error -R '^pixel_aot_sdwa_cmp_' -V`; the full measurement is `ctest --preset dev --no-tests=error -R '^(pixel_aot_|compute_store_aot_)' -E '_hardware$' -j 1 --output-junit out/build/dev/out/wave1-sdwa-after.xml` followed by `python -B tools/form_coverage.py out/build/dev/out/wave1-sdwa-after.xml --records out/build/dev/form_coverage --json out/wave1-sdwa-after.json`.
+The 46 non-`v_cmpx` VOPC SDWA comparisons left by lot 1a are lowered: the 16 binary16 predicates and `v_cmp_class_f16_sdwa`, `v_cmp_class_f32_sdwa`, the 8 signed and 8 unsigned 32-bit predicates and the 6 signed and 6 unsigned 16-bit predicates. VOPC SDWA encodes only `src0_sel` and `src1_sel`; `llvm-mc` rejects `dst_sel`/`dst_unused` on these instructions, so the destination stays `vcc`/`vcc_lo` or one SGPR and the translator refuses an SGPR pair and the destination fields. Sources accept `BYTE_0..3`, `WORD_0..1` and `DWORD`, with `sext()` where LLVM prints it. The selection is zero-extended, or sign-extended under `sext()`, before the existing table applies: binary16 uses the low 16 bits through `widen16`/`num16`, the 16-bit integer forms take the low 16 bits, the 32-bit integer forms compare the selected word as signed or unsigned, and the class forms feed the selected bits to `class16` or `class32`. The comparison result is tracked in the same VCC/SGPR lane-mask state as the e32 and e64 forms, so `v_cndmask_b32` consumes it unchanged. The source-built fixture `tests/pixel_aot_check.py draw-sdwa-cmp` puts all 46 forms in one program, folds each predicate into two exported `R32G32B32A32_UINT` words, and repeats the rows with selections on every field. Its wrong references must each report `pixel_mismatch`: selections ignored (whole dwords), every field reversed (`BYTE_0`/`BYTE_3`, `BYTE_1`/`BYTE_2`, `WORD_0`/`WORD_1`), signedness inverted on the rows containing `0x8000`/`0xffff`, and zero extension in place of `sext()`. A second program writes two comparisons to `s52` and `vcc_lo` before consuming both; a reference that uses the second mask for both channels must mismatch. `tests/form_coverage_check.py` isolates this fixture's accepted words and asserts the 46 forms count in both `gfx1013.tsv` and `rdna2.tsv`, while the non-SDWA `v_cmp_*` neighbours and the `v_cmpx_*_sdwa` forms stay out. The same program is part of `check_binary`, so the LLVM 15 `Assemble and translate gfx1013 fixtures` job assembles, disassembles and re-translates it. On base `0aa6522c` the measurement moved from 1255/1968 to 1301/1968 on gfx1013 and from 1246/1863 to 1292/1863 on gfx1030, exactly 46 forms in each reference. The new tests passed on WARP and on `pixel_aot_sdwa_cmp_hardware` on an AMD Radeon RX 9060 XT (driver 32.0.32029.2010), Windows 11 build 10.0.26300.10075, in 1.10 s; the debug layer was unavailable. The separate `pixel_aot_comparisons_hardware` entry still fails on this adapter in its pre-existing strict binary32 subnormal comparison ([issue #958](https://github.com/R0Y00/Xbox2Windows/issues/958)); that failure is outside this lot and does not affect the SDWA draw. This measures translated fixtures, not console behavior or full title execution. Reproduce with `ctest --preset dev --no-tests=error -R '^pixel_aot_sdwa_cmp_' -V`; the full measurement is `ctest --preset dev --no-tests=error -R '^(pixel_aot_|compute_store_aot_)' -E '_hardware$' -j 1 --output-junit out/build/dev/out/wave1-sdwa-after.xml` followed by `python -B tools/form_coverage.py out/build/dev/out/wave1-sdwa-after.xml --records out/build/dev/form_coverage --json out/wave1-sdwa-after.json`. A supplemental per-predicate fixture (`tests/pixel_aot_check.py draw-sdwa-int-compare`, tests `pixel_aot_sdwa_int_compare_{warp,hardware}`) exercises all 16 32-bit integer SDWA comparisons across four 4-channel groups (`i32_lo`, `i32_hi`, `u32_lo`, `u32_hi`) with 41 targeted single-channel negative controls plus static refusal checks for `low16` sources, pending loads, masked regions, float modifiers, `clamp` and SGPR pair destinations.
 
 Binary32 floating-point vector comparisons (`v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f32` in e32, e64, and whole-dword SDWA forms) evaluate the 16 IEEE-754 relations against scalar and vector operands, including subnormals, signed zeroes, infinities, and quiet/signaling NaNs. The e32 (VOPC) encoding requires destination `vcc` or `vcc_lo`; SGPR destinations (`s52`, `s[52:53]`) are accepted on suffix-less and explicit `_e64` (VOP3) encodings. Source modifiers (`neg`, `abs`) are accepted on e64 operands (`-s44`, `|v18|`, `-|s44|`), while `clamp` and `op_sel` remain rejected on comparisons. Rejection controls verify that untracked source registers, SGPR destinations on explicit e32, and sub-dword SDWA selections (`src0_sel:WORD_0`, `src1_sel:BYTE_2`) raise `ValueError`. The synthetic fixture `f32_compares()` verifies all 16 predicates across e32, e64, and whole-dword SDWA, validating them against an exact reference oracle (`f32_compares_reference()`). Mutating predicates or modifiers produces a mismatch.
 
@@ -8964,11 +8976,16 @@ of console shader programs and support for other console mesh paths are tracked 
 
 Slot 86 publishes complete Xbox mesh containers under a separate cache key. The
 key frames the original MS, the optional PS, the creation root signature and the
-pipeline-state stream with its pointers cleared. The shim writes `.m86` last,
+pipeline-state stream with its pointers and known padding cleared. A request that
+previously contained nonzero blend or depth-stencil padding gets a new key and
+must be published once under that key. The shim writes `.m86` last,
 after `.ps86`, `.root` and `.stream86`. An empty `.ps86` records a stream
 without a pixel shader. Use the cache tool with a desktop pair independently
 validated for that exact source and root. The ready marker records both output
-shader hashes so an incomplete or mixed update cannot reach PSO creation.
+shader hashes so an incomplete or mixed update cannot reach PSO creation. The
+cache fixture changes only blend and depth-stencil padding and reuses the cached
+PSO, then changes one sample-mask bit and checks for a new request and clear
+attachments.
 
 ```powershell
 python -B tools/startup/mesh86_cache.py <cache> <key> --mesh <desktop-ms.cso> --pixel <desktop-ps.cso>
@@ -8977,13 +8994,22 @@ ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V
 
 The executable subset uses the original root and PSO state. It accepts root
 constants captured on the list, single-sample color attachments in exact format
-order and a matching depth view when the stream declares one. A mesh stream
-without a pixel stage requires zero color attachments, a writable matching
-depth view and a physical adapter. The depth-only fixture removed the device
-on WARP when dispatched, so the shim refuses it there. Untracked descriptor
-tables, heap indexing, root descriptors,
+order and a matching depth view when the stream declares one. A cached mesh
+stream with zero color attachments requires a writable matching depth view.
+It can include a depth-only pixel stage. The mesh-only depth path still
+requires a physical adapter because its fixture removed the device on WARP.
+Untracked descriptor tables, heap indexing, root descriptors,
 stencil state and depth bounds are refused. A shader accepted individually can still
 fail PSO creation or lack a consumable root binding.
+
+The depth-only pixel fixture publishes a source-built mesh and pixel pair, binds
+zero color targets and a writable D16 depth view, and uses the guest
+`ExecuteIndirect` entry point. The pixel shader writes `SV_Depth = 0.25` on
+the left half and discards the right half. Readback checks four `0x4000` depth
+words and four unchanged `0xffff` clear words. A missing DSV format and a
+zero depth-write mask each leave the cached PSO unavailable. Missing draw
+attachments and incomplete root constants also leave depth clear. The MS-only
+depth and three-color-target controls still run in the same test.
 
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
@@ -11528,6 +11554,12 @@ the first thread's descriptors. The same commit's RTX 5080 Laptop
 three orders. [Issue #1115](https://github.com/R0Y00/Xbox2Windows/issues/1115)
 has the reports.
 
+The strict readback initializes the four output words to -1.0, -2.0, -3.0 and -4.0 before each dispatch.
+It prints the zero-based index and expected and actual bits of every differing word, finishes all three
+sampler orders and returns failure on any difference. In the missing-store control the shader omits both
+comparison stores only when the ordinary pair is reversed (swap 1). Those results would otherwise carry
+over from swap 0 and pass. Words 2 and 3 must instead retain the sentinels `c0400000` and `c0800000`.
+
 Two controls written as direct HLSL on that adapter, compiled with the same DXC
 at `cs_6_0` and run through the same readback path, separate the shader from the
 descriptor layer. With the two bindings written out explicitly — `SamplerState
@@ -11573,6 +11605,14 @@ Laptop (32.0.15.8142), the Intel Arc 140T (32.0.101.8132) and in-box WARP
 (10.0.26100.9818). The group-id build matched on the RTX and WARP, and read
 `0.25 0.25`/`0 0`, `0.75 0.75`/`0 0` and `0.25 0.25`/`1 1` on the Arc.
 An Arc rerun with fixed output indexing can isolate the sampler index.
+
+On Intel UHD Graphics 770 (8086:a780, driver 32.0.101.5973), both the plain and renamed translated tables
+differed at words 1 and 3 in each swap. Swaps 0, 1 and 2 produced `0.25 0.25 0 0`, `0.75 0.75 0 0` and
+`0.25 0.25 1 1` with DXC 1.9.2609.5 and the pinned SPIR-V tools. The same shader binaries matched all four
+words in every swap on RTX 4060 (32.0.15.9579) and in-box WARP (10.0.26100.9711).
+The direct control with fixed dispatch-thread output indexing also distinguished the two index sources on
+the UHD 770. Its dispatch-thread sampler index passed and its group sampler index reproduced all three rows.
+The local D3D12 debug layer was unavailable.
 
 ### Standalone comparison-sampler split in the SPIR-V bridge
 
@@ -12162,7 +12202,7 @@ adapter, with zero D3D12 debug errors and warnings. The fractional case on the s
   must fail at pixel (0, 0).
 
 `spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It requires
-mip 1 at 1.4375 and mip 3 at 3.75. At 1.5 and 1.5625 it checks for exact
+mip 1 at 1.4375, mip 2 at 2 and mip 3 at 3.75. At 1.49609375, 1.5, 1.5625 and 1.99609375 it checks for exact
 readback of mip 1 or 2, then requires the translated and direct HLSL shaders
 to agree and reports the selected mip. The wrong-mip control at 1.5625
 must reject mip 0 at pixel (0, 0) under either rounding rule. To test
@@ -12170,6 +12210,13 @@ nearest-mip selection away from the tie, append `--strict-rounding` to
 the normal arguments to `tests/spirv_window/minlod_fractional.py`.
 [Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
 fractional point cases run separately.
+
+On a 1/256 grid the UHD Graphics 770 (32.0.101.5973) last read mip 1 at 1.99609375 and first read
+mip 2 at 2. On the RTX 4060 (32.0.15.9579) and in-box WARP (10.0.26100.9711) these adjacent
+clamps were 1.49609375 and 1.5. The translated SPIR-V and direct HLSL matched all 64 pixels
+at each sampled clamp (Windows 11 build 26100.9711, DXC 1.9.2609.5, debug layer unavailable).
+Rounding the translated clamp to the nearest 1/128 changes the selected mip at 1.99609375 on the UHD
+and at 1.49609375 on RTX and WARP. The four original fractional fixture inputs are all exact multiples of 1/128.
 
 In separate `ps_6_0` and `ps_6_2` probes, in-box WARP
 10.0.19041.5794 selected green mip 1 for a per-sample clamp of 1.5625 under

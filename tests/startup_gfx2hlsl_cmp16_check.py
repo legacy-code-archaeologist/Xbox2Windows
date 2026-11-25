@@ -276,6 +276,26 @@ def controls():
     for token in ('-17', 's[2:3]', 'v[1:2]', 'vcc_lo', 'exec_lo', 'm0', '-v1', '|v1|', 'neg(v1)'):
         refused.append(('source %s' % token, refusal(name='v_cmp_lt_i16_e64',
                                                      asm='v_cmp_lt_i16_e64 s4, %s, v2' % token) is not None))
+    # NEG/ABS on every opcode: the e64 guard must cover v_cmpx, u16 and every relation, not only v_cmp_lt_i16
+    # (inline 1 with NEG decodes as -1, the text of inline -1).
+    for (cmpx, cond, typ), opcode in sorted(OPCODES.items()):
+        for field in ('neg', 'absolute'):
+            refused.append(('%s on inline 1 in v_cmp%s_%s_%s' % (field, 'x' if cmpx else '', cond, typ),
+                            'neg/abs' in (refusal(e64(opcode, 0 if cmpx else SGPR_DST, inline(1), V(2),
+                                                      **{field: 1})) or '')))
+    # Literal bounds: 0xffff is the widest 16-bit literal, 0x10000 would silently lose its high bit.
+    for typ in ('i16', 'u16'):
+        lt = OPCODES[False, 'lt', typ]
+        refused.append(('literal 0xffff %s accepted' % typ, refusal(e32(lt, LITERAL, 2, 0xffff)) is None))
+        refused.append(('literal 0x10000 %s' % typ,
+                        'wider than 16 bits' in (refusal(e32(lt, LITERAL, 2, 0x10000)) or '')))
+    # Conditions that exist for no 16-bit integer compare stay refused, as v_cmp_f does.
+    for cond in ('t', 'lg', 'nlg', 'nlt', 'nle', 'ngt', 'nge', 'neq', 'o', 'u'):
+        for typ in ('i16', 'u16'):
+            for x in ('', 'x'):
+                name = 'v_cmp%s_%s_%s_e64' % (x, cond, typ)
+                refused.append((name, refusal(name=name, asm='%s %sv1, v2' % (name, '' if x else 's4, '))
+                                == 'v_cmp%s_%s_%s' % (x, cond, typ)))
     refused.append(('destination vcc_hi', 'into vcc_hi' in (refusal(e64(lt_i16, VCC_HI, V(1), V(2))) or '')))
     refused.append(('destination m0', 'into m0' in (refusal(e64(lt_i16, M0, V(1), V(2))) or '')))
     refused.append(('no 16-bit f', refusal(name='v_cmp_f_i16_e64', asm='v_cmp_f_i16_e64 s4, v1, v2')

@@ -204,6 +204,16 @@ def mismatches(observed, expected):
     return [index for index in range(WORD_COUNT) if observed[index] != expected[index]]
 
 
+def require_matching_dispatches(context, first_name, first, second_name, second):
+    differences = mismatches(first, second)
+    if differences:
+        i = differences[0]
+        raise RuntimeError(f"{context}: first_mismatch=word={i} field={field(i)} "
+                           f"{first_name}={first[i]:08x} {second_name}={second[i]:08x} "
+                           f"{first_name}_width={first[WIDTH]} {second_name}_width={second[WIDTH]} "
+                           f"mismatches={len(differences)}")
+
+
 def report_mismatches(observed, expected, problems):
     first = problems[0]
     print(f"first_mismatch=word={first} field={field(first)} "
@@ -225,12 +235,18 @@ def check_source(label, adapter, mask_name, observed, width, mask):
         raise RuntimeError(f"{label} readback differs from the CPU reference at word {problems[0]}")
 
 
-def run_control(adapter, observed, mask, width, name, mutation, predicted):
+def run_control(adapter, observed, mask, baseline_width, name, mutation, predicted):
+    width = observed[WIDTH]
+    widths = f"baseline_width={baseline_width} control_width={width}"
+    if width not in SUPPORTED_WIDTHS:
+        raise RuntimeError(f"negative control {name} reported an unsupported subgroup width: {widths}")
     mutated = reference(mask, width, **mutation)
     unexpected = mismatches(observed, mutated)
     if unexpected:
         first = report_mismatches(observed, mutated, unexpected)
-        raise RuntimeError(f"negative control {name} differs from its mutated reference at word {first}")
+        raise RuntimeError(f"negative control {name} differs from its mutated reference at word {first}: {widths}")
+    if width != baseline_width:
+        raise RuntimeError(f"negative control {name} changed subgroup width: {widths} mutated_reference=exact")
 
     expected = reference(mask, width)
     problems = mismatches(observed, expected)
@@ -267,14 +283,14 @@ def main(argv):
                     raise RuntimeError(f"{label} reported an invalid subgroup width: {width}")
                 check_source(label, adapter, mask_name, observed, width, mask)
                 code, repeat = run(offscreen_check, adapter, dxil)
-                if repeat != observed:
-                    raise RuntimeError(f"{label} readback changed between identical dispatches")
+                if code == SKIP:
+                    raise RuntimeError(f"{label} {mask_name} repeat skipped after first dispatch at width {width}")
+                require_matching_dispatches(f"{label} readback changed between identical dispatches ({mask_name})",
+                                            "first", observed, "repeat", repeat)
                 print(f"source={label} adapter={adapter} mask={mask_name} repeat=identical")
                 results[label] = observed
-            if results["bridge"] != results["direct"]:
-                first = next(index for index in range(WORD_COUNT)
-                             if results["bridge"][index] != results["direct"][index])
-                raise RuntimeError(f"bridge and direct HLSL differ at word {first} ({field(first)})")
+            require_matching_dispatches(f"bridge and direct HLSL differ ({mask_name})",
+                                        "bridge", results["bridge"], "direct", results["direct"])
             print(f"adapter={adapter} mask={mask_name} bridge_equals_direct=true")
             for control_name, (mutation, predicted) in CONTROLS.items():
                 control = emit_bridge(directory, tools, mask, **mutation)
@@ -282,7 +298,7 @@ def main(argv):
                 if code == SKIP:
                     print(f"skip: {adapter} has no capable D3D12 adapter")
                     return SKIP
-                run_control(adapter, observed, mask, width, control_name, mutation, predicted)
+                run_control(adapter, observed, mask, results["bridge"][WIDTH], control_name, mutation, predicted)
     print(f"subgroup compaction fixture passed on {adapter}")
     return 0
 

@@ -27,8 +27,16 @@ inline T at(const unsigned char* base, std::uint32_t offset) {
     return *reinterpret_cast<const T*>(base + offset);
 }
 
-// PEB::ImageBaseAddress. In a pe_map host it names the host EXE, not this image.
-inline bool started_as_process() { return at<const void*>(peb(), 0x10) == &__ImageBase; }
+// True only when Windows started this image as the process EXE. PEB::ImageBaseAddress alone is not enough:
+// pe_map_run_main reports the mapped EXE there (#1151), so under pe_run_package it also equals &__ImageBase.
+// pe_map leaves the PEB loader list alone, so there the first InLoadOrderModuleList entry is the host EXE.
+// Natively the process EXE is the first entry. Both must name this image.
+inline bool started_as_process() {
+    if (at<const void*>(peb(), 0x10) != &__ImageBase) return false;
+    const unsigned char* head = at<const unsigned char*>(peb(), 0x18) + 0x10;
+    const unsigned char* first = at<const unsigned char*>(head, 0);
+    return first != head && at<const void*>(first, 0x30) == &__ImageBase;  // DllBase
+}
 
 inline bool same_ascii(const wchar_t* name, std::uint16_t bytes, const char* expected) {
     std::uint16_t i = 0;

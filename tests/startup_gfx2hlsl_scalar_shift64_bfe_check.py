@@ -244,6 +244,91 @@ def runtime_blocks():
     assert text.index('shl64(s6, s7') < text.index('s6 = '), text
 
 
+def run_block(text, funcs, regs):
+    """Run one emitted `{ ... }` block with the helper functions; returns (registers, scc)."""
+    m = re.fullmatch(r'\{ uint2? t = (\w+)\((.*?)\); (.*) \}', text)
+    assert m, text
+    args = []
+    for tok in (a.strip() for a in m.group(2).split(',')):
+        args.append(U(regs[int(tok[1:])]) if tok.startswith('s') else U(int(tok[:-1], 0)))
+    t = funcs[m.group(1)](*args)
+    out, scc = dict(regs), None
+    for stmt in (s.strip() for s in m.group(3).split(';') if s.strip()):
+        lhs, rhs = (p.strip() for p in stmt.split(' = ', 1))
+        rhs = re.sub(r'\b(\d+)u\b', r'\1', re.sub(r'\bt\.x\b', 't[0]', re.sub(r'\bt\.y\b', 't[1]', rhs)))
+        value = eval(rhs, {'t': t if isinstance(t, tuple) else int(t)})  # noqa: S307 - generated text
+        if lhs == 'scc':
+            scc = bool(value)
+        else:
+            out[int(lhs[1:])] = int(value)
+    return out, scc
+
+
+def runtime_semantics():
+    """Evaluate the run-time block for operands unknown at translation time against the reference."""
+    funcs = make_helpers(S.translate('v_lshlrev_b64', 'shl64')[1])
+    rows = {'s_lshl_b64': ((1, 32), (1, 1), (0x8000000000000000, 1), (0x00000000f0f0f0f0, 4)),
+            's_lshr_b64': ((0x100000000, 32), (0x8000000000000000, 63), (1, 1)),
+            's_ashr_i64': ((0x8000000000000000, 1), (0x7fffffffffffffff, 62)),
+            's_bfe_i32': ((0x000000f0, 4 | 4 << 16), (0x80000000, 31 | 1 << 16), (0x12345678, 0), (0x1, 2 << 16)),
+            's_bfe_u64': ((0x123456789abcdef0, 32 | 16 << 16), (M64, 63 | 8 << 16)),
+            's_bfe_i64': ((0x00000000000000f0, 4 | 4 << 16), (0x8000000000000000, 63 | 1 << 16))}
+    for op, cases in rows.items():
+        wide = op in WIDE_RESULT
+        stage = stage_for(op)                      # s6, s7 and s9 are unknown at translation time
+        text = [line for line in stage.lines if HELPERS[op][0] + '(' in line][0]
+        for x, amount in cases:
+            regs = {SRC: x & M32, SRC + 1: x >> 32, AMT: amount, DST: 0xdeadbeef, DST + 1: 0xdeadbeef}
+            if op == 's_bfe_i32':
+                x &= M32
+            out, scc = run_block(text, funcs, regs)
+            want = reference(op, x, amount)
+            got = out[DST] | (out[DST + 1] << 32 if wide else 0)
+            assert got == want, '%s %#x,%#x: block gave %#x, reference %#x' % (op, x, amount, got, want)
+            assert scc == (want != 0), '%s %#x,%#x: SCC %s for result %#x' % (op, x, amount, scc, want)
+            if not wide:
+                assert out[DST + 1] == 0xdeadbeef, (op, 'wrote the next register')
+
+
+def partly_known():
+    """One constant word, one unknown word, or a constant source with an unknown amount: no folding."""
+    cases = ((('s_lshl_b64', 's[20:21], s[6:7], s9'), {6: ('const', 1)}),
+             (('s_lshl_b64', 's[20:21], s[6:7], s9'), {7: ('const', 0)}),
+             (('s_lshl_b64', 's[20:21], s[6:7], s9'), {6: ('const', 1), 7: ('const', 0)}),
+             (('s_lshl_b64', 's[20:21], s[6:7], s9'), {9: ('const', 3)}),
+             (('s_lshl_b64', 's[20:21], s[6:7], s9'), {6: ('const', 1), 9: ('const', 3)}),
+             (('s_lshl_b64', 's[20:21], s[6:7], s9'), {7: ('const', 0), 9: ('const', 3)}),
+             (('s_bfe_i32', 's20, s6, s9'), {6: ('const', 5)}),
+             (('s_bfe_i32', 's20, s6, s9'), {9: ('const', 5)}))
+    funcs = make_helpers(S.translate('v_lshlrev_b64', 'shl64')[1])
+    fills = {'s_lshl_b64': ((1, 2, 1), (0x80000000, 1, 3), (0xf0f0f0f0, 0x0f0f0f0f, 33)),
+             's_bfe_i32': ((0xf0, 0, 4 | 4 << 16), (0x8000, 0, 15 | 1 << 16), (0x1, 0, 2 << 16))}
+    for (op, operands), sym in cases:
+        stage = M.ProbeStage()
+        stage.sym.update(sym)
+        stage.one(op, '%s %s' % (op, operands))
+        assert any(HELPERS[op][0] + '(' in line for line in stage.lines), (op, sym, stage.lines)
+        assert not any(line.startswith('s20 = 0x') for line in stage.lines), (op, sym, stage.lines)
+        # Run the emitted block: constants stay in their registers, the unknown ones take concrete values.
+        text = [line for line in stage.lines if HELPERS[op][0] + '(' in line][0]
+        wide = op in WIDE_RESULT
+        for lo, hi, amount in fills[op]:
+            regs = {SRC: lo, SRC + 1: hi, AMT: amount, DST: 0xdeadbeef, DST + 1: 0xdeadbeef}
+            regs.update({r: v[1] for r, v in sym.items()})
+            x = regs[SRC] | (regs[SRC + 1] << 32 if wide else 0)
+            out, scc = run_block(text, funcs, regs)
+            want = reference(op, x, regs[AMT])
+            got = out[DST] | (out[DST + 1] << 32 if wide else 0)
+            assert got == want, '%s %s %#x,%#x: block gave %#x, reference %#x' % (op, sym, x, regs[AMT], got, want)
+            assert scc == (want != 0), (op, sym, x, regs[AMT], scc, want)
+        # A destination that held a constant must not keep it once the run-time block has overwritten it.
+        stale = M.ProbeStage()
+        stale.sym.update(sym)
+        stale.sym.update({DST: ('const', 7), DST + 1: ('const', 9)})
+        stale.one(op, '%s %s' % (op, operands))
+        assert not set(range(DST, DST + 1 + wide)) & set(stale.sym), (op, sym, stale.sym)
+
+
 def uniformity():
     for op in OPCODES:
         stage = M.ProbeStage()
@@ -262,6 +347,24 @@ def uniformity():
         except G.Unsupported:
             continue
         raise AssertionError('%s on a lane mask should be refused' % op)
+
+
+def varying_operand():
+    """A varying low word, high word or shift amount makes the result and SCC varying."""
+    for op in OPCODES:
+        wide = op in WIDE_RESULT
+        for varying in ([SRC, AMT] if not wide else [SRC, SRC + 1, AMT]):
+            stage = M.ProbeStage()
+            stage.varying_s, stage.scc_uniform = set(), True
+            code = M.encode_sop2(OPCODES[op], DST, SRC, AMT)
+            _, name, asm, _ = M.D.decode_instruction(code, 0)
+            for reg in (SRC, SRC + 1, AMT):
+                stage.sym[reg] = ('ud', 1)
+            stage.sym.pop(varying)
+            stage.varying_s.add(varying)
+            stage.one(name, asm)
+            assert DST in stage.varying_s and not stage.scc_uniform, (op, varying, stage.varying_s)
+            assert (not wide) or DST + 1 in stage.varying_s, (op, varying, stage.varying_s)
 
 
 def overwritten_mask():
@@ -313,7 +416,10 @@ def main():
     checked = helper_grid()
     const_folding()
     runtime_blocks()
+    runtime_semantics()
+    partly_known()
     uniformity()
+    varying_operand()
     refusals()
     overwritten_mask()
     print('startup scalar 64-bit shift and bitfield extract controls passed (%d helper cases)' % checked)

@@ -62,6 +62,34 @@ bool mesh86_hardware_depth()
         !(desc.VendorId == 0x1414 && desc.DeviceId == 0x008c);
 }
 
+void mesh86_clear_state_padding(unsigned char* record, UINT type, std::size_t size)
+{
+    constexpr std::size_t tag_size = sizeof(UINT);
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
+        constexpr auto targets = tag_size + offsetof(D3D12_BLEND_DESC, RenderTarget);
+        constexpr auto stride = sizeof(D3D12_RENDER_TARGET_BLEND_DESC);
+        constexpr auto fields = offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+        static_assert(stride == 40 && fields == 37);
+        for (UINT i = 0; i < 8; ++i)
+            std::memset(record + targets + i * stride + fields, 0, stride - fields);
+        constexpr auto used = tag_size + sizeof(D3D12_BLEND_DESC);
+        std::memset(record + used, 0, size - used);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL ||
+               type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+        constexpr auto masks = offsetof(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1;
+        constexpr auto faces = offsetof(D3D12_DEPTH_STENCIL_DESC, FrontFace);
+        static_assert(masks == offsetof(D3D12_DEPTH_STENCIL_DESC1, StencilWriteMask) + 1 &&
+                      faces == offsetof(D3D12_DEPTH_STENCIL_DESC1, FrontFace));
+        std::memset(record + tag_size + masks, 0, faces - masks);
+        const auto used = tag_size + (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
+            ? sizeof(D3D12_DEPTH_STENCIL_DESC) : sizeof(D3D12_DEPTH_STENCIL_DESC1));
+        std::memset(record + used, 0, size - used);
+    } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+        constexpr auto used = tag_size + sizeof(DXGI_SAMPLE_DESC);
+        std::memset(record + used, 0, size - used);
+    }
+}
+
 // Parse the entire stream and keep a pointer-free copy. The shared tag is only
 // recognized as Xbox MS when its shader container declares mesh and native code.
 bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request& result, bool& recognized)
@@ -122,9 +150,7 @@ bool mesh86_request(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Mesh86Request&
         if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE || mesh ||
             (type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS))
             std::memset(record + 4, 0, 4);
-        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC ||
-            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
-            std::memset(record + size - 4, 0, 4);
+        mesh86_clear_state_padding(record, type, size);
         offset += size;
     }
     return recognized && result.root && result.root->own().kind == root_signature_kind;

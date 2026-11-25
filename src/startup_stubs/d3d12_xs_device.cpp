@@ -2081,7 +2081,7 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         offset += desktop_stream_size(type);
     }
     if (ok && cached_mesh && (untracked_depth_state || targets.NumRenderTargets > 8 ||
-        (pixel ? !targets.NumRenderTargets : targets.NumRenderTargets || !depth_enabled || !depth_writes) ||
+        (targets.NumRenderTargets ? !pixel : !depth_writes) ||
         (depth_enabled && depth == DXGI_FORMAT_UNKNOWN) ||
         std::any_of(targets.RTFormats, targets.RTFormats + std::min<UINT>(targets.NumRenderTargets, 8),
             [](DXGI_FORMAT value) { return value == DXGI_FORMAT_UNKNOWN; }))) {

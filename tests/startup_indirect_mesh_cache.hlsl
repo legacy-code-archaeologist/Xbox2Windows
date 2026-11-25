@@ -20,3 +20,9 @@ PixelOutput main(PixelInput input) {
     output.first = output.second = output.third = float4(1, 0, 0, 1);
     return output;
 }
+
+float depth_only(PixelInput input) : SV_Depth {
+    if (any(gates != uint2(17, 29)) || input.side != 0 || input.position.x >= 2)
+        discard;
+    return 0.25;
+}

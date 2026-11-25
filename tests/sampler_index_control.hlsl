@@ -1,4 +1,5 @@
-// One control shader, built twice, that differs only in the source of the sampler descriptor index.
+// The two index controls differ only in the source of the sampler descriptor index.
+// The split-sampler readback also uses this shader to check for missing output stores.
 //
 // The descriptor tables, the shader model, the output indexing and the three sampler swaps stay
 // identical between the two builds, so a difference in the readback can only come from the index:
@@ -24,7 +25,12 @@ void main(uint3 dispatch_thread : SV_DispatchThreadID, uint3 group : SV_GroupID)
 #endif
     const uint output_index = dispatch_thread.x;
     const float2 uv = float2(1.25, 0.5);
-    results.Store(output_index * 4, asuint(depth_texture.SampleLevel(ordinary[sampler_index], uv, 0).x));
+    const float sample_value = depth_texture.SampleLevel(ordinary[sampler_index], uv, 0).x;
+    results.Store(output_index * 4, asuint(sample_value));
+#if defined(OMIT_STORES_ON_ORDINARY_SWAP)
+    // Skip both comparison stores only when the ordinary sampler pair is reversed.
+    if (sample_value != (output_index == 0 ? 0.25 : 0.75)) return;
+#endif
     results.Store((output_index + 2) * 4,
                   asuint(depth_texture.SampleCmpLevelZero(comparison[sampler_index], uv, 0.5)));
 }

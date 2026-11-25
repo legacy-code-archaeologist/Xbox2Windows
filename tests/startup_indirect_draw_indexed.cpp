@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -252,7 +253,7 @@ Method slot(IUnknown* object, unsigned index)
 }
 
 template <typename T>
-ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object)
+ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* object, bool allow_missing = false)
 {
     // The guest forwards SetPrivateDataInterface with the underlying desktop argument.
     constexpr GUID key{0x18097577, 0x0a4a, 0x427c, {0xac, 0xd5, 0xac, 0x1d, 0x98, 0x90, 0x65, 0x85}};
@@ -261,6 +262,7 @@ ComPtr<T> native_object(ID3D12Device* device, ID3D12Device* guest, IUnknown* obj
     UINT bytes = sizeof(IUnknown*);
     const HRESULT read = device->GetPrivateData(key, &bytes, stored.GetAddressOf());
     check(guest->SetPrivateDataInterface(key, nullptr), "clear underlying object");
+    if (allow_missing && (read == DXGI_ERROR_NOT_FOUND || (SUCCEEDED(read) && !stored))) return {};
     check(read, "retrieve underlying object");
     ComPtr<T> result;
     check(stored.As(&result), "query underlying object");
@@ -356,24 +358,31 @@ struct alignas(void*) Subobject {
     T value{};
 };
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage>
+enum class StreamDepth { none, writable, read_only };
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage, bool CacheControl = false>
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
                                D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE pixel,
-                               D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, bool depth_only = false)
+                               D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, StreamDepth depth = StreamDepth::none)
 {
+    using Depth = std::conditional_t<CacheControl, D3D12_DEPTH_STENCIL_DESC1, D3D12_DEPTH_STENCIL_DESC>;
+    constexpr auto depth_type = CacheControl ? D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
+                                             : D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
     struct {
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
         Subobject<Stage, D3D12_SHADER_BYTECODE> source;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
-        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<depth_type, Depth> depth;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
     } stream;
-    static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16 + 8 + 24);
+    static_assert(offsetof(decltype(stream), as) == 16 + 24 + 24 + 48 + (CacheControl ? 64 : 56) + 8 + 40 + 16 + 8);
     stream.root.value = root;
     stream.source.value = source;
     stream.ps.value = pixel;
@@ -382,9 +391,10 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.raster.value.DepthClipEnable = TRUE;
     stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    if (depth_only) {
+    if (depth != StreamDepth::none) {
         stream.depth.value.DepthEnable = TRUE;
-        stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        if (depth == StreamDepth::writable)
+            stream.depth.value.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         stream.depth.value.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         stream.dsv.value = DXGI_FORMAT_D16_UNORM;
     }
@@ -393,12 +403,40 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.targets.value.NumRenderTargets = targets;
     stream.samples.value.Count = 1;
     stream.as.value = amplification;
-    const D3D12_PIPELINE_STATE_STREAM_DESC desc{
-        amplification.pShaderBytecode ? sizeof(stream) : sizeof(stream) - sizeof(stream.as), &stream};
     using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     ComPtr<IUnknown> result;
-    check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
-                                 reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    const auto create = [&](void* bytes, std::size_t size) {
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{size, bytes};
+        check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
+                                     reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    };
+    if constexpr (CacheControl) {
+        constexpr auto masks = offsetof(Depth, StencilWriteMask) + 1;
+        constexpr auto faces = offsetof(Depth, FrontFace);
+        constexpr auto write_mask = offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+        const int padding = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_PADDING", nullptr, 0) ? 0xa5 : 0;
+        std::memset(reinterpret_cast<unsigned char*>(&stream.depth.value) + masks, padding, faces - masks);
+        for (auto& blend : stream.blend.value.RenderTarget) {
+            blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+            blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            std::memset(reinterpret_cast<unsigned char*>(&blend) + write_mask, padding, sizeof(blend) - write_mask);
+        }
+        stream.sample_mask.value = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_SAMPLE_MASK", nullptr, 0)
+            ? UINT_MAX ^ 1u : UINT_MAX;
+
+        // Omit the amplification record from this cache profile.
+        constexpr auto prefix = offsetof(decltype(stream), as);
+        constexpr auto suffix = offsetof(decltype(stream), blend);
+        alignas(void*) std::array<unsigned char, sizeof(stream) - sizeof(stream.as)> bytes;
+        std::memcpy(bytes.data(), &stream, prefix);
+        std::memcpy(bytes.data() + prefix, &stream.blend, sizeof(stream) - suffix);
+        create(bytes.data(), bytes.size());
+    } else {
+        create(&stream, amplification.pShaderBytecode ? offsetof(decltype(stream), blend) : offsetof(decltype(stream), as));
+    }
     return result;
 }
 
@@ -680,7 +718,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr, bool cached_depth_pixel = false)
 {
     std::unique_lock<std::mutex> recording;
     if (gate) recording = std::unique_lock<std::mutex>(gate->state);
@@ -1128,10 +1166,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                 std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * pixel_bytes,
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
-                const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
+                const bool covered = (cached_depth_only && !cached_depth_pixel) ||
+                    (indexed ? right_half == draw_right : translated || !right_half || draw_right);
                 const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
-                auto wanted = drawn ? (cached_depth_only ? 0u :
+                const auto depth_word = cached_depth_pixel ? 0x4000u : 0u; // D16_UNORM encodes SV_Depth 0.25.
+                auto wanted = drawn ? (cached_depth_only ? depth_word :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
                 if (leased) wanted = right_half ? leased->expected_right.value_or(leased->expected) : leased->expected;
                 if (rect) {
@@ -1469,6 +1509,11 @@ int main(int argc, char** argv) try
     wchar_t mesh86_dir[MAX_PATH]{};
     if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
         const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
+        char depth_mode[16]{};
+        const bool depth_pixel = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH_PIXEL", depth_mode, sizeof(depth_mode)) != 0;
+        auto depth = depth_only ? StreamDepth::writable : StreamDepth::none;
+        if (std::strcmp(depth_mode, "no-dsv") == 0) depth = StreamDepth::none;
+        if (std::strcmp(depth_mode, "read-only") == 0) depth = StreamDepth::read_only;
         const auto input = std::filesystem::path(mesh86_dir);
         const auto read_stage = [&](const char* name) {
             std::ifstream file(input / name, std::ios::binary);
@@ -1476,7 +1521,7 @@ int main(int argc, char** argv) try
             return std::vector<char>(std::istreambuf_iterator<char>(file), {});
         };
         const auto ms = read_stage("source.ms.dxbc");
-        const auto ps = depth_only ? std::vector<char>{} : read_stage("source.ps.dxbc");
+        const auto ps = depth_only && !depth_pixel ? std::vector<char>{} : read_stage("source.ps.dxbc");
         D3D12_ROOT_PARAMETER parameter{};
         parameter.ParameterType = lease_fixture ? D3D12_ROOT_PARAMETER_TYPE_SRV : D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameter.ShaderVisibility = lease_fixture ? D3D12_SHADER_VISIBILITY_MESH : D3D12_SHADER_VISIBILITY_ALL;
@@ -1488,9 +1533,12 @@ int main(int argc, char** argv) try
         const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create cached mesh signature");
-        const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
-            guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
-            {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth_only);
+        const D3D12_SHADER_BYTECODE ms_code{ms.data(), ms.size()};
+        const D3D12_SHADER_BYTECODE ps_code{ps.empty() ? nullptr : ps.data(), ps.size()};
+        const auto pso = lease_fixture
+            ? guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(guest.Get(), root.Get(), ms_code, ps_code, {}, 1, depth)
+            : guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, true>(guest.Get(), root.Get(), ms_code, ps_code, {},
+                                                                         depth_only ? 0 : 3, depth);
         if (dual_lease) {
             const bool init_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_INIT_ONLY", nullptr, 0) != 0;
             const auto initialize = writer_pipeline(device.Get(), writer.Get(), "initialize_mesh_record");
@@ -1551,13 +1599,26 @@ int main(int argc, char** argv) try
         }
         const auto verify = [&](Refusal control, const char* label) {
             return run(device.Get(), guest.Get(), writer.Get(), work.Get(), root.Get(), pso.Get(), signature.Get(),
-                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, false, depth_only ? 0 : 3, depth_only);
+                       DrawKind::mesh, false, control, label, nullptr, false, nullptr, false, false,
+                       depth_only ? 0 : 3, depth_only, false, nullptr, nullptr, depth_pixel);
         };
-        if (!GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0))
-            return verify(Refusal::mesh_pending, "unavailable cached mesh") ? 0 : 1;
-        return verify(Refusal::none, depth_only ? "cached mesh depth-only" : "cached translated mesh with three attachments") &&
-            verify(Refusal::incomplete_mesh_constants, "cached mesh incomplete root constants") &&
-            verify(Refusal::mesh_attachment_count, "cached mesh missing attachment") ? 0 : 1;
+        const bool ready = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_READY", nullptr, 0) != 0;
+        const bool invalid_depth_pixel = depth_pixel && depth != StreamDepth::writable;
+        if (depth_pixel) {
+            const bool native = bool(native_object<ID3D12PipelineState>(device.Get(), guest.Get(), pso.Get(), true));
+            if (native != (ready && !invalid_depth_pixel)) {
+                std::fprintf(stderr, "depth-only pixel mode %s: unexpected native PSO presence %d\n", depth_mode, native);
+                return 1;
+            }
+        }
+        const bool ok = !ready || invalid_depth_pixel
+            ? verify(Refusal::mesh_pending, invalid_depth_pixel ? depth_mode : "unavailable cached mesh")
+            : verify(Refusal::none, depth_pixel ? "cached mesh depth-only pixel stage" :
+                depth_only ? "cached mesh depth-only" : "cached translated mesh with three attachments") &&
+              verify(Refusal::incomplete_mesh_constants, "cached mesh incomplete root constants") &&
+              verify(Refusal::mesh_attachment_count, "cached mesh missing attachment");
+        if (depth_pixel) check_lease_debug(info.Get());
+        return ok ? 0 : 1;
     }
     if (mesh && GetEnvironmentVariableA("X2W_MESH_REQUEST_FIXTURE", nullptr, 0)) {
         const auto cache = std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));

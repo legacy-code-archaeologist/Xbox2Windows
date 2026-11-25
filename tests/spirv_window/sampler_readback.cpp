@@ -55,6 +55,11 @@ void check_sampler_views(ID3D12Device* device, const char* path)
     auto output = make_buffer(device, 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = make_buffer(device, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::array<float, 4> sentinels{-1.0f, -2.0f, -3.0f, -4.0f};
+    auto reset = make_buffer(device, sizeof(sentinels), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    check(reset->Map(0, &empty, &mapped), "Map sampler fixture sentinels");
+    std::memcpy(mapped, sentinels.data(), sizeof(sentinels));
+    reset->Unmap(0, nullptr);
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     ComPtr<ID3D12DescriptorHeap> views, samplers;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views)), "Create sampler fixture views");
@@ -74,6 +79,7 @@ void check_sampler_views(ID3D12Device* device, const char* path)
     UINT sampler_stride = device->GetDescriptorHandleIncrementSize(hd.Type);
 
     // Reverse each typed pair independently. The other operation must retain its results.
+    bool mismatched = false;
     for (UINT mask : {0u, 1u, 2u}) {
         auto handle = samplers->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < 4; ++i) {
@@ -91,15 +97,17 @@ void check_sampler_views(ID3D12Device* device, const char* path)
         ComputeCommands commands(device, pipeline.Get());
         auto list = commands.list.Get();
         if (mask == 0) {
-            transition(list, output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             D3D12_TEXTURE_COPY_LOCATION dst{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             D3D12_TEXTURE_COPY_LOCATION src{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
             src.PlacedFootprint = footprint;
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        } else {
-            transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
+        // Each sampler swap must write its own four results, including values unchanged from the previous swap.
+        transition(list, output.Get(), mask == 0 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(output.Get(), 0, reset.Get(), 0, sizeof(sentinels));
+        transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         list->SetComputeRootSignature(root.Get());
         ID3D12DescriptorHeap* heaps[] = {views.Get(), samplers.Get()};
         list->SetDescriptorHeaps(2, heaps);
@@ -125,7 +133,16 @@ void check_sampler_views(ID3D12Device* device, const char* path)
         readback->Unmap(0, &empty);
         std::printf("sampler swap %u: sample %g %g, comparison %g %g\n",
                     mask, actual[0], actual[1], actual[2], actual[3]);
-        if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0)
-            throw std::runtime_error("Split sampler readback mismatch");
+        for (size_t i = 0; i < expected.size(); ++i) {
+            UINT expected_word, actual_word;
+            std::memcpy(&expected_word, &expected[i], sizeof(expected_word));
+            std::memcpy(&actual_word, &actual[i], sizeof(actual_word));
+            if (actual_word != expected_word) {
+                std::printf("sampler swap %u word %zu: expected=%08x actual=%08x\n",
+                            mask, i, expected_word, actual_word);
+                mismatched = true;
+            }
+        }
     }
+    if (mismatched) throw std::runtime_error("Split sampler readback mismatch");
 }
