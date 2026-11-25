@@ -14689,6 +14689,21 @@ Cube sampling in `tools/startup/gfx2hlsl.py` (#1723): cube `image_sample_l` and 
 `v_mul_hi_u32_u24` is refused (`Unsupported`), in the VOP2 and the `_e64` spelling. The exact lowering was written and passes the CPU check, but FXC 10.0.26100 (the compiler the startup path uses, `ps_5_1`) folds it to a constant zero and the draw reads `00000000` for every lane, on WARP and on an RTX 3070 Ti, while DXC compiles the same text correctly. Reported in #2077 by independent runs on an RX 9070 XT, WARP and an RTX 3070 Ti. The cause is not the multiply: the result is at most `0xffff`, so read as a float output word it is always a binary32 denormal, and FXC folds a float output whose provable range lies below `0x00800000` to a constant zero. A compile-only run in #2077 (FXC `ps_5_1`; `/Gis` does not help) showed the fold also for a bare `F(v0 >> 9)` (maximum `0x7fffff`), no fold for `F(v0 >> 8)` (maximum `0xffffff`), and no fold for the same arithmetic written to a `uint4` output. Those variants were compiled, not drawn, and only one FXC version was tried. This replaces an earlier claim that three unsigned variants folded because of how they were written. Small words that FXC cannot prove small survive on hardware (`v_mul_hi_i32_i24` reads back `00003fff,00004000,00000000,ffffc000`). The instruction is therefore refused instead of translated into zeros that look like a result. Any other lowering whose float output word is provably below `0x00800000` would meet the same fold. A lowering FXC keeps can replace the refusal later.
 
 `tests/startup_gfx2hlsl_mul24_align_check.py` translates each instruction, evaluates the emitted text on the CPU against a reference written with unbounded integers, and checks that `v_mul_hi_u32_u24` is refused. Run with `python3 -B tests/startup_gfx2hlsl_mul24_align_check.py` (`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mul24_align$' -V`). `tests/startup_gfx2hlsl_mul24_align_draw_check.py` draws the six translated instructions through FXC `ps_5_1` and DXC `ps_6_0` and compares the GPU readback with the same reference (`startup_gfx2hlsl_mul24_align_warp` and `_hardware`); both compilers run before the test fails, so one compiler's failure does not hide the other's result. The draw covers the six translated instructions only.
+## Startup translator: explicit-gradient image_sample_d
+
+`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_d` form in a pixel stage to `tex.SampleGrad(smp, uv, ddx, ddy)`. The address dwords are ddx, then ddy (one register per coordinate axis each), then the coordinates: six registers for 2D, seven for a 2D array (slice last), nine for a volume (a contiguous nine-dword volume address encoded as a sixteen-register range is trimmed to nine). Only `dim:`, `dmask:` and the cache-policy bits `dlc`, `glc`, `slc` are accepted.
+
+Refused with a named reason: `image_sample_c_d` (it would need `SampleCmpGrad`, shader model 6.8; only `image_sample_c` and `_c_lz` are lowered), `image_sample_d_o` and every other offset, bias, clamp, `a16`, `tfe` or `lwe` form, an empty `dmask`, a 1D image, and an address count that does not match the dimension.
+
+The guest sampler LOD range is kept: a constant sampler carries MIN_LOD and MAX_LOD to the static sampler through the same `smpl` line as `image_sample`, `_l` and `_lz` (sampler words `(0, 0, 0x04000000, 0)` stay capped at mip 0), with the same refusals for a LOD bias and for MIN_LOD above MAX_LOD. A mip filter of 0 keeps the ordinary sampler, and a heap sampler is not validated and is logged once per module.
+
+Verified: the Python translation checks only (address order, refusals, the LOD cap, fixture words against `llvm-mc`). A D3D12 readback of `SampleGrad` against a CPU reference is not part of this change and is unverified.
+
+```bash
+./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_d_check.py binary <llvm-mc>
+ctest --preset dev --no-tests=error -R "^startup_image_sample_d" -V
+```
 
 ## Non-constant scalar symbols at branch targets in the startup translator
 
