@@ -2223,6 +2223,8 @@ class Stage:
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_H:
             return self.half_alu(base, ops, mods)
+        if base in VEC_H1:
+            return self.half_unary(base, ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -4769,6 +4771,36 @@ class Stage:
     def op_v_fma_mixhi_f16(self, ops, mods):
         self.mix(ops, mods, 'hi')
 
+    def half_src(self, tok):
+        """float expression for the binary16 value in the low half of a 32-bit operand."""
+        # -0x3800 is the NEG modifier on the literal 0x3800 (the half 0.5); -1 and -0.5 are inline constants.
+        neg = (tok.startswith('-') and not re.match(r'-[\d.]', tok)) or re.fullmatch(r'-0x[0-9a-fA-F]+', tok) is not None
+        if neg:
+            tok = tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        if tok in FLOATS:
+            text = repr(float(struct.unpack('<e', struct.pack('<e', FLOATS[tok]))[0]))
+        elif tok == '-0':
+            text = '0.0'
+        else:
+            text = 'f16tof32(%s & 0xffffu)' % self.u(tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def half_unary(self, base, ops, mods):
+        """VEC_H1: binary16 one-source operation, computed in binary32 and rounded into the low half."""
+        if mods:
+            raise Unsupported('%s with %s' % (base, mods))
+        if len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2' % (base, len(ops)))
+        d = reg_range(ops[0])
+        if not d or d[0] != 'v':
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        self.set_v(d[1], 'f32tof16rne(%s)' % VEC_H1[base].format(self.half_src(ops[1])))
+
     def i64_words(self, tok, signed=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
         32-bit hex literal (zero-extended, sign-extended when the operation is signed)."""
@@ -5327,6 +5359,15 @@ VEC_H = {
     'v_cvt_i16_f16': (1, 'h', 'isnan({0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
     'v_cvt_u16_f16': (1, 'h', 'isnan({0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
 }
+# binary16 one-source operations (VOP1, or VOP3 without modifiers): the source is the low half of the operand,
+# the result is rounded to binary16 (to nearest even, not toward zero as f32tof16 does) and written to the low half with the high half cleared, as v_cvt_f16_f32 does.
+# v_fract_f16 stops at the largest binary16 below one; v_sin/cos take revolutions, as the binary32 forms do.
+VEC_H1 = {
+    'v_ceil_f16': 'ceil({0})', 'v_floor_f16': 'floor({0})', 'v_trunc_f16': 'trunc({0})', 'v_rndne_f16': 'round({0})',
+    'v_fract_f16': 'min(frac({0}), 0.99951171875)', 'v_rcp_f16': '1.0 / {0}', 'v_rsq_f16': 'rsqrt({0})',
+    'v_sqrt_f16': 'sqrt({0})', 'v_sin_f16': 'sin({0} * 6.283185307)', 'v_cos_f16': 'cos({0} * 6.283185307)',
+    'v_exp_f16': 'exp2({0})', 'v_log_f16': 'log2({0})',
+}
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
 # conversions stay in VEC_U.
@@ -5746,6 +5787,16 @@ class Pipeline:
                ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
                ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
                ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
+               # f32tof16 truncates toward zero on D3D12; the binary16 operations round to nearest even.
+               'uint f32tof16rne(float x) {',
+               '    uint sign = (asuint(x) & 0x80000000u) >> 16;',
+               '    float a = abs(x);',
+               '    if (a != a) return sign | 0x7e00u;',
+               '    if (a >= 65520.0) return sign | 0x7c00u;',
+               '    uint t = f32tof16(a);',
+               '    float below = a - f16tof32(t), above = f16tof32(t + 1u) - a;',
+               '    return sign | ((above < below || (above == below && (t & 1u) != 0u)) ? t + 1u : t);',
+               '}',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

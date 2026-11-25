@@ -13325,6 +13325,18 @@ Not covered:
 
 Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and `startup_gfx2hlsl_cvt_alu_hardware`.
 
+## Startup translator: binary16 rounding and transcendental operations
+
+`tools/startup/gfx2hlsl.py` translates `v_ceil_f16`, `v_floor_f16`, `v_trunc_f16`, `v_rndne_f16`, `v_fract_f16`, `v_rcp_f16`, `v_rsq_f16`, `v_sqrt_f16`, `v_sin_f16`, `v_cos_f16`, `v_exp_f16` and `v_log_f16`, in the VOP1 and the VOP3 spelling. The source is the low half of the operand (inline constants, a literal and the neg/abs source modifiers are read as binary16; `-0x3800` is the neg modifier on the half 0.5). The result is computed in binary32, rounded to binary16 to nearest even by the generated `f32tof16rne` helper (`f32tof16` truncates toward zero) and written to the low half with the high half cleared. `v_fract_f16` stops at 0.99951171875, a deliberate deviation from the printed formula `S0 + -floor(S0)` (for -0.0001 the formula rounds to 1.0), kept in line with the binary32 form, and is a lowering choice, not a measurement; the inputs are chosen so that binary32 and exact arithmetic agree, so the guide's printed edge cases (signed zero from `v_sin_f16` and `v_fract_f16`, `v_sqrt_f16(-0.0)`, which FXC returns as 0x8001 where DXC returns 0x8000) are not covered by the draw. `v_sin_f16` and `v_cos_f16` take revolutions. A `clamp`, `omod` or `op_sel` modifier, a missing source and an extra source stay refused.
+
+`tests/startup_gfx2hlsl_f16_trans_check.py` translates every form from text and from machine code through the decoder. `tests/startup_gfx2hlsl_f16_trans_draw_check.py` draws the operations through D3D12 and compares the readback with a CPU reference.
+
+```bash
+ctest --test-dir build -R 'startup_gfx2hlsl_f16_trans' --output-on-failure
+```
+
+Tests: `startup_gfx2hlsl_f16_trans`, `startup_gfx2hlsl_f16_trans_draw_controls`, `startup_gfx2hlsl_f16_trans_draw_warp` and `startup_gfx2hlsl_f16_trans_draw_hardware`. The draw tests passed on Windows 11 WARP at `f3513dc0` (10/10 with the `cvt_alu` and `bit_alu` suites).
+
 ## Startup translator: three-source integer min, max and median
 
 `tools/startup/gfx2hlsl.py` lowered `v_med3_f32`, `v_min3_f32` and `v_max3_f32`, but refused the integer forms as unknown instructions. It now lowers `v_min3_i32`, `v_max3_i32` and `v_med3_i32` with signed comparisons, storing the result word as `uint`, and `v_min3_u32`, `v_max3_u32` and `v_med3_u32` with unsigned comparisons. The median is `max(min(a, b), min(max(a, b), c))`. As for the other integer VALU ops, modifiers such as `clamp` and source negation are refused.
