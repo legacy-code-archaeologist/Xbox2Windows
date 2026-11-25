@@ -2140,7 +2140,7 @@ class Stage:
                     ops[0] == 'exec_hi' or not (base in SCA or base.startswith('v_cmp') or
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
-        if base in ('s_wqm_b32', 's_wqm_b64'):
+        if base in ('s_wqm_b32', 's_wqm_b64') and any(self.is_lane_mask(tok) for tok in ops):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
             if hasattr(self, 'uniform_v'):
@@ -5547,6 +5547,114 @@ for _bit in (0, 1):
             self.set_scc('((%s >> (%s & 31)) & 1u) == %du' % (self.u(ops[0]), self.u(ops[1]), bit))
         return handler
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
+
+
+def _word_pair(self, tok, base):
+    """(low, high) uint expressions of a 64-bit scalar source: an even-aligned SGPR pair or an immediate."""
+    if self.is_lane_mask(tok) or tok == 'm0':
+        raise Unsupported('%s on a lane mask or m0' % base)
+    reg = reg_range(tok)
+    if reg:
+        if reg[0] != 's' or reg[2] != reg[1] + 1 or reg[1] % 2 or reg[2] > 105:
+            raise Unsupported('%s operand %s' % (base, tok))
+        if reg[1] in self.masks or reg[2] in self.masks:
+            raise Unsupported("%s on a projected lane mask in %s" % (base, tok))
+        return self.S(reg[1]), self.S(reg[2])
+    try:
+        value = int(tok, 0)
+    except ValueError:
+        raise Unsupported('%s operand %s' % (base, tok))
+    if -16 <= value <= 64:  # inline constant: sign-extended to 64 bits
+        value &= 0xffffffffffffffff
+    elif not 0 <= value <= 0xffffffff:  # a 32-bit literal is zero-extended
+        raise Unsupported('%s literal %s' % (base, tok))
+    return '0x%08xu' % (value & 0xffffffff), '0x%08xu' % (value >> 32)
+
+
+def _scalar_dst(self, tok, base, wide):
+    reg = reg_range(tok)
+    if (not reg or reg[0] != 's' or reg[2] != reg[1] + (1 if wide else 0) or reg[1] > 105 or
+            (wide and reg[1] % 2) or self.is_lane_mask(tok)):
+        raise Unsupported('%s destination %s' % (base, tok))
+    return reg[1]
+
+
+def _op_cmp_u64(equal):
+    def handler(self, ops, mods):
+        name = 's_cmp_%s_u64' % ('eq' if equal else 'lg')
+        if len(ops) != 2 or mods:
+            raise Unsupported('%s requires two unmodified operands' % name)
+        (a_lo, a_hi), (b_lo, b_hi) = (_word_pair(self, tok, name) for tok in ops)
+        self.set_scc('(%s == %s) && (%s == %s)' % (a_lo, b_lo, a_hi, b_hi) if equal else
+                     '(%s != %s) || (%s != %s)' % (a_lo, b_lo, a_hi, b_hi))
+    return handler
+
+
+Stage.op_s_cmp_eq_u64 = _op_cmp_u64(True)
+Stage.op_s_cmp_lg_u64 = _op_cmp_u64(False)
+
+
+def _op_bitcmp_b64(bit):
+    def handler(self, ops, mods):
+        name = 's_bitcmp%d_b64' % bit
+        if len(ops) != 2 or mods:
+            raise Unsupported('%s requires two unmodified operands' % name)
+        lo, hi = _word_pair(self, ops[0], name)
+        if self.is_lane_mask(ops[1]):
+            raise Unsupported('%s on a lane mask' % name)
+        index = self.u(ops[1])
+        high = '((%s >> 5u) & 1u)' % index
+        shift = '(%s & 31u)' % index
+        self.set_scc('(((%s >> %s) & (1u - %s)) | ((%s >> %s) & %s)) == %du' % (lo, shift, high, hi, shift, high, bit))
+    return handler
+
+
+Stage.op_s_bitcmp0_b64 = _op_bitcmp_b64(0)
+Stage.op_s_bitcmp1_b64 = _op_bitcmp_b64(1)
+
+
+def _quad_any(word):
+    """Bit 4i of the result is set when any bit of nibble i of word is set."""
+    return '(((%s) | ((%s) >> 1u) | ((%s) >> 2u) | ((%s) >> 3u)) & 0x11111111u)' % ((word,) * 4)
+
+
+def _quad_pack(word):
+    """The eight nibble-any bits of word, packed into bits 0..7."""
+    return ' | '.join('(uint(((%s) & 0x%xu) != 0u) << %du)' % (word, 0xf << (4 * i), i) for i in range(8))
+
+
+def _op_quad(base, wide, spread):
+    def handler(self, ops, mods):
+        if len(ops) != 2 or mods:
+            raise Unsupported('%s requires two unmodified operands' % base)
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]):
+            raise Unsupported('%s on a lane mask' % base)
+        dst = _scalar_dst(self, ops[0], base, wide)
+        if wide:
+            lo, hi = _word_pair(self, ops[1], base)
+        else:
+            reg = reg_range(ops[1])
+            if reg and (reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105):
+                raise Unsupported('%s operand %s' % (base, ops[1]))
+            lo, hi = self.u(ops[1]), None
+        if spread:  # s_wqm: every lane of a quad that has any lane set
+            self.set_s(dst, '%s * 0xfu' % _quad_any(lo), scc='$ != 0u' if not wide else None)
+            if wide:
+                self.set_s(dst + 1, '%s * 0xfu' % _quad_any(hi))
+                self.set_scc('(s%d | s%d) != 0u' % (dst, dst + 1))
+        else:  # s_quadmask: one bit per quad
+            if wide:
+                self.set_s(dst, '(%s) | ((%s) << 8u)' % (_quad_pack(lo), _quad_pack(hi)))
+                self.set_s(dst + 1, '0u')
+                self.set_scc('s%d != 0u' % dst)
+            else:
+                self.set_s(dst, _quad_pack(lo), scc='$ != 0u')
+    return handler
+
+
+for _base, _wide, _spread in (('s_quadmask_b32', False, False), ('s_quadmask_b64', True, False),
+                              ('s_wqm_b32', False, True), ('s_wqm_b64', True, True)):
+    setattr(Stage, 'op_' + _base, _op_quad(_base, _wide, _spread))
 
 
 def scalar_wide_fold(helper, x, amount, signed):

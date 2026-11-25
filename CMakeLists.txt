@@ -2827,6 +2827,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers v_fma_mix_f32 and selects binary16 source halves on all three mixed-precision FMAs.
     add_test(NAME startup_gfx2hlsl_fma_mix COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py")
+    # gfx2hlsl lowers s_cmp_eq_u64, s_cmp_lg_u64, s_bitcmp0/1_b64, s_quadmask_b32/b64 and s_wqm_b32/b64 on scalar registers.
+    add_test(NAME startup_gfx2hlsl_s_cmp64_wqm COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_cmp64_wqm_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B

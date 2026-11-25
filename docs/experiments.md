@@ -7552,6 +7552,21 @@ more, and every shift count stays in 0..31. Width 0 still gives 0, and SCC is st
 The old formula, a 6-bit width, a dropped field mask and a dropped SCC write each fail it. It runs on the CPU and
 does not draw on a GPU.
 
+**Scalar 64-bit compares, quad masks and WQM.** The startup translator lowers
+`s_cmp_eq_u64`, `s_cmp_lg_u64`, `s_bitcmp0_b64`, `s_bitcmp1_b64`,
+`s_quadmask_b32`, `s_quadmask_b64`, `s_wqm_b32` and `s_wqm_b64` on scalar
+registers. A 64-bit source is an even-aligned SGPR pair (up to `s[104:105]`) or
+an inline or 32-bit literal constant. Compares and bit tests set SCC from both
+words; `s_quadmask_*` and `s_wqm_*` write the destination and set SCC from the
+result. EXEC, VCC, M0 and any pair with a projected lane mask in either word are
+refused, because a per-lane projection is not the full wave mask. Unaligned
+pairs and out-of-range registers are refused. This is a text-level HLSL lowering
+of single instructions, separate from the pixel AOT path: it runs no GPU draw.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_cmp64_wqm$' -V`.
+The fixture evaluates the emitted expressions on the CPU against references for
+ten 64-bit values and checks the refusals, including a projected mask in the
+low or high pair word.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
