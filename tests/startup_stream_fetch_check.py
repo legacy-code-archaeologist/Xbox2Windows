@@ -201,6 +201,13 @@ EXEC_LO_0, EXEC_LO_ALL, BRANCH_OVER_ONE = 0xbefe0380, 0xbefe03c1, 0xbf820001  # 
 WQM_EXEC_LO_0, WQM_EXEC_EXEC, EXEC_HI_0 = 0xbefe0980, 0xbefe0a7e, 0xbeff0380  # s_wqm_b32 exec_lo, 0; s_wqm_b64 exec, exec; s_mov_b32 exec_hi, 0
 V7_ONE, V12_ONE = vop1(1, 7, 242), vop1(1, 12, 242)                         # v_mov_b32 v7 / v12, 1.0
 EXPORTS_V12 = [0xf80008cf, 0x07060504, 0xf800020f, 0x070c0c0c, ENDPGM]      # pos0 v4-v7; param0 v12, v12, v12, v7
+def vop2(op, vdst, vsrc1, src0):
+    return (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0
+
+
+SUB_V12 = vop2(0x29, 12, 5, 256 + 4)      # v_sub_co_ci_u32_e32 v12, vcc_lo, v4, v5, vcc_lo
+SUBREV_V12 = vop2(0x2a, 12, 5, 256 + 4)   # v_subrev_co_ci_u32_e32 v12, vcc_lo, v4, v5, vcc_lo
+SUB_V12_FROM_V13 = vop2(0x29, 12, 5, 256 + 13)  # reads v13, which nothing defines
 EMPTY_ROOT = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 68, 1, 36) + b"RTS0" + struct.pack("<I", 24)
               + struct.pack("<6I", 1, 0, 24, 0, 24, 0))
 
@@ -274,6 +281,19 @@ def translate_cases(directory):
     status, _, _ = translate(directory / "wqm_exec_exec", fetch_container(words, RECORDS), LAYOUT_TEXT)
     assert status == "ok", status
     print("translate: s_wqm_b64 exec, exec translates")
+
+    # A borrow-chain subtraction is an unconditional write of its destination: a later read of v12 is defined,
+    # while a read of a register nothing defines inside the same instruction is still refused.
+    for label, sub in (('sub_co_ci', SUB_V12), ('subrev_co_ci', SUBREV_V12)):
+        words = [SWAPPC, PREFETCH, V7_ONE, sub, WAIT_VM] + EXPORTS_V12
+        status, vs, _ = translate(directory / label, fetch_container(words, RECORDS), LAYOUT_TEXT)
+        assert status == 'ok', (label, status)
+        assert 'v12 = ca - cb - ci;' in vs, vs
+        print(f'translate: {label} into a fresh VGPR defines it')
+    words = [SWAPPC, PREFETCH, V7_ONE, SUB_V12_FROM_V13, WAIT_VM] + EXPORTS_V12
+    status, _, _ = translate(directory / 'sub_co_ci_undefined', fetch_container(words, RECORDS), LAYOUT_TEXT)
+    assert status == 'unsupported: ' + UNDEFINED.replace('v12', 'v13'), status
+    print('translate: sub_co_ci reading an undefined VGPR refused')
 
     # z only: the count reaches the highest component read; a mask above the count is refused.
     for count, want in ((3, "ok"), (2, "unsupported: unverified vertex fetch record 0600040401")):

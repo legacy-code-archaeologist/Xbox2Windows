@@ -2426,7 +2426,7 @@ class Stage:
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
-        word_pack = (base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
+        word_pack = (base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32', 's_flbit_i32_b32')
                      or base in SCA_WORD_ONLY)
         if base in SCA_RMW_DEST:
             # The old destination is the first source of the expression.
@@ -2605,6 +2605,54 @@ class Stage:
         self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
         if hasattr(self, 'scc_uniform'):
             self.scc_uniform = False
+
+    def borrow_mask(self, tok, op, what):
+        """('vcc', None) or ('s', n) for a one-lane borrow mask operand; anything else is refused."""
+        if tok in ('vcc', 'vcc_lo'):
+            return 'vcc', None
+        r = reg_range(tok)
+        if r and r[0] == 's' and r[1] <= r[2] <= r[1] + 1 and r[1] not in (106, 107):
+            return 's', r[1]
+        raise Unsupported('%s %s %s: expected vcc or an SGPR mask' % (op, what, tok))
+
+    def sub_co_ci(self, op, ops, mods, reverse):
+        # d = a - b - borrow_in (subrev: b - a - borrow_in); the borrow out is bit 0 of the destination mask.
+        if mods:
+            raise Unsupported('%s with %s' % (op, mods))
+        if len(ops) != 5:
+            raise Unsupported('%s with %d operands, expected 5' % (op, len(ops)))
+        regs = reg_range(ops[0])
+        if not regs or regs[0] != 'v' or regs[1] != regs[2] or regs[1] > 255:
+            raise Unsupported('%s destination %s: expected a single VGPR' % (op, ops[0]))
+        out_kind, out_n = self.borrow_mask(ops[1], op, 'borrow out')
+        in_kind, in_n = self.borrow_mask(ops[4], op, 'borrow in')
+        if in_kind == 's' and in_n not in self.masks:
+            raise Unsupported('%s borrow in s%d is not a known mask' % (op, in_n))
+        borrow_in = self.u(ops[4]) if in_kind == 'vcc' else self.S(in_n)
+        a, b = self.u(ops[2]), self.u(ops[3])
+        if reverse:
+            a, b = b, a
+        d = regs[1]
+        self.uniform_v.discard(d)
+        self.used_v.add(d)
+        guard = '' if self.exec_known else 'if (exec & 1) '
+        borrow = '(ca < cb || ca - cb < ci) ? 1u : 0u'
+        if not self.exec_known:
+            borrow = '(exec & %s)' % borrow
+        if out_kind == 'vcc':
+            store = 'vcc = %s;' % borrow
+        else:
+            self.used_s.add(out_n)
+            self.sym.pop(out_n, None)
+            self.masks.add(out_n)
+            store = 's%d = %s;' % (out_n, borrow)
+        self.emit('{ uint ca = %s, cb = %s, ci = %s & 1u; %sv%d = ca - cb - ci; %s }' % (a, b, borrow_in, guard, d, store))
+
+    def op_v_sub_co_ci_u32(self, ops, mods):
+        self.sub_co_ci('v_sub_co_ci_u32', ops, mods, False)
+
+    def op_v_subrev_co_ci_u32(self, ops, mods):
+        self.sub_co_ci('v_subrev_co_ci_u32', ops, mods, True)
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
         if len(ops) != 2:
@@ -5114,6 +5162,8 @@ SCA = {
     # s_ff0_i32_b32: index of the lowest zero bit, -1 when every bit is set; SCC unchanged.
     's_ff0_i32_b32': ('uint(firstbitlow(~{0}))', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
+    # s_flbit_i32_b32: leading zero count of S0, all ones when S0 is 0; SCC unchanged.
+    's_flbit_i32_b32': ('({0} == 0u ? 0xffffffffu : 31u - firstbithigh({0}))', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
     # s_lshlN_add_u32: low 32 bits of (S0 << N) + S1. SHIFT_ADD also supplies SCC for wide overflow.
@@ -5523,12 +5573,18 @@ class Pipeline:
             for index, (start, lines, term) in enumerate(s.blocks):
                 for line in lines + ([term[1]] if term and term[0] == 'branch' else []):
                     target = re.match(r'v(\d+) = (.*)', line)
-                    unwritten = {int(n) for n in re.findall(r'\bv(\d+)\b', target.group(2) if target else line)} - written
+                    reads = target.group(2) if target else line
+                    # The borrow-chain block `{ uint ca = A, cb = B, ci = C & 1u; vD = ca - cb - ci; ... }` writes vD
+                    # unconditionally; only the three operands are reads. A guarded store never matches.
+                    block = re.match(r'\{ uint ca = (.*), cb = (.*), ci = (.*) & 1u; v(\d+) = ca - cb - ci; .*\}$', line)
+                    if block:
+                        target, reads = block, ' '.join(block.group(1, 2, 3))
+                    unwritten = {int(n) for n in re.findall(r'\bv(\d+)\b', reads)} - written
                     if unwritten:
                         raise Unsupported('vertex stage reads v%d, which neither the fetch nor an unconditional write '
                                           'before the first branch defines' % min(unwritten))
                     if target and index == 0 and start == 0:
-                        written.add(int(target.group(1)))
+                        written.add(int(target.group(4 if block else 1)))
         out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',

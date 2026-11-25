@@ -7518,6 +7518,17 @@ The check builds the SOP1 words, evaluates the emitted expression on the CPU
 against an integer reference and covers the mask refusals. This is Python-only
 verification: no Windows, WARP or GPU draw has been run for these forms.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
+**Borrow-chain subtraction and leading-zero count.** Startup translation lowers `v_sub_co_ci_u32`,
+`v_subrev_co_ci_u32` and `s_flbit_i32_b32`. The two vector forms compute `S0 - S1 - carry_in` (subrev: `S1 - S0 -
+carry_in`) and write the borrow out, `S0 < S1 + carry_in`, to VCC or a tracked lane mask. `s_flbit_i32_b32` returns the
+leading-zero count of a 32-bit word, `0xffffffff` for zero, and leaves SCC unchanged. Refused: modifiers, a wrong
+operand count, a destination that is not a single VGPR, a borrow in from an SGPR that is not a known mask, and lane-mask
+operands of `s_flbit_i32_b32`. Behind a vertex fetch call the subtraction counts as an unconditional write of its
+destination, so a later read of that VGPR is defined. Measured on CPU only: the emitted lines are evaluated over edge
+values against plain integer arithmetic. Windows, D3D12 and GPU behavior are not measured here. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sub_co_ci_flbit$' -V` or
+`python3 -B tests/startup_gfx2hlsl_sub_co_ci_flbit_check.py`; the fetch definition case is in
+`tests/startup_stream_fetch_check.py`. [Part of #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
 
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
