@@ -7276,6 +7276,18 @@ emits `0xbf000000u`. ABS on an immediate and a missing literal dword are refused
 instruction carrying the same register modifier still refuses it. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
 
+**Add with carry in and out.** `v_add_co_ci_u32` (issue #1723) was refused as an unknown instruction. It now
+lowers to a 32-bit add of the two numeric sources plus bit 0 of the carry in, and the carry out is written
+to a one-lane mask. The e32 form uses `vcc` for both masks; the e64 form takes a single VGPR destination, an
+SGPR or `vcc` carry out, and an SGPR or `vcc` carry in. An SGPR carry in must be a mask the translator already
+knows. Under an unknown EXEC the write is guarded by EXEC bit 0 and the carry is masked by it. Refused: any
+modifier, a wrong operand count, a destination that is not a single VGPR, a carry in from a register that is
+not a known mask, and a lane-mask register (`vcc`, `exec` or a known mask SGPR) as a numeric source, because
+the translator keeps only its 0/1 lane bit and not the full 32-bit word. Only the translated text is
+evaluated, not a draw. Run
+`python3 -B tests/startup_gfx2hlsl_add_co_ci_check.py` or
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_add_co_ci$' -V`.
+
 **Output modifiers on float-result conversions.** The float-result conversions (`v_cvt_f32_i32`,
 `v_cvt_f32_u32`, `v_cvt_f32_ubyte0..3`, `v_cvt_f32_f16`) sat in the uint-result table, whose dispatch
 refused every modifier, so `v_cvt_f32_i32_e64 v1, v1 mul:2` did not translate - 5 of the 29 refused
