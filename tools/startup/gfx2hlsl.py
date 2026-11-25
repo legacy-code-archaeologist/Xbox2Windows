@@ -5380,8 +5380,6 @@ class Stage:
             f16 = name.endswith('_f16')
             writes_exec = name in ('v_cmpx_class_f32', 'v_cmpx_class_f16')
             sdwa = name != base
-            if f16 and sdwa:
-                raise Unsupported('SDWA form of %s' % name)
             if sdwa:
                 self.check_compare_sdwa_destination(base, writes_exec, ops)
             if len(ops) == 3:
@@ -5391,7 +5389,20 @@ class Stage:
                 dst, (value, mask) = 'exec', ops
             else:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
-            if sdwa:
+            if sdwa and f16:
+                # SDWA half class: classes bits [15:0] of a plain register. src0_sel DWORD and WORD_0 both
+                # leave those bits where class16 reads them; WORD_1, a byte, sext() and the abs/neg spellings
+                # (which print |v|, -v, abs(), neg()) would classify other bits, so they are refused.
+                selections = [m for m in mods if m.startswith('src0_sel:')]
+                if selections not in (['src0_sel:DWORD'], ['src0_sel:WORD_0']):
+                    raise Unsupported('SDWA form of %s with %s' % (name, ' '.join(selections) or 'no src0_sel'))
+                if not reg_range(value):
+                    raise Unsupported('%s with source %s' % (base, value))
+                if mask in FLOATS:
+                    raise Unsupported('%s mask %s: expected an integer class mask' % (base, mask))
+                _word, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods)
+                value = self.u(value)
+            elif sdwa:
                 value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=True)
             elif f16:
                 # abs() and - apply to bit 15 of the half, before the class test.
