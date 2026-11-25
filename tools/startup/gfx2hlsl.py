@@ -5335,6 +5335,65 @@ class Stage:
     def op_v_subrev_co_u32(self, ops, mods):
         self.carry_out_op(ops, mods, 'subrev')
 
+    def carry_in_out_op(self, ops, mods, kind):
+        """v_{add,sub,subrev}_co_ci_u32 D, SDST, S0, S1, S2: 32-bit add/sub with carry or borrow in and out.
+
+        AMD RDNA 2 ISA: V_ADD_CO_CI_U32 D = S0 + S1 + S2[lane] with carry out to SDST[lane];
+        V_SUB_CO_CI_U32 D = S0 - S1 - S2[lane] with borrow out to SDST[lane]; V_SUBREV_CO_CI_U32 swaps S0 and S1.
+        Both VOP2 (_e32, implicit vcc_lo) and VOP3b (_e64) forms arrive with five operands. Results go through
+        scratch a and w first so D or SDST may overlap any source.
+        """
+        name = 'v_%s_co_ci_u32' % kind
+        if mods:
+            raise Unsupported('%s with %s' % (name, ' '.join(mods)))
+        if len(ops) != 5:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        d = reg_range(ops[0])
+        if not d or d[0] != 'v' or d[1] != d[2] or d[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        sdst = reg_range(ops[1])
+        if ops[1] not in ('vcc', 'vcc_lo') and not (sdst and sdst[0] == 's' and sdst[1] == sdst[2] and sdst[1] <= 105):
+            raise Unsupported('%s carry-out destination %s' % (name, ops[1]))
+        cin_tok = ops[4]
+        if cin_tok in ('vcc_hi', 'exec_hi'):
+            raise Unsupported('%s carry-in %s' % (name, cin_tok))
+        cin_const = self.const_u32(cin_tok)
+        if cin_const in (0, 0xffffffff):
+            ci = '1u' if cin_const else '0u'
+        elif self.is_lane_mask(cin_tok):
+            ci = '(%s & 1u)' % self.u(cin_tok)
+        else:
+            raise Unsupported('%s carry-in %s' % (name, cin_tok))
+        a, b = self.u(ops[2]), self.u(ops[3])
+        if kind == 'subrev':
+            a, b = b, a
+        if kind == 'add':
+            self.emit('a = %s + %s;' % (a, b))
+            self.emit('w = a < %s ? 1u : 0u;' % a)
+            self.emit('a = a + %s;' % ci)
+            self.emit('w = w | (a < %s ? 1u : 0u);' % ci)
+        else:
+            self.emit('a = %s - %s;' % (a, b))
+            self.emit('w = %s > %s ? 1u : 0u;' % (b, a))
+            self.emit('w = w | (%s > a ? 1u : 0u);' % ci)
+            self.emit('a = a - %s;' % ci)
+        self.set_v(d[1], 'a')
+        predicate = 'w' if self.exec_known else '(exec & w)'
+        if ops[1] in ('vcc', 'vcc_lo'):
+            self.emit('vcc = %s;' % predicate)
+        else:
+            self.set_s(sdst[1], predicate, uniform=False)
+            self.masks.add(sdst[1])
+
+    def op_v_add_co_ci_u32(self, ops, mods):
+        self.carry_in_out_op(ops, mods, 'add')
+
+    def op_v_sub_co_ci_u32(self, ops, mods):
+        self.carry_in_out_op(ops, mods, 'sub')
+
+    def op_v_subrev_co_ci_u32(self, ops, mods):
+        self.carry_in_out_op(ops, mods, 'subrev')
+
     def op_v_lshlrev_b64(self, ops, mods):
         self.shift64(ops, mods, 'shl64')
 
