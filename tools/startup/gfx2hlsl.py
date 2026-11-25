@@ -1573,8 +1573,6 @@ class Stage:
             # descriptors): its offset is the load's offset plus the first register's dword index.
             return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
-            if len(s) > 2 and s[2]:
-                raise Unsupported('descriptor operand %s is a pointer with offset %#x' % (tok, s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
@@ -2378,14 +2376,6 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
-        if base == 's_addc_u32':
-            # Only the high word of an advanced descriptor pointer; the carry is not modelled.
-            hi = reg_range(ops[1]) if len(ops) == 3 else None
-            if hasattr(self, 'scc_uniform') and self.tracks_uniformity():
-                self.scc_uniform = False
-            if hi and hi[0] == 's' and self.pointer_add(base, ops[0], ops[1:], [self.sym.get(hi[1]), None]):
-                return None
-            raise Unsupported(base)
         if base == 'buffer_load_format_xyzw':
             # Not translated: the four-component form has no startup request that needs it yet.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
@@ -2600,42 +2590,6 @@ class Stage:
                       destination in self.low16_only_v)
         self.set_v(destination, sdwa_dest(result, select, unused, 'v%d' % destination), low16_only=keep_low16)
 
-    def pointer_add(self, base, dname, srcs, syms):
-        """Propagate a descriptor pointer through s_add_u32 sD, sP, <literal> / s_addc_u32 sD+1, sP+1, 0.
-
-        The pair advances a table or root pointer by a literal byte offset, into the same or
-        another register pair. The offset rides in the low word as ('ptr', source, offset); the
-        high word keeps ('ptrhi', source). The low-word carry is taken as zero: the base is a
-        table or root address and the offset is below 1 MiB. Anything else returns False.
-        """
-        if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
-            return False
-        if getattr(self, 'has_branches', False):
-            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
-            return False
-        reg = reg_range(dname)
-        if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
-            return False
-        d = reg[1]
-        if base == 's_add_u32':
-            if syms[0][0] != 'ptr' or not re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', srcs[1]):
-                return False
-            added = int(srcs[1], 0)
-            if added > 0xfffff:
-                raise Unsupported('descriptor pointer offset %s' % srcs[1])
-            self.sym[d] = ('ptr', syms[0][1], (syms[0][2] if len(syms[0]) > 2 else 0) + added)
-            # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
-            # instruction starts so that the high-word add is accepted right behind it and nowhere else.
-            size = next((n for off, n, _name, _asm in getattr(self, 'ins', ()) if off == self.pc), 0)
-            self.ptr_low_add = (d, self.pc + size)
-            return True
-        low = self.sym.get(d - 1)
-        if (syms[0][0] != 'ptrhi' or srcs[1] != '0' or not low or low[0] != 'ptr'
-                or low[1] != syms[0][1] or getattr(self, 'ptr_low_add', None) != (d - 1, getattr(self, 'pc', 0))):
-            return False
-        self.sym[d] = ('ptrhi', syms[0][1])
-        return True
-
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
         if base == 's_movk_i32' and len(ops) != 2:
@@ -2710,8 +2664,6 @@ class Stage:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
-            if self.pointer_add(base, dname, srcs, syms):
-                return None
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
@@ -2736,8 +2688,6 @@ class Stage:
                             self.sym[d + 1] = hi
                         elif self.tracks_uniformity():
                             self.varying_s.add(d + 1)
-            elif own and own[0] == 'ptr' and base in ('s_add_u32', 's_addc_u32'):
-                raise Unsupported('%s adds a non-literal to a descriptor pointer' % base)
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add(desc_key(own))
@@ -3120,7 +3070,6 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
-        base_off = p[2] if len(p) > 2 else 0   # literal bytes added by s_add_u32 on the pointer
         # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
         token = smem_offset(ops[2])
         known = self.const_soffset(token) if p[1] != ('smpheap',) else None
@@ -3142,10 +3091,10 @@ class Stage:
                     raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
-                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
+                    self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
                 return
             for i in range(count):
-                self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i)
+                self.sym[dst[1] + i] = ('desc', p[1], off, i)
             if into_vcc:
                 self.vcc_lost = True
                 self.vcc_descriptor_overwritten = False
@@ -3153,8 +3102,6 @@ class Stage:
                     value = tuple(self.sym.get(i) for i in (106, 107))
                     self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
             return
-        if base_off:
-            raise Unsupported('s_load through %s advanced by %#x' % (p[1], base_off))
         if into_vcc:
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if p[1] == ('smpheap',):
