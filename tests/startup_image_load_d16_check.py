@@ -643,6 +643,7 @@ def check_odd_dmask_consumers():
     def dummy_pipe():
         pipe = G.Pipeline.__new__(G.Pipeline)
         pipe.resources = {}
+        pipe.uavs = {}
         pipe.rtv_formats = ()
         pipe.srv_formats = {}
         pipe.uds = []

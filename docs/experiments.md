@@ -191,6 +191,14 @@ The runtime binds an explicit or default 1D view and uploads single-array-slice 
 using their desktop copyable footprints. Run `ctest --preset dev -R '^startup_1d_srv_' --no-tests=error`
 to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on hardware and WARP.
 
+## Offline vertex buffer stores
+
+`tools/startup/gfx2hlsl.py` lowers vertex-stage `buffer_store_dword`, `dwordx2`, `dwordx3` and `dwordx4` in the `off` form to `RWByteAddressBuffer.Store*`. The descriptor must come from a root-table slot, and the manifest becomes version 2 with a `uav <slot> table <param> <byte offset>` line. This is offline only: the shipped runtime refuses version 2 manifests, so no store runs in a game. Refused forms: `glc`, `slc`, `offen`, `idxen`, pixel stage, a descriptor also used for a load, a descriptor whose base was changed, and an immediate or inline offset that is not a multiple of four. A register offset is rounded down to a multiple of four.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_buffer_store$' --output-on-failure
+```
+
 ## Offline store context forwarding
 
 The fake-user runtime creates an offline store context token. Unimplemented methods receiving

@@ -165,6 +165,14 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 return;
             }
             matched_rtv = true;
+        } else if (line.compare(0, 13, "x2w-manifest ") == 0 && line != "x2w-manifest 1") {
+            // Version 2 adds `uav` lines for vertex-stage stores. This runtime does not bind them,
+            // so it must not draw a translation whose stores it would silently skip (#1723).
+            log("x2w-draw unsupported manifest version for %016llx", tr.key);
+            return;
+        } else if (line.compare(0, 4, "uav ") == 0) {
+            log("x2w-draw unsupported uav line for %016llx", tr.key);
+            return;
         } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
@@ -233,7 +241,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-13";
+    constexpr char revision[] = "x2w-startup-shader-14";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -353,7 +361,7 @@ void publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-13cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-14cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
