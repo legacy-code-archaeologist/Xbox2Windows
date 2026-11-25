@@ -330,6 +330,93 @@ def stream_interface(vs_container, ps_container):
 
 
 # Binary32 words for inline source encodings 240 through 248, in encoding order.
+# Single-rounding binary16 fma (v_pk_fma_f16): integer arithmetic only, same routine as pixel_aot.fma16_rne.
+FMA16_RNE_HLSL = (
+    '// Exact fused binary16 multiply-accumulate (a * b + c), rounding once to binary16 RNE.',
+    '// Operates on finite binary16 encodings in bits [15:0] using 32-bit integer arithmetic only,',
+    '// avoiding intermediate binary32 rounding and remaining independent of binary32 FTZ modes.',
+    'uint fma16_rne(uint a_bits, uint b_bits, uint c_bits) {',
+    '    uint a = a_bits & 0xffffu;',
+    '    uint b = b_bits & 0xffffu;',
+    '    uint c = c_bits & 0xffffu;',
+    '    uint sa = (a >> 15u) & 1u;',
+    '    uint ea_f = (a >> 10u) & 31u;',
+    '    uint ma = (a & 0x3ffu) | (ea_f != 0u ? 0x400u : 0u);',
+    '    int ea = ea_f != 0u ? (int)ea_f - 25 : -24;',
+    '    uint sb = (b >> 15u) & 1u;',
+    '    uint eb_f = (b >> 10u) & 31u;',
+    '    uint mb = (b & 0x3ffu) | (eb_f != 0u ? 0x400u : 0u);',
+    '    int eb = eb_f != 0u ? (int)eb_f - 25 : -24;',
+    '    uint sc = (c >> 15u) & 1u;',
+    '    uint ec_f = (c >> 10u) & 31u;',
+    '    uint mc = (c & 0x3ffu) | (ec_f != 0u ? 0x400u : 0u);',
+    '    int ec = ec_f != 0u ? (int)ec_f - 25 : -24;',
+    '    uint sp = sa ^ sb;',
+    '    uint mp = ma * mb;',
+    '    int ep = ea + eb;',
+    '    if (mp == 0u && mc == 0u) return (sp != 0u && sc != 0u) ? 0x8000u : 0u;',
+    '    if (mp == 0u) return c;',
+    '    uint norm;',
+    '    int res_exp;',
+    '    uint res_sign;',
+    '    if (mc == 0u) {',
+    '        uint top = firstbithigh(mp);',
+    '        norm = mp << (31u - top);',
+    '        res_exp = ep + (int)top;',
+    '        res_sign = sp;',
+    '    } else {',
+    '        uint bp = firstbithigh(mp);',
+    '        uint px = mp << (30u - bp);',
+    '        int ex = ep + (int)bp;',
+    '        uint bc = firstbithigh(mc);',
+    '        uint cx = mc << (30u - bc);',
+    '        int ey = ec + (int)bc;',
+    '        uint big_m, small_m, big_s, small_s;',
+    '        int big_e, small_e;',
+    '        if (ex > ey || (ex == ey && px >= cx)) {',
+    '            big_m = px; big_e = ex; big_s = sp;',
+    '            small_m = cx; small_e = ey; small_s = sc;',
+    '        } else {',
+    '            big_m = cx; big_e = ey; big_s = sc;',
+    '            small_m = px; small_e = ex; small_s = sp;',
+    '        }',
+    '        if (big_e == small_e && big_m == small_m && big_s != small_s) return 0u;',
+    '        uint diff_e = (uint)(big_e - small_e);',
+    '        uint y_main = 0u;',
+    '        uint y_sticky = 1u;',
+    '        if (diff_e < 30u) {',
+    '            y_main = (small_m >> diff_e) & 0xfffffffeu;',
+    '            y_sticky = (small_m & ((1u << (diff_e + 1u)) - 1u)) != 0u ? 1u : 0u;',
+    '        }',
+    '        res_sign = big_s;',
+    '        uint mag = big_s == small_s ? (big_m + y_main + y_sticky) : (big_m - y_main - y_sticky);',
+    '        uint top = firstbithigh(mag);',
+    '        norm = mag << (31u - top);',
+    '        res_exp = big_e + (int)top - 30;',
+    '    }',
+    '    if (res_exp >= -14) {',
+    '        uint sig = norm >> 21u;',
+    '        uint rem = norm & 0x001fffffu;',
+    '        if (rem > 0x00100000u || (rem == 0x00100000u && (sig & 1u) != 0u)) sig += 1u;',
+    '        if (sig == 0x800u) {',
+    '            sig = 0x400u;',
+    '            res_exp += 1;',
+    '        }',
+    '        if (res_exp > 15) return (res_sign << 15u) | 0x7c00u;',
+    '        return (res_sign << 15u) | ((uint)(res_exp + 15) << 10u) | (sig & 0x3ffu);',
+    '    }',
+    '    if (res_exp == -25) return (res_sign << 15u) | (norm > 0x80000000u ? 1u : 0u);',
+    '    if (res_exp < -25) return res_sign << 15u;',
+    '    uint shift = (uint)(7 - res_exp);',
+    '    uint sig = norm >> shift;',
+    '    uint half_bit = 1u << (shift - 1u);',
+    '    uint mask = (1u << shift) - 1u;',
+    '    uint rem = norm & mask;',
+    '    if (rem > half_bit || (rem == half_bit && (sig & 1u) != 0u)) sig += 1u;',
+    '    return (res_sign << 15u) | sig;',
+    '}',
+)
+
 CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
                             0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
                             0x3e22f983)  # 1/(2*pi)
@@ -5030,6 +5117,127 @@ class Stage:
 
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
+
+    # VOP3P packed math. Source i feeds the low lane from half op_sel[i] and the high lane from half
+    # op_sel_hi[i] (defaults 0 and 1); neg_lo/neg_hi flip the sign of a float lane. Float lanes are computed
+    # in binary32 and narrowed with f32tof16, as v_cvt_f16_f32 does.
+    def pk_modifiers(self, mods, arity, allow_neg, allow_clamp):
+        fields = {'op_sel': [0] * arity, 'op_sel_hi': [1] * arity, 'neg_lo': [0] * arity, 'neg_hi': [0] * arity}
+        clamp = False
+        for m in mods:
+            if m == 'clamp' and allow_clamp:
+                clamp = True
+                continue
+            match = re.fullmatch(r'(op_sel|op_sel_hi|neg_lo|neg_hi):\[([01](?:,[01])*)\]', m)
+            if not match or (match.group(1).startswith('neg') and not allow_neg):
+                raise Unsupported('modifier %s' % m)
+            bits = [int(b) for b in match.group(2).split(',')]
+            if len(bits) != arity:
+                raise Unsupported('modifier %s for %d sources' % (m, arity))
+            fields[match.group(1)] = bits
+        return fields, clamp
+
+    def pk_half(self, tok, high_half):
+        if tok in FLOATS or tok.startswith(('|', '-')) and not re.match(r'-\d', tok):
+            raise Unsupported('packed operand %s' % tok)
+        word = self.u(tok)
+        return '(%s >> 16)' % word if high_half else '(%s & 0xffffu)' % word
+
+    def pk_lanes(self, ops, mods, arity, *, float_lanes=False, clamp_ok=False, packed=None):
+        """-> (low lane exprs, high lane exprs, clamp, modifier fields) of the first `packed` sources."""
+        if len(ops) != arity + 1 or not (reg_range(ops[0]) and reg_range(ops[0])[0] == 'v'
+                                         and reg_range(ops[0])[1] == reg_range(ops[0])[2]):
+            raise Unsupported('packed operation operands %s' % ', '.join(ops))
+        fields, clamp = self.pk_modifiers(mods, arity, float_lanes, clamp_ok)
+        lanes = ([], [])
+        for index, tok in enumerate(ops[1:1 + (packed or arity)]):
+            for lane, (sel, neg) in enumerate(((fields['op_sel'], fields['neg_lo']), (fields['op_sel_hi'], fields['neg_hi']))):
+                half = self.pk_half(tok, sel[index])
+                if float_lanes:
+                    half = 'f16tof32(%s)' % half
+                    if neg[index]:
+                        half = '(-%s)' % half
+                lanes[lane].append(half)
+        return lanes[0], lanes[1], clamp, fields
+
+    def pk_float(self, ops, mods, combine):
+        low, high, clamp, _ =self.pk_lanes(ops, mods, len(ops) - 1, float_lanes=True, clamp_ok=True)
+        results = []
+        for lane in (low, high):
+            expr = combine(*lane)
+            results.append('f32tof16(%s)' % ('saturate(%s)' % expr if clamp else expr))
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % tuple(results))
+
+    def pk_int(self, ops, mods, combine, signed):
+        low, high, _, _ = self.pk_lanes(ops, mods, 2)
+        wrap = (lambda x: '(int(((%s) << 16)) >> 16)' % x) if signed else (lambda x: x)
+        results = ['((%s) & 0xffffu)' % combine(wrap(lane[0]), wrap(lane[1])) for lane in (low, high)]
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % tuple(results))
+
+    def op_v_pk_add_f16(self, ops, mods):
+        self.pk_float(ops, mods, lambda a, b: '%s + %s' % (a, b))
+
+    def op_v_pk_mul_f16(self, ops, mods):
+        self.pk_float(ops, mods, lambda a, b: '%s * %s' % (a, b))
+
+    def op_v_pk_max_f16(self, ops, mods):
+        self.pk_float(ops, mods, lambda a, b: 'max(%s, %s)' % (a, b))
+
+    def op_v_pk_min_f16(self, ops, mods):
+        self.pk_float(ops, mods, lambda a, b: 'min(%s, %s)' % (a, b))
+
+    def op_v_pk_fma_f16(self, ops, mods):
+        # Fused: the product is not rounded before the add, so binary32 arithmetic would round twice.
+        low, high, clamp, _ = self.pk_lanes(ops, mods, 3, float_lanes=False, clamp_ok=True)
+        fields, _ = self.pk_modifiers(mods, 3, True, True)
+        results = []
+        for lane, neg in ((low, fields['neg_lo']), (high, fields['neg_hi'])):
+            args = ['(%s ^ 0x8000u)' % h if n else h for h, n in zip(lane, neg)]
+            expr = 'fma16_rne(%s, %s, %s)' % tuple(args)
+            if clamp:
+                expr = 'f32tof16(saturate(f16tof32(%s)))' % expr
+            results.append(expr)
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % tuple(results))
+
+    def op_v_pk_add_i16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: '%s + %s' % (a, b), True)
+
+    def op_v_pk_add_u16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: '%s + %s' % (a, b), False)
+
+    def op_v_pk_sub_i16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: '%s - %s' % (a, b), True)
+
+    def op_v_pk_sub_u16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: '%s - %s' % (a, b), False)
+
+    def op_v_pk_max_i16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: 'max(%s, %s)' % (a, b), True)
+
+    def op_v_pk_max_u16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: 'max(%s, %s)' % (a, b), False)
+
+    def op_v_pk_min_i16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: 'min(%s, %s)' % (a, b), True)
+
+    def op_v_pk_min_u16(self, ops, mods):
+        self.pk_int(ops, mods, lambda a, b: 'min(%s, %s)' % (a, b), False)
+
+    def op_v_dot2_f32_f16(self, ops, mods):
+        """d = a.lo * b.lo + a.hi * b.hi + c, with c a binary32 value. The accumulator takes no modifier."""
+        low, high, clamp, fields = self.pk_lanes(ops, mods, 3, float_lanes=True, clamp_ok=True, packed=2)
+        if fields['op_sel'][2] or not fields['op_sel_hi'][2] or fields['neg_lo'][2] or fields['neg_hi'][2]:
+            raise Unsupported('v_dot2_f32_f16 modifier on the accumulator')
+        expr = '%s * %s + %s * %s + %s' % (low[0], low[1], high[0], high[1], self.f(ops[3]))
+        self.set_vf(reg_range(ops[0])[1], expr, ['clamp'] if clamp else [])
+
+    def op_v_dot4_u32_u8(self, ops, mods):
+        """d = sum of four unsigned byte products + c (wrapping). Any modifier is refused."""
+        if mods or len(ops) != 4 or not reg_range(ops[0]) or reg_range(ops[0])[0] != 'v':
+            raise Unsupported('v_dot4_u32_u8 operands %s' % ', '.join(ops + mods))
+        a, b = self.u(ops[1]), self.u(ops[2])
+        terms = ['((%s >> %d) & 0xffu) * ((%s >> %d) & 0xffu)' % (a, s, b, s) for s in (0, 8, 16, 24)]
+        self.set_v(reg_range(ops[0])[1], '%s + %s' % (' + '.join(terms), self.u(ops[3])))
 
     # VOPC with sub-dword addressing (tools/disasm_rdna2.py _decode_vopc_sdwa prints it): each source
     # reads its src0_sel/src1_sel field, zero-extended or, under sext(), sign-extended, and the
