@@ -3012,7 +3012,7 @@ class Stage:
             elif m not in ('idxen', 'offen', 'glc', 'slc', 'dlc'):
                 raise Unsupported('buffer modifier %s' % m)
         if len(ops) != 4:
-            raise Unsupported('buffer load with %d operands' % len(ops))
+            raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
         soffset = None
@@ -3055,6 +3055,11 @@ class Stage:
         return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
+        # ops[0] is read before buffer_address() can refuse a short operand list, so an instruction with no
+        # operands at all would reach it as an index error. Everything longer is left to the shared check,
+        # which sees a modifier first: the lds form decodes to three operands and must still refuse on it.
+        if not ops:
+            raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
         self.emit('a = %s;' % address)
@@ -3222,6 +3227,8 @@ class Stage:
         self.op_buffer_store_dword(ops, mods, 4)
 
     def tbuffer(self, ops, mods, count):
+        if not ops:
+            raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format

@@ -29,6 +29,16 @@ def check(name, operands, expected_output):
         assert not blocks, (name, invalid, blocks)
 
 
+def refuse(name, operands, expected):
+    """Assert a refusal for a form whose accepted shape needs a bound descriptor, so that the
+    shortest operand list is still a refusal rather than an index error at ops[0]."""
+    refusals, blocks = translate(name, operands)
+    assert len(refusals) == 1, (name, operands, refusals)
+    assert not blocks, (name, operands, blocks)
+    assert 'translator crash' not in refusals[0][0], (name, operands, refusals)
+    assert expected in refusals[0][0], (name, operands, refusals)
+
+
 def main():
     for condition in ('eq', 'lg', 'gt', 'ge', 'lt', 'le'):
         for kind in ('i32', 'u32'):
@@ -40,7 +50,16 @@ def main():
             check(f's_{operation}_b{width}', (dst, src), 'exec = ')
         check(f's_cselect_b{width}', (dst, src, '1'), 'scc ? ')
     check('s_andn2_saveexec_b64', ('s[12:13]', 's[14:15]'), 'exec = ')
-    print('startup gfx2hlsl scalar arity: 33 accepted instructions and 99 refusals')
+
+    # MUBUF and MTBUF loads read ops[0] before the shared address check can refuse a short list, so the
+    # shortest form is asserted here: without the head guard it reaches reg_range('') as an index error.
+    for suffix, count in (('', 1), ('x2', 2), ('x3', 3), ('x4', 4)):
+        refuse(f'buffer_load_dword{suffix}', (), 'buffer load with 0 operands, expected 4')
+        refuse(f'buffer_load_dword{suffix}', ('v4',), 'buffer load with 1 operands, expected 4')
+    for suffix in ('x', 'xy', 'xyz', 'xyzw'):
+        refuse(f'tbuffer_load_format_{suffix}', (), 'buffer load with 0 operands, expected 4')
+        refuse(f'tbuffer_load_format_{suffix}', ('v[8:11]',), 'buffer load with 1 operands, expected 4')
+    print('startup gfx2hlsl operand arity: 33 accepted instructions, 99 scalar refusals and 16 load refusals')
 
 
 if __name__ == '__main__':
