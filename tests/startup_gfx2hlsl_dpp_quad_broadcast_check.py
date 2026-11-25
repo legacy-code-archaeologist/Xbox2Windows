@@ -23,7 +23,7 @@ Two mutated translations, one that reads lane k + 1 and one that reads the lane'
 against the reference and match their own plain-Python image.
 
 Refused (the single-lane model cannot read a neighbour, or the quad may be partly off): swaps, pair broadcasts, row
-shifts, mirrors, DPP8, a partial row_mask or bank_mask, fi, bound_ctrl:0, a scalar or constant source, a vertex
+shifts, mirrors, DPP8, a partial row_mask or bank_mask, fi:1 without the whole-quad proof, bound_ctrl:0, a scalar or constant source, a vertex
 stage, a pixel stage after EXEC changed or with branches, and operations outside the VOP1/VOP2 tables.
 """
 import re
@@ -223,7 +223,6 @@ def controls():
         'partial row_mask': 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,1,1] row_mask:0xe bank_mask:0xf',
         'partial bank_mask': 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,1,1] row_mask:0xf bank_mask:0x7',
         'no masks': 'v_mov_b32_dpp v1, v0 quad_perm:[1,1,1,1]',
-        'fi': sane + ' fi:1',
         'bound_ctrl:0': sane + ' bound_ctrl:0',
         'scalar source': 'v_mov_b32_dpp v1, s2 quad_perm:[1,1,1,1]' + DPP,
         'constant source': 'v_mov_b32_dpp v1, 1.0 quad_perm:[1,1,1,1]' + DPP,
@@ -240,6 +239,19 @@ def controls():
     check('refused: s_wqm into another register', refused_in_stage(OTHER_WQM_WORDS))
     check('refused: pixel stage with branches', refused(sane, branches=True))
     check('control: the sane line itself translates', not refused(sane))
+    # fi:1 only decides what a disabled source lane returns, and the whole quad is proven active.
+    with_fi = 'v_subrev_f32_dpp v1, v0, v0 quad_perm:[0,0,0,0]' + DPP + ' bound_ctrl:1 fi:1'
+    stages = [Probe(), Probe()]
+    stages[0].one('v_subrev_f32_dpp', with_fi)
+    stages[1].one('v_subrev_f32_dpp', with_fi[:-len(' fi:1')])
+    check('fi:1 does not change the broadcast lowering', stages[0].lines == stages[1].lines)
+    # The DPP source is SRC0 and v_subrev computes SRC1 - SRC0 (#1996 item B): the lane's own word minus lane 0.
+    check('v_subrev_f32_dpp of a register with itself is own lane minus quad lane 0',
+          stages[0].lines == ['v256 = QuadReadLaneAt(v0, 0u);', 'v1 = U(F(v0) - F(v256));'], str(stages[0].lines))
+    check('refused: fi:1 without s_wqm exec, exec', refused(with_fi, quad_exec=False))
+    check('refused: fi:1 with EXEC no longer the entry mask', refused(with_fi, exec_known=False))
+    check('refused: fi:1 in a pixel stage with branches', refused(with_fi, branches=True))
+    check('refused: fi:1 in a vertex stage', refused(with_fi, kind='vs'))
 
 
 def check_binary(llvm_mc):

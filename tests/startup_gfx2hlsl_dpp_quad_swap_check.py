@@ -203,7 +203,9 @@ def controls():
         ('partial bank_mask', base.replace('bank_mask:0xf', 'bank_mask:0x5'), {}),
         ('row_mirror', 'v_mov_b32_dpp v5, v0 row_mirror row_mask:0xf bank_mask:0xf', {}),
         ('DPP8', 'v_mov_b32_dpp v5, v0 dpp8:[1,0,3,2,5,4,7,6]', {}),
-        ('fi:1', base + ' fi:1', {}),
+        ('fi:0 spelling', base + ' fi:0', {}),
+        ('fi:1 with EXEC no longer the entry mask', base + ' fi:1', {'exec_known': False}),
+        ('fi:1 with entry EXEC not proven whole-quad', base + ' fi:1', {'wqm_exec': False}),
         ('negated source', 'v_add_f32_dpp v5, -v0, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('SGPR source', 'v_mov_b32_dpp v5, s0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('operation without a table entry', 'v_cvt_f64_f32_dpp v[5:6], v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
@@ -237,6 +239,32 @@ def controls():
         check('refused: whole-quad proof dropped by a restored exec copy', False)
     except G.Unsupported as reason:
         check('refused: whole-quad proof dropped by a restored exec copy (%s)' % reason, 'whole-quad' in str(reason))
+
+    # 4b'. fi:1 (fetch inactive, bit 18 of the DPP dword) decides what a disabled source lane returns. With the whole
+    # quad proven active there is none, so the translation is the one without it; without the proof it stays refused.
+    for name in NAMES:
+        plain = fixture(name)[1]
+        with_fi = bytearray(plain)
+        for off, _size, mnemonic, _asm in G.decode(plain):
+            if mnemonic.endswith('_dpp'):
+                with_fi[off + 6] |= 4
+        decoded = [asm for _, _, mnemonic, asm in G.decode(bytes(with_fi)) if mnemonic.endswith('_dpp')]
+        check('%s fixture with FI set decodes to three fi:1 swaps' % name,
+              len(decoded) == 3 and all(asm.endswith(' fi:1') for asm in decoded), str(decoded))
+        check('%s fixture with fi:1 translates to the text without it' % name,
+              pipeline(bytes(with_fi)).hlsl_ps() == pipeline(plain).hlsl_ps())
+        try:
+            pipeline(bytes(with_fi)[len(WQM):]).hlsl_ps()
+            check('%s fixture with fi:1 and no s_wqm exec is refused' % name, False)
+        except G.Unsupported as reason:
+            check('%s fixture with fi:1 and no s_wqm exec is refused (%s)' % (name, reason), 'whole-quad' in str(reason))
+    branched = Probe()
+    branched.has_branches = True
+    try:
+        branched.one('v_min_u32_dpp', dpp_text('v_min_u32_dpp', 'v5, v0, v0', (1, 0, 3, 2)) + ' fi:1')
+        check('refused: fi:1 in a shader with branches', False)
+    except G.Unsupported:
+        check('refused: fi:1 in a shader with branches', True)
 
     # 4c. The min fixture keeps src1 in its own lane and its reference is neither the plain exchange nor a maximum.
     line = pipeline(fixture('min')[1]).hlsl_ps()

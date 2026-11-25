@@ -2302,7 +2302,7 @@ class Stage:
         lane keeps the one quad_perm names for its own position in the quad. That needs all four lanes of the quad to
         run the instruction in the same flow, as in a pixel shader with helper lanes: straight-line code and a
         whole-quad exec mask (proved by s_wqm exec, exec on the entry mask; a restored exact mask loses it). Every
-        other control (other permutations, row_*, wave_*, a partial row or bank mask, fi, a vertex stage) is refused by
+        other control (other permutations, row_*, wave_*, a partial row or bank mask, a vertex stage) is refused by
         name, since the single lane cannot read a neighbour."""
         perms = [m for m in mods if m.startswith('quad_perm:')]
         rest = [m for m in mods if not m.startswith('quad_perm:')]
@@ -2528,7 +2528,7 @@ class Stage:
     # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
     # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
     # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
-    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
+    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, and a vertex stage (dpp() drops fi:1 first).
     DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
     DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
 
@@ -2587,8 +2587,12 @@ class Stage:
     # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
     # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
     # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
-    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, DPP8, row shifts and partial masks stay refused.
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Other permutations, fi:1 without that proof, DPP8, row shifts and partial masks stay refused.
     def dpp(self, base, ops, mods):
+        # fi:1 (fetch inactive, DPP16 dword bit 18; LLVM AMDGPU `fi`, Mesa ACO fetch_inactive) only decides what a
+        # disabled source lane returns. Every lowering below is taken only with the whole quad proven active, so no
+        # source lane is disabled and it decides nothing.
+        mods = [m for m in mods if m != 'fi:1']
         if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
             return self.dpp_broadcast(base, ops, mods)
         perm = None

@@ -249,6 +249,11 @@ def controls():
     accepted = 'v_mov_b32_dpp v2, v1 quad_perm:[1,1,3,3] row_mask:0xf bank_mask:0xf'
     check('accepted form translates', refused(accepted) is None, str(refused(accepted)))
     check('bound_ctrl does not change the lowering', refused(accepted + ' bound_ctrl:1') is None)
+    stages = [Probe(), Probe()]
+    stages[0].one('v_mov_b32_dpp', accepted + ' bound_ctrl:1 fi:1')
+    stages[1].one('v_mov_b32_dpp', accepted)
+    check('fi:1 does not change the lowering (no source lane of a whole quad is disabled)',
+          stages[0].lines == stages[1].lines and any('QuadReadLaneAt' in line for line in stages[0].lines))
     check('quad swap also translates', refused(accepted.replace('[1,1,3,3]', '[1,0,3,2]')) is None)
     check('quad broadcast also translates', refused(accepted.replace('[1,1,3,3]', '[0,0,0,0]')) is None)
     for label, asm, kwargs in (
@@ -259,7 +264,9 @@ def controls():
             ('a mirror control', 'v_mov_b32_dpp v2, v1 row_mirror row_mask:0xf bank_mask:0xf', {}),
             ('a partial row mask', accepted.replace('row_mask:0xf', 'row_mask:0x5'), {}),
             ('a partial bank mask', accepted.replace('bank_mask:0xf', 'bank_mask:0xe'), {}),
-            ('fi', accepted + ' fi:1', {}),
+            ('fi:1 with an entry mask not proven whole-quad', accepted + ' fi:1', {'wqm_exec': False}),
+            ('fi:1 with an unknown entry mask', accepted + ' fi:1', {'exec_known': False}),
+            ('fi:1 in a program with branches', accepted + ' fi:1', {'has_branches': True}),
             ('no control', 'v_mov_b32_dpp v2, v1 row_mask:0xf bank_mask:0xf', {}),
             ('a vertex stage', accepted, {'kind': 'vs'}),
             ('a program with branches', accepted, {'has_branches': True}),
