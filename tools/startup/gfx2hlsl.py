@@ -4397,6 +4397,10 @@ class Stage:
                    % (rest, shift, value, shift))
 
     def op_s_ff1_i32_b32(self, ops, mods):
+        if not mods and len(ops) == 2 and not self.is_lane_mask(ops[1]):
+            # Local merge of #2028 with main's #2389: a plain scalar word keeps the generic SCA lowering
+            # (firstbitlow, -1 for zero). A lane mask source takes main's compute-entry path below.
+            return self.scalar('s_ff1_i32_b32', ops)
         if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
             raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
         dst = reg_range(ops[0])
