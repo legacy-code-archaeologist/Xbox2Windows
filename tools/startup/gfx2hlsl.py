@@ -2421,7 +2421,11 @@ class Stage:
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         # s_mul_hi_u32 needs the whole 32-bit word of each source, like the halfword pack.
-        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
+        word_pack = (base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16', 's_mul_hi_u32')
+                     or base in SCA_WORD_ONLY)
+        if base in SCA_RMW_DEST:
+            # The old destination is the first source of the expression.
+            srcs = [dname] + srcs
         if shift_add or word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations. s_mul_hi_u32 into an
             # SGPR that held a mask replaces it with a plain word (set_s drops the mark), so only vcc/exec count.
@@ -4940,6 +4944,8 @@ VEC_U = {
     'v_ffbh_i32': (1, '({0} == 0u || {0} == 0xffffffffu ? 0xffffffffu : 31u - firstbithigh(asint({0}) < 0 ? ~{0} : {0}))'),
     'v_bfrev_b32': (1, 'reversebits({0})'),
 }
+SCA_RMW_DEST = ('s_bitset0_b32', 's_bitset1_b32')
+SCA_WORD_ONLY = SCA_RMW_DEST + ('s_ff1_i32_b32',)
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
 # Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
 # no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
@@ -4967,6 +4973,10 @@ SCA = {
     # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
     's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
     's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
+    # s_bitset0/1_b32 read-modify-write the destination: {0} is the old D, {1} is S0; SCC unchanged.
+    's_bitset0_b32': ('({0} & ~(1u << ({1} & 31)))', None), 's_bitset1_b32': ('({0} | (1u << ({1} & 31)))', None),
+    # s_ff1_i32_b32: index of the lowest set bit, -1 when none; SCC unchanged.
+    's_ff1_i32_b32': ('({0} == 0u ? 0xffffffffu : firstbitlow({0}))', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),

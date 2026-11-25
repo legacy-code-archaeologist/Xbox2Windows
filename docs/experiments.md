@@ -7483,6 +7483,19 @@ symbolic descriptors and reserved scalar encodings stay refused; an SGPR that
 held a compare mask may be overwritten and loses its mask mark.
 `s_mul_hi_i32` is still refused by name.
 
+**Scalar bit set, clear and find-first-one.** Startup translation lowers
+`s_bitset0_b32`, `s_bitset1_b32` and `s_ff1_i32_b32`. The bitset forms read
+the old destination word and clear or set the bit selected by the low five bits
+of source 0. `s_ff1_i32_b32` returns the index of the lowest set bit of the
+source, or -1 when the source is zero. SCC is unchanged by all three. They are
+word-only: EXEC, VCC and SGPRs tracked as lane masks are refused as source or
+destination, because their per-lane projections lose the other bits. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitset_ff1$' -V`.
+The check builds the SOP1 words, evaluates the emitted expression on the CPU
+against an integer reference and covers the mask refusals. This is Python-only
+verification: no Windows, WARP or GPU draw has been run for these forms.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
+
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
