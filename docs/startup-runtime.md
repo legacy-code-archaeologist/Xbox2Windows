@@ -210,6 +210,7 @@ Revisions before 12 can overwrite the source mask when a save-EXEC instruction u
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
 an operation on a descriptor word, or lack the vertex buffer-store lowering.
+The shader cache revision is `x2w-startup-shader-9`, so translations paired by number are not reused.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
