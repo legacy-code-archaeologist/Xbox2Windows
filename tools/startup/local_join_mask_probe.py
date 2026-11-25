@@ -12,6 +12,8 @@ no keys, paths, offsets, operands, disassembly or generated HLSL.
     python -B tools/startup/local_join_mask_probe.py --compute <copy of shader_cache> > probe-with-compute.json
 
 Graphics requests only by default (compute takes much longer); progress goes to stderr every 25 requests.
+5. DPP and v_permlanex16_b32 refusals: the reason with the stage shape (branches, whole-quad EXEC), and the
+   ordered cross-lane instructions of each refused program (opcodes and DPP controls only, registers dropped).
 4. "mask from descriptor data" and "descriptor operand ... holds X" (other than joins): source symbol kinds and the
    opcode that last wrote the register.
 """
@@ -216,6 +218,48 @@ def wrap_spill(original):
     return spill_operands
 
 
+CROSS = []       # cross-lane refusals of the current request: (reason, stage shape, program signature)
+CROSS_OPS = re.compile(r'_dpp$|^v_permlane|^v_readlane|^v_readfirstlane|^v_writelane|^ds_swizzle|^ds_bpermute|^ds_permute'
+                       r'|^v_mbcnt|^s_wqm')
+
+
+def cross_signature(self):
+    """The program's cross-lane instructions in order: opcode plus DPP/swizzle controls, registers dropped."""
+    tokens = []
+    for _off, _n, name, asm in getattr(self, 'ins', []):
+        if not CROSS_OPS.search(name):
+            continue
+        _, _, mods = G.parse(asm)
+        controls = [m for m in mods if not m.startswith(('row_mask', 'bank_mask'))]
+        lane = ''
+        if name in ('v_readlane_b32', 'v_writelane_b32'):
+            last = asm.rsplit(',', 1)[-1].strip()
+            lane = ' lane=' + (last if re.fullmatch(r'\d+', last) else 'sgpr')
+        tokens.append(name + (' ' + ' '.join(controls) if controls else '') + lane)
+    collapsed = []
+    for t in tokens:  # runs of the same token count once
+        if collapsed and collapsed[-1][0] == t:
+            collapsed[-1][1] += 1
+        else:
+            collapsed.append([t, 1])
+    text = ' -> '.join('%s x%d' % (t, n) if n > 1 else t for t, n in collapsed[:24])
+    return text + (' -> ...' if len(collapsed) > 24 else '')
+
+
+def wrap_cross(original):
+    def handler(self, *args):
+        try:
+            return original(self, *args)
+        except G.Unsupported as error:
+            reason = re.sub(r'\b([vs])\d+\b', r'\1N', str(error))
+            shape = '%s, %s, %s' % (getattr(self, 'kind', '?'),
+                                    'branches' if getattr(self, 'has_branches', True) else 'straight-line',
+                                    'wqm' if getattr(self, 'wqm_exec', False) else 'no wqm')
+            CROSS.append((reason, shape, cross_signature(self)))
+            raise
+    return handler
+
+
 REG = re.compile(r'\bs\[?(\d+)')
 
 
@@ -229,6 +273,8 @@ def main(argv):
     G.Stage.scalar = wrap_scalar(G.Stage.scalar)
     G.Stage.spill_operands = wrap_spill(G.Stage.spill_operands)
     G.Stage.descriptor = wrap_descriptor(G.Stage.descriptor)
+    G.Stage.dpp = wrap_cross(G.Stage.dpp)
+    G.Stage.op_v_permlanex16_b32 = wrap_cross(G.Stage.op_v_permlanex16_b32)
     out_dir = argv[0]
     sides = ('graphics', 'compute') if with_compute else ('graphics',)
     tallies = {side: collections.Counter() for side in sides}
@@ -236,6 +282,8 @@ def main(argv):
     spill = {side: collections.Counter() for side in sides}
     maskdesc = {side: collections.Counter() for side in sides}
     holds = {side: collections.Counter() for side in sides}
+    cross_reasons = {side: collections.Counter() for side in sides}
+    cross_programs = {side: collections.Counter() for side in sides}
     for side in sides:
         compute = side == 'compute'
         keys = list(dict.fromkeys(G.request_keys(out_dir, compute=compute)))
@@ -247,6 +295,7 @@ def main(argv):
             SPILL.clear()
             MASKDESC.clear()
             HOLDS.clear()
+            CROSS.clear()
             try:
                 sites = G.compute_refusals(out_dir, key) if compute else G.request_refusals(out_dir, key, [])
             except Exception as error:  # keep going; count the crash class only
@@ -273,11 +322,19 @@ def main(argv):
                 maskdesc[side][item] += 1
             for item in set(HOLDS):
                 holds[side][item] += 1
+            for reason, shape in {(r, sh) for r, sh, _ in CROSS}:
+                cross_reasons[side]['%s [%s]' % (reason, shape)] += 1
+            for signature in {sig for _, _, sig in CROSS}:
+                cross_programs[side][signature] += 1
     print(json.dumps({side: {'joined (requests per class)': dict(tallies[side].most_common()),
                              'nand/nor mixed (requests per class)': dict(nand[side].most_common()),
                              'lane spill needs straight-line (requests per class)': dict(spill[side].most_common()),
                              'mask from descriptor data (requests per class)': dict(maskdesc[side].most_common()),
-                             'descriptor operand holds (requests per class)': dict(holds[side].most_common())}
+                             'descriptor operand holds (requests per class)': dict(holds[side].most_common()),
+                             'cross-lane refusals (requests per reason and stage shape)':
+                                 dict(cross_reasons[side].most_common()),
+                             'cross-lane signatures of refused programs (requests, top 40)':
+                                 dict(cross_programs[side].most_common(40))}
                       for side in sides}, indent=1))
 
 
