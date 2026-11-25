@@ -707,3 +707,36 @@ int draw_d16_srvs(ID3D12Device* desktop, void* guest, void* list)
     draw_at(7, 8);  // Rebind R16_UNORM default SRV on column 7; must draw yellow (0x3bff) cleanly.
     return 0;
 }
+
+// One translated pixel shader uses the same table slot across five draws. The clear color is opaque blue.
+int draw_formatted_buffer(void* guest, void* list)
+{
+    alignas(16) static const std::uint32_t zeros[4] = {};
+    alignas(16) static const std::uint32_t red[4] = {0x3f800000u};
+    const auto draw_at = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    draw_at(0);  // No table binding.
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    const auto store = [&](const std::uint32_t* data, std::uint32_t format) {
+        const auto address = ptr(data);
+        const std::uint32_t descriptor[4] = {static_cast<std::uint32_t>(address),
+            static_cast<std::uint32_t>(address >> 32) | (4u << 16), 4u, (format << 12) | 4u};
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptor, sizeof(descriptor));
+    };
+    store(red, 2);
+    draw_at(1);  // Unknown FORMAT, readable descriptor and range.
+    store(zeros, 22);
+    draw_at(2);  // Real zero data with a supported R32_FLOAT descriptor.
+    store(nullptr, 22);
+    draw_at(3);  // Supported metadata with no resolved buffer.
+    store(red, 22);
+    // Expand the viewport from the fixture's initial four columns to all eight.
+    const D3D12_VIEWPORT viewport{0, 0, 8, 4, 0, 1};
+    invoke(list, 21, 1, ptr(&viewport));
+    draw_at(4);  // Nonzero data proves the accepted format is sampled.
+    return 0;
+}

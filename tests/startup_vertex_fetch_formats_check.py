@@ -16,9 +16,15 @@ binary32, missing X, Y and Z as 0 and a missing W as 1.0, or 1 for an integer fo
 Each format with sub-dword fields uses a stride and offset that put elements at more than one byte
 alignment, so a field that crosses a dword is read through ldu(); the 32-bit formats keep aligned elements. UNORM components are compared as round(v * (2^bits - 1)), so the
 check does not depend on how many ulps the division is off by; every other component is compared bit for bit.
+The same table also serves buffer_load_format_x/xy/xyz, whose format and component selection are not in the
+instruction but in word 3 of the buffer descriptor (FORMAT bits 12..18, DST_SEL bits 0..11): the runtime passes
+that word as an entry constant and the translation switches on it. Each format is run through a MUBUF
+xyz load with its own descriptor word, then descriptor words with swizzles and constants 0 and 1 run through
+the same translated body.
 Wrong references (channels swapped, a shift off by one field, a missing W read as 0, UNORM over 2^bits)
 and mutated translations must fail the readback.
 """
+import re
 import struct
 import subprocess
 import sys
@@ -67,10 +73,10 @@ def snorm_words(fields, unsigned=False, no_clamp=False):
     return out
 
 
-def reference(name, vertex, *, swap=False, shift=False, w_zero=False, unorm_pow2=False, unsigned=False, no_clamp=False):
+def reference(name, vertex, *, offset=None, swap=False, shift=False, w_zero=False, unorm_pow2=False, unsigned=False, no_clamp=False):
     """The four compared words of one vertex, from the format definition. The keywords give wrong references."""
-    _, stride, offset, bits, kind, count = FORMATS[name]
-    address, size = vertex * stride + offset, bits // 8
+    _, stride, own_offset, bits, kind, count = FORMATS[name]
+    address, size = vertex * stride + (own_offset if offset is None else offset), bits // 8
     fields = [int.from_bytes(DATA[address + size * i:address + size * (i + 1)], 'little') for i in range(count)]
     if shift and bits < 32:
         # Each field read one field higher, as a wrong shift would; the last reads past the element.
@@ -186,6 +192,73 @@ def snorm_boundaries(components):
             assert abs(got - value) < 1e-6, (hex(half), low_first, got, value)
 
 
+IDENTITY = 4 | 5 << 3 | 6 << 6 | 7 << 9  # DST_SEL X, Y, Z, W: the four components in order
+
+
+def pipeline_mubuf(offset, op=2):
+    """A source-built vertex stage: buffer_load_format_xyz (op 2; 0 is _x, 1 is _xy) from a hardware table descriptor."""
+    # s_load_dwordx4 s[16:19], s[8:9], 0
+    # buffer_load_format_xyz v[4:6], v0, s[16:19], 0 idxen offset:<offset>
+    # exp pos0 v4, v5, v6, v7 done
+    words = (0xf4080404, 0xfa000000, 0xe0002000 | op << 18 | offset, 0x80040400,
+             0xf80008cf, 0x07060504, 0xbf810000)
+    ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
+    result = gfx2hlsl.Pipeline(struct.pack('<7I', *words), ps, root_blob(flags=0))
+    assert 'srv 0 buf table 0 0' in result.manifest().splitlines()
+    assert 'udsrc 5 descword3 0' in result.manifest().splitlines()
+    return result
+
+
+def descriptor_word3(name, selects=(4, 5, 6, 7)):
+    """Word 3 of a buffer descriptor: FORMAT in bits 12..18, then DST_SEL x, y, z, w in three bits each."""
+    return FORMATS[name][0] << 12 | sum(sel << 3 * i for i, sel in enumerate(selects))
+
+
+def mubuf_expected(name, count, selects=(4, 5, 6, 7), integer_one=False):
+    """The four compared words per vertex of a buffer_load_format_* with `count` registers and these DST_SEL values."""
+    words = [SENTINEL] * 320
+    one = 1 if integer_one else ONE
+    for vertex in range(16):
+        comps = reference(name, vertex)
+        comps = [comps[0], comps[1], comps[2], comps[3]]
+        out = [{4: comps[0], 5: comps[1], 6: comps[2], 7: comps[3], 1: one}.get(sel, 0) for sel in selects]
+        words[vertex * 4:vertex * 4 + 4] = out[:count] + [0] * (4 - count)
+    return words
+
+
+def mutate_case(source, code, old, new):
+    """Replace `old` by `new` inside the switch case of one format code only."""
+    lines = source.split('\n')
+    marker = 'case %du:' % code
+    hits = [i for i, line in enumerate(lines) if line.strip().startswith(marker) and old in line]
+    assert len(hits) == 1, (code, old)
+    lines[hits[0]] = lines[hits[0]].replace(old, new, 1)
+    return '\n'.join(lines)
+
+
+# Translations a wrong switch would produce on the descriptor path: (label, old text, new text).
+DESC_MUTATIONS = (
+    ('format field ignored (always 4 half floats)', '(ud5 >> 12) & 127u', '71u'),
+    ('format field one bit low', '(ud5 >> 12) & 127u', '(ud5 >> 11) & 127u'),
+    ('DST_SEL y from the x field', '((ud5 >> 3) & 7u)', '((ud5 >> 0) & 7u)'),
+    ('DST_SEL constant 1 as 0', 'one = U(1.0)', 'one = 0u'),
+)
+# Integer 1 for the constant of an integer format, and the switch cases themselves, are mutated per format below.
+
+
+def mubuf_cases():
+    """(label, format used for the offset and the reference, descriptor word 3, expected words) for the device run."""
+    cases = []
+    for name in FORMATS:
+        cases.append(('%s xyz' % name, name, descriptor_word3(name), mubuf_expected(name, 3)))
+    wide, small = 'BUF_FMT_32_32_32_32_FLOAT', 'BUF_FMT_8_UINT'
+    cases.append(('xyzw read as y, x, 1', wide, descriptor_word3(wide, (5, 4, 1, 7)), mubuf_expected(wide, 3, (5, 4, 1))))
+    cases.append(('xyzw read as w, 0, z', wide, descriptor_word3(wide, (7, 0, 6, 7)), mubuf_expected(wide, 3, (7, 0, 6))))
+    cases.append(('uint constant 1 stays integer', small, descriptor_word3(small, (4, 1, 0, 7)),
+                  mubuf_expected(small, 3, (4, 1, 0), integer_one=True)))
+    return cases
+
+
 def controls():
     """Translation-side checks: every table entry is reached, and the reference is not degenerate."""
     for name in FORMATS:
@@ -194,6 +267,8 @@ def controls():
     for name, label, old, new in MUTATIONS:
         source = pipeline(name).hlsl_vs()
         assert old in source, (name, label)
+    runtime = (Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'formatted_buffer.h').read_text()
+    assert set(map(int, re.findall(r'case (\d+):', runtime))) == set(gfx2hlsl.DESC_FORMAT_CODES.values())
     # SNORM: the emitted expressions hit the boundaries, and each wrong form is caught by the same check.
     components = gfx2hlsl.FETCH_FORMATS['BUF_FMT_16_16_SNORM'][1][:2]
     snorm_boundaries(components)
@@ -236,6 +311,125 @@ def controls():
         alignments = {(v * stride + offset) % 4 for v in range(16)}
         assert len(alignments) > 1 if bits < 32 else alignments == {0}, name
 
+    # buffer_load_format_x/xy/xyz: every table format has a switch case, and the codes match the disassembler's.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
+    from disasm_rdna2 import MTBUF_FORMATS
+    assert gfx2hlsl.DESC_FORMAT_CODES.keys() == gfx2hlsl.FETCH_FORMATS.keys()
+    def table_matches(table):
+        for name, (code, *_rest) in FORMATS.items():
+            if code == 1:  # the omitted tbuffer format: LLVM prints nothing, the disassembler has no name for it
+                if code in table or name != 'BUF_FMT_8_UNORM':
+                    return False
+            elif table.get(code) != name:
+                return False
+        return True
+    for name, (code, *_rest) in FORMATS.items():
+        assert gfx2hlsl.DESC_FORMAT_CODES[name] == code, name
+    assert table_matches(MTBUF_FORMATS)
+    swapped = dict(MTBUF_FORMATS)  # a wrong format name for one code must be caught
+    victim = next(c for n, (c, *_r) in FORMATS.items() if c != 1)
+    swapped[victim] = 'BUF_FMT_INVALID'
+    assert not table_matches(swapped), 'format mutation not caught'
+    assert not table_matches({**MTBUF_FORMATS, 1: 'BUF_FMT_8_UNORM'}), 'code 1 must stay the omitted default'
+    for op, count in ((0, 1), (1, 2), (2, 3)):
+        source = pipeline_mubuf(4, op).hlsl_vs()
+        assert source.count('case ') == len(FORMATS), op
+        # An unvalidated FORMAT yields the NaN sentinel in every component, never silent zeros.
+        assert 'default: c0 = c1 = c2 = c3 = %du;' % gfx2hlsl.DESC_FORMAT_UNKNOWN in source, op
+        assert 'default: break' not in source, op
+        written = {int(n) for n in re.findall(r'^\s*v(\d+) = ', source, re.M) if int(n) >= 4}
+        assert written == set(range(4, 4 + count)), (op, written)
+    try:
+        gfx2hlsl.Pipeline(struct.pack('<7I', 0xf4080404, 0xfa000000, 0xe00c2000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000),
+                          struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
+    except gfx2hlsl.Unsupported:
+        pass
+    else:
+        raise AssertionError('buffer_load_format_xyzw must stay refused')
+    # A shader that rewrites descriptor word 3 (s_mov_b32 s19, 0x50fac) after the load must not be translated
+    # with the table word: the formatted load is refused.
+    try:
+        gfx2hlsl.Pipeline(struct.pack('<8I', 0xf4080404, 0xfa000000, 0xbe9303ff, 0x50fac, 0xe0002000 | 2 << 18, 0x80040400,
+                                      0xf80008cf, 0x07060504) + struct.pack('<I', 0xbf810000),
+                          struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
+    except gfx2hlsl.Unsupported as error:
+        assert 'rewritten' in str(error), error
+    else:
+        raise AssertionError('formatted load through a rewritten descriptor word 3 must be refused')
+    # A branch can bypass the descriptor load, even though the decoder sees the load before the use.
+    branch = (0xbf840002, 0xf4080404, 0xfa000000, 0xe0002000, 0x80040400,
+              0xf80008cf, 0x07060504, 0xbf810000)
+    ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
+    try:
+        gfx2hlsl.Pipeline(struct.pack('<8I', *branch), ps, root_blob(flags=0))
+    except gfx2hlsl.Unsupported as error:
+        assert 'proven in the entry block' in str(error) or 'joined at a branch target' in str(error), error
+    else:
+        raise AssertionError('formatted load accepted when a branch could skip the descriptor load')
+    def stage(words):
+        return gfx2hlsl.Pipeline(struct.pack('<%dI' % len(words), *words), ps, root_blob(flags=0))
+
+    load = (0xf4080404, 0xfa000000)
+    formatted_tail = (0xe0002000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000)
+    # Both edges reach a block that reloads all four words from the unmodified table pointer.
+    local_reload = stage((0xbf840001, 0xbf800000, *load, *formatted_tail))
+    assert 'srv 0 buf table 0 0' in local_reload.manifest().splitlines()
+    # One edge clobbers the entry pointer before the reload. The last lexical path restores it,
+    # but the branch can skip that restore, so a proof based only on translation order is wrong.
+    changed_pointer = (0xbe920308, 0xbe880380, 0xbf840001, 0xbe880312, *load, *formatted_tail)
+    try:
+        stage(changed_pointer)
+    except gfx2hlsl.Unsupported as error:
+        assert 'local table load' in str(error) or 'joined at a branch target' in str(error), error
+    else:
+        raise AssertionError('formatted load accepted after a possibly clobbered root pointer')
+    source = pipeline_mubuf(0).hlsl_vs()
+    for label, old, new in DESC_MUTATIONS:
+        assert old in source, label
+    runtime_gate_controls()
+    # Each reference is built from the format table: no case may be degenerate (an all-zero or all-sentinel set).
+    for label, name, word3, words in mubuf_cases():
+        assert words != [SENTINEL] * 320 and (any(words[:64]) or 'zeros' in label), label
+    assert mubuf_expected('BUF_FMT_32_32_32_32_FLOAT', 3, (5, 4, 1)) != mubuf_expected('BUF_FMT_32_32_32_32_FLOAT', 3)
+
+
+RUNTIME = Path(__file__).resolve().parents[1] / 'src' / 'startup_stubs' / 'd3d12_draw.inl'
+
+
+def runtime_gate(source):
+    """Check that both FORMAT metadata and usable backing are required before submission."""
+    assert 'formatted_buffers_ready(*tr, pass, formatted_buffers)' in source
+    preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
+    for condition in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+        assert condition in preflight, condition
+    start = source.index('bool draw_translated(')
+    gate = source.index('if (!have && formatted.entry)', start)
+    assert source.index('formatted_buffers_ready(*tr, pass, formatted_buffers)', start) < gate
+    assert gate < source.index('if (!have && identity_for_null)', gate)
+    assert gate < source.index('list->SetPipelineState(pipeline)', gate)
+
+
+def runtime_gate_controls():
+    source = RUNTIME.read_text(encoding='utf-8')
+    runtime_gate(source)
+    preflight = source[source.index('bool formatted_buffers_ready('):source.index('bool draw_translated(')]
+    for dropped in ('x2w_local::readable(', 'view_token_magic', 'formatted_buffer_supported('):
+        try:
+            runtime_gate(source.replace(preflight, preflight.replace(dropped, 'omitted')))
+        except AssertionError:
+            continue
+        raise AssertionError('gate without %s must fail the control' % dropped)
+    start = source.index('bool draw_translated(')
+    gate = 'if (!have && formatted.entry)'
+    start_cmd = 'list->SetPipelineState(pipeline);'
+    late = source[:start] + source[start:].replace(gate, '', 1).replace(start_cmd, start_cmd + '\n' + gate, 1)
+    try:
+        runtime_gate(late)
+    except (AssertionError, ValueError):
+        pass
+    else:
+        raise AssertionError('gate after binding fallback or list commands must fail the control')
+
 
 def compile_fetch(directory, compiler, name, source):
     hlsl, binary = directory / 'fetch.hlsl', directory / 'fetch.cso'
@@ -248,12 +442,20 @@ def compile_fetch(directory, compiler, name, source):
     return binary
 
 
-def run_reference(directory, consumer, adapter, binary, name, words):
+def run_reference(directory, consumer, adapter, binary, name, words, translated=None, word3=None):
     case = directory / 'fetch.case'
+    translated = translated or pipeline(name)
     constants = [0] * 16
-    constants[pipeline(name).uds.index(('stride', 0))] = FORMATS[name][1]
+    constants[translated.uds.index(('stride', 0))] = FORMATS[name][1]
+    if word3 is not None:
+        constants[translated.uds.index(('descword3', 0))] = word3
     case.write_bytes(struct.pack('<337I', 1, *words, *constants))
     return subprocess.run([consumer, adapter, '--compute-store-case', binary, case], capture_output=True, text=True)
+
+
+def run(directory, compiler, consumer, adapter, name, source, words, translated=None, word3=None):
+    binary = compile_fetch(directory, compiler, name, source)
+    return run_reference(directory, consumer, adapter, binary, name, words, translated, word3)
 
 
 def check(directory, compiler, consumer, adapter):
@@ -287,6 +489,50 @@ def check(directory, compiler, consumer, adapter):
         print('%s: mutation %r fails' % (name, label))
     print('%s: %d buffer formats, 16 vertices each, every wrong reference and %d mutations fail'
           % (adapter, len(FORMATS), len(MUTATIONS)))
+    mubuf_runs = 0
+    for label, name, word3, words in mubuf_cases():
+        translated = pipeline_mubuf(FORMATS[name][2])
+        source = translated.hlsl_vs()
+        result = run(directory, compiler, consumer, adapter, name, source, words, translated, word3)
+        if result.returncode:
+            raise RuntimeError('descriptor %s: %s%s' % (label, result.stdout, result.stderr))
+        print('descriptor %s: %s' % (label, [l for l in result.stdout.splitlines() if 'mismatches=' in l][0]))
+        mubuf_runs += 1
+    # The same translated body must fail when the descriptor word names another format, or when it is mutated.
+    name = 'BUF_FMT_32_32_32_32_FLOAT'
+    translated = pipeline_mubuf(FORMATS[name][2])
+    source = translated.hlsl_vs()
+    for other in ('BUF_FMT_32_32_FLOAT', 'BUF_FMT_16_16_16_16_FLOAT'):
+        bad = run(directory, compiler, consumer, adapter, name, source, mubuf_expected(name, 3), translated, descriptor_word3(other))
+        if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
+            raise AssertionError('descriptor word of %s did not change the load\n%s' % (other, bad.stderr))
+    for label, old, new in DESC_MUTATIONS:
+        for case_label, case_name, word3, words in mubuf_cases():
+            if 'xyz' not in case_label and 'as' not in case_label and 'integer' not in case_label:
+                continue
+            translated = pipeline_mubuf(FORMATS[case_name][2])
+            bad = run(directory, compiler, consumer, adapter, case_name, translated.hlsl_vs().replace(old, new), words, translated, word3)
+            if bad.returncode == 1 and 'Compute readback differs' in bad.stderr:
+                print('descriptor mutation %r fails on %s' % (label, case_label))
+                break
+        else:
+            raise AssertionError('descriptor mutation %r escaped detection' % label)
+    for name, label, old, new in MUTATIONS:
+        translated = pipeline_mubuf(FORMATS[name][2])
+        # The descriptor switch names its components c0..c3 where the tbuffer translation names v4..v7.
+        old, new = (re.sub(r'\bv([4-7]) =', lambda m: 'c%d =' % (int(m.group(1)) - 4), t) for t in (old, new))
+        source = mutate_case(translated.hlsl_vs(), FORMATS[name][0], old, new)
+        # An xyz load never reads W, so a W-only mutation needs a word routing W into the third register.
+        for selects in ((4, 5, 6, 7), (4, 5, 7, 7)):
+            bad = run(directory, compiler, consumer, adapter, name, source, mubuf_expected(name, 3, selects), translated,
+                      descriptor_word3(name, selects))
+            if bad.returncode == 1 and 'Compute readback differs' in bad.stderr:
+                break
+        else:
+            raise AssertionError('%s: descriptor-path mutation %r escaped detection\n%s' % (name, label, bad.stderr))
+        print('%s: descriptor-path mutation %r fails' % (name, label))
+    print('%s: %d buffer_load_format descriptor cases, wrong descriptor words and %d mutations fail'
+          % (adapter, mubuf_runs, len(MUTATIONS) + len(DESC_MUTATIONS)))
     return 0
 
 

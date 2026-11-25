@@ -11,7 +11,7 @@
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16 };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -173,6 +173,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "rootconst")) ud.kind = Translation::root_constant;
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
             else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
+            else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
@@ -1480,6 +1481,7 @@ namespace indirect_refusal_code {
 constexpr const char* pipeline_or_target_unavailable = "pipeline_or_target_unavailable";
 constexpr const char* translation_not_ready = "translation_not_ready";
 constexpr const char* d16_srv_not_ready = "d16_srv_not_ready";
+constexpr const char* formatted_buffer_not_ready = "formatted_buffer_not_ready";
 constexpr const char* missing_guest_root = "missing_guest_root";
 constexpr const char* live_compute_pipeline = "live_compute_pipeline";
 constexpr const char* unsupported_resource_or_entry = "unsupported_resource_or_entry";
@@ -1729,6 +1731,42 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     return {native, offset, bytes, stride, upload};
 }
 
+struct FormattedBufferDescriptor {
+    u64 entry = 0;
+    std::uint32_t words[8] = {};
+};
+
+bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
+{
+    const auto refuse = [&](int slot, const char* reason, std::uint32_t detail = 0) {
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-draw %016llx srv %d: formatted buffer refused (%s %u)", tr.key, slot, reason, detail);
+        return false;
+    };
+    for (const auto& ud : tr.uds) {
+        if (ud.kind != Translation::desc_word3) continue;
+        if (ud.a < 0 || ud.a >= 32 || static_cast<std::size_t>(ud.a) >= tr.srvs.size())
+            return refuse(ud.a, "invalid SRV index");
+        auto& descriptor = descriptors[ud.a];
+        if (descriptor.entry) continue;
+        const auto& srv = tr.srvs[ud.a];
+        if (srv.kind != 0 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
+            return refuse(ud.a, "missing hardware descriptor");
+        const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), sizeof(descriptor.words));
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
+            return refuse(ud.a, "missing hardware descriptor");
+        std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
+        if (descriptor.words[0] == view_token_magic)
+            return refuse(ud.a, "missing hardware descriptor");
+        const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
+        if (!x2w_startup::formatted_buffer_supported(format))
+            return refuse(ud.a, "unsupported FORMAT", format);
+        descriptor.entry = entry;
+    }
+    return true;
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
                      TranslatedIndirectDraw* indirect)
 {
@@ -1743,10 +1781,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
     std::uint32_t d16_unorm16[32] = {};
-    if (!tr || tr->state != 1 || !d16_srvs_ready(*tr, pass, d16_unorm16)) {
+    FormattedBufferDescriptor formatted_buffers[32] = {};
+    const bool translation_ok = tr && tr->state == 1;
+    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    if (!formatted_ok) {
         if (indirect && tr)
-            indirect->refusal_code = tr->state != 1 ? indirect_refusal_code::translation_not_ready
-                                                    : indirect_refusal_code::d16_srv_not_ready;
+            indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
+                                     : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
+                                                     : indirect_refusal_code::formatted_buffer_not_ready;
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -1850,11 +1893,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = pass.root_address[srv.a];
             bytes = readable_window(address, 0x10000);
         }
-        const u64 entry = srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
-            pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0;
+        const auto& formatted = formatted_buffers[i];
+        const u64 entry = formatted.entry ? formatted.entry :
+            (srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
+                pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0);
         std::uint32_t words[8] = {};
-        const bool entry_ok = entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32);
-        if (entry_ok) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        const bool entry_ok = formatted.entry ||
+            (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
+        if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 4) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
@@ -2051,6 +2097,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
+        if (!have && formatted.entry) {
+            static LONG refused;
+            if (first_calls(refused, 6))
+                log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
         if (!have && identity_for_null) {
             static float identity[64];
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
@@ -2078,7 +2131,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
-            : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a] : 0;
+            : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
+            : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
