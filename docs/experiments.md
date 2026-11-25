@@ -13927,6 +13927,25 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-p
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Startup compute 64-bit LDS exchange
+
+[The startup translator](../tools/startup/gfx2hlsl.py) (`check_lds_exchange`, refs `#2274`, `#1541`) extends the bounded group-shared LDS exchange to 64-bit contiguous pairs (`ds_write_b64` and `ds_read_b64`, RDNA 2 DS `0x4d` and `0x76`):
+
+- `ds_write_b64 addr, v[d0:d1] [offset:k]` requires a single VGPR byte address from `v_lshlrev_b32 addr, 3, v0`, a contiguous `v[d0:d1]` pair in `v0..v255`, 4-byte aligned `offset`, and `offset + group[0] * 8 <= lds_words * 4`.
+- `ds_read_b64 v[r0:r1], addr [offset:k]` requires matching 64-bit fill width (mixed `b32`/`b64` exchanges stay refused), a completed `s_waitcnt lgkmcnt(0)` before `s_barrier` and after each read, an exact `v[r0:r1]` pair, and literal or literal-masked (`v_and_b32`) byte addresses proving `[a + offset, a + offset + 8)` lies 4-byte aligned inside `[first, first + group[0] * 8)`. It computes `a = (addr + offset) >> 2` before assigning `r0 = lds[a]` and `r1 = lds[a + 1u]` (alias-safe when `addr` overlaps `v[r0:r1]`).
+
+[The 64-bit LDS check](../tests/startup_compute_lds_b64_check.py) verifies offline sizing/mask/pair/mixed-width/overflow/refusal controls and runs two `gfx1013` programs on D3D12 (`cs_6_0`, `debug_layer=enabled`): `P` (`[numthreads(64,1,1)]`, `groups=(2,1,1)`, `LDS_SIZE=2`, `offset:16`, cross-wave `X ^ 32` peer swap with `v[8:9], v8` aliasing) and `B` (`[numthreads(64,1,1)]`, `groups=(1,1,1)`, `LDS_SIZE=1`, peer `v[8:9]` plus lane-37 broadcast `v[10:11]` at `offset:296`). On both WARP (`Microsoft Basic Render Driver` `1414:008c`, driver `10.0.26100.9818`) and `NVIDIA GeForce RTX 4070 SUPER` (`10de:2783`, driver `32.0.16.2114`), both cases matched all `320` words (`mismatches=0`, `debug_errors=0 debug_warnings=0`), and all five shader mutants rejected cleanly (`p-same-lane`: `word=0`, 256 mismatches; `p-swap-dwords`: `word=0`, 256 mismatches; `p-drop-high`: `word=1`, 128 mismatches; `b-wrong-mask`: `word=0`, 64 mismatches; `b-wrong-lane`: `word=2`, 128 mismatches).
+
+```powershell
+. .\tools\dev.ps1
+cmake --preset release
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -j 1 -R "^startup_compute_lds_b64" -V
+python -B tests/startup_compute_lds_b64_check.py binary llvm-mc-15
+```
+
+Not covered here: `llvm-mc-15` assembly step on Linux CI (`binary`), sub-dword or mixed-width LDS exchanges, non-1D groups, divergent `EXEC`, and real title shaders.
+
 ## Startup translator: refusal census
 
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
