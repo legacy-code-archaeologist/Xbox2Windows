@@ -424,6 +424,9 @@ CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
                             0x3e22f983)  # 1/(2*pi)
 
 
+INTERP_DST_HIGH = 'op_sel:[0,0,0,1]'
+
+
 def check_encoding(code, off, n, name, asm):
     # These SOP1 forms have an unused field that the disassembler does not print.
     # Only the ordinary four-byte encodings (no literal or hidden operand) are used
@@ -434,11 +437,17 @@ def check_encoding(code, off, n, name, asm):
         if n != 4 or unused:
             raise Unsupported('s_setpc_b64: unsupported %s encoding at +0x%x' % (name, off))
     if name in ('v_interp_p1ll_f16', 'v_interp_p2_f16'):
-        # The shared disassembler ignores op_sel (w0[14:11]) here, as LLVM 15 does. Mesa ACO's
-        # v_interp_p2_hi_f16 is p2 with op_sel bit 3 (w0[14]): it writes the high half of the destination. The
-        # attribute half `high` is a different bit (w1[8]) and is printed, so it is not refused here.
-        if struct.unpack_from('<I', code, off)[0] & 0x7800:
-            raise Unsupported('%s with op_sel: only the plain form and high are lowered' % name)
+        # The shared disassembler ignores op_sel (w0[14:11]) here, as LLVM 15 does (its VOP3Interp_gfx10 encoding
+        # leaves bits 14:11 undefined). Only Mesa ACO states a meaning: v_interp_p2_hi_f16 is p2 with op_sel 0x8 (bit
+        # 14, aco_assembler.cpp), which writes the high half of the destination; register allocation turns p2 into it
+        # for a 16-bit value at byte 2 of a register that holds another 16-bit value. It is passed on as the printed
+        # LLVM modifier `op_sel:[0,0,0,1]`. The attribute half `high` is a different bit (w1[8]) and is printed.
+        sel = struct.unpack_from('<I', code, off)[0] >> 11 & 15
+        if sel == 8 and name == 'v_interp_p2_f16':
+            return asm + ' ' + INTERP_DST_HIGH
+        if sel:
+            raise Unsupported('%s with op_sel 0x%x: only the plain form and, on v_interp_p2_f16, op_sel 0x8 '
+                              '(destination high half) are lowered' % (name, sel))
     if name == 'image_load_mip':
         # The shared disassembler does not expose these gfx10 MIMG flags.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -4978,7 +4987,8 @@ class Stage:
           f16tof32(word_c >> 16 * h), carried by the extra outputs hparamN_lo (h = 0) and hparamN_hi (h = 1),
           channel c of each. All four channels exist.
         """
-        extra = [m for m in mods if m != 'high']
+        allowed = ('high', INTERP_DST_HIGH) if op == 'v_interp_p2_f16' else ('high',)
+        extra = [m for m in mods if m not in allowed]
         if extra:
             raise Unsupported('%s with %s: only the plain form and high are lowered' % (op, ' '.join(extra)))
         if len(ops) != n_ops:
@@ -5017,9 +5027,10 @@ class Stage:
         never written (they still hold the entry barycentrics wherever the pair reads them), (2) v_interp_p1ll_f16,
         which emits nothing, has no consumer but the v_interp_p2_f16 that follows it in the same straight-line run
         and nothing reads the destination it leaves stale when p2 writes elsewhere, and (3) nothing reads the
-        upper 16 bits of the p2 destination: whether gfx10 keeps or clears them is not established by a source
+        upper 16 bits of a plain p2 destination: whether gfx10 keeps or clears them is not established by a source
         (LLVM 15 SIInstrInfo/VOP3Instructions.td model the result as f16 only; the encoding states no
-        high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it.
+        high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it, until a p2 with
+        op_sel 0x8 writes the high half of that register (Mesa ACO keeps the other half, see check_encoding).
         """
         if self.interp_scanned:
             return
@@ -5087,7 +5098,15 @@ class Stage:
                 stale.discard(out)
                 if out != d:
                     stale.add(d)
-                high_undefined.add(out)
+                if INTERP_DST_HIGH in mods:
+                    # Completes a 16-bit pair: the low half it keeps must be a plain p2 result still waiting for its
+                    # upper half (no other writer is modelled), after which every reader sees defined halves.
+                    if out not in high_undefined:
+                        raise Unsupported('v_interp_p2_f16 op_sel 0x8 into v%d, which holds no v_interp_p2_f16 low '
+                                          'half: the half it keeps is not modelled' % out)
+                    high_undefined.discard(out)
+                else:
+                    high_undefined.add(out)
             elif low_reader:
                 high_undefined.discard(int(ops[0][1:]))
                 stale.discard(int(ops[0][1:]))
@@ -5115,9 +5134,10 @@ class Stage:
         self.interp_p1[int(ops[0][1:])] = (attr, field, high)
 
     def op_v_interp_p2_f16(self, ops, mods):
-        # P1 + J * P20, converted to binary16 into the low half of the destination (LLVM: the result is f16, the
-        # high bit selects the attribute half only). The upper half is not modelled: interp_f16_scan refuses
-        # every consumer of it, so the preserved half emitted here is never observed.
+        # P1 + J * P20, converted to binary16 into one half of the destination, the other half kept (LLVM: the
+        # result is f16, the high bit selects the attribute half only). The plain form writes the low half; with
+        # op_sel 0x8 (ACO's v_interp_p2_hi_f16) the high half. interp_f16_scan refuses every consumer of a half the
+        # pair has not written, so a half that is never written is never observed.
         attr, field, high = self.interp_f16('v_interp_p2_f16', ops, mods, 1, 4)
         self.interp_f16_pair('v_interp_p2_f16', ops)
         self.interp_f16_scan()
@@ -5125,7 +5145,10 @@ class Stage:
             raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' % (ops[3], ops[2]))
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
-        self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field))
+        if INTERP_DST_HIGH in mods:
+            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(i.%s) << 16)' % (d, field))
+        else:
+            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.%s)' % (d, field))
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)

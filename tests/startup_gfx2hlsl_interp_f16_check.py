@@ -20,7 +20,8 @@ with struct ('e' format) conversions, not from the lowering: the translated text
 interpreter of exactly the statements the fixture produces. Negative controls: the lowering removed (the pair is
 refused), the high bit inverted on both instructions (the evaluated words differ from the reference), and every
 modifier or form the fixture does not cover (refused),
-including every op_sel bit (ACO's v_interp_p2_hi_f16 writes the high half of the destination).
+including every op_sel bit (ACO's v_interp_p2_hi_f16, op_sel 0x8 on p2, is lowered by startup_gfx2hlsl_interp_p2_hi_check.py;
+here it is refused where no plain p2 low half precedes it).
 
 Plain export (follow-up of #2052): real programs pack the binary16 halves into a plain 32-bit export, e.g. with
 v_cvt_pkrtz_f16_f32, and read all four channels. Half h of 32-bit channel c is f16tof32(word_c >> 16 * h) (the low
