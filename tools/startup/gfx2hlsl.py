@@ -3741,13 +3741,15 @@ class Stage:
         return False
 
     def mubuf_format(self, ops, mods, count):
-        """Lower a formatted MUBUF read using FORMAT and DST_SEL from descriptor word 3.
+        """buffer_load_format_x/xy/xyz/xyzw: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
 
         The caller supplies that word as an entry constant. Each supported format becomes one case of a switch
         on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
-        each destination register, a component or the constant 0 or 1. For compute, the caller must validate
-        the native descriptor and reachable byte addresses, and bind the SRV and entry constants from that
-        same descriptor snapshot. The switch default is a diagnostic for an unsupported format.
+        each destination register, a component or the constant 0 or 1. The draw builds the word from a hardware
+        descriptor or from the title's typed buffer view (src/startup_stubs/buffer_format_word3.h) and refuses the
+        draw when it has none or the FORMAT has no case here, so the default arm is not reached from a draw.
+        For compute, the caller must validate the native descriptor and reachable byte addresses, and bind the
+        SRV and entry constants from that same descriptor snapshot.
         """
         buf, address = self.buffer_address(ops, mods)
         dst = reg_range(ops[0])
@@ -3791,8 +3793,6 @@ class Stage:
         self.mubuf_format(ops, mods, 3)
 
     def op_buffer_load_format_xyzw(self, ops, mods):
-        if self.kind != 'cs':
-            raise Unsupported('buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL')
         self.mubuf_format(ops, mods, 4)
 
     def op_tbuffer_load_format_x(self, ops, mods):

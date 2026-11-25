@@ -415,6 +415,41 @@ void release_placed_vertices(bool done)
     }
 }
 
+// X2W_TEST_FORMATTED_VIEW=<DXGI format>:<component mapping>:<raw 0|1>:<64 hex bytes>: one typed (or raw) buffer view
+// the title creates over a placed buffer holding those bytes, at table entry 0, then one draw. The translated pixel
+// shader in tests/startup_formatted_view_draw_check.py reads element 1 through buffer_load_format_xyzw.
+int draw_formatted_view(void* guest, void* list)
+{
+    char spec[256]{};
+    if (!GetEnvironmentVariableA("X2W_TEST_FORMATTED_VIEW", spec, sizeof(spec))) return 48;
+    unsigned format = 0, mapping = 0, raw = 0;
+    char hex[129]{};
+    if (std::sscanf(spec, "%u:%x:%u:%128s", &format, &mapping, &raw, hex) != 4 || std::strlen(hex) != 128) return 48;
+    static std::array<std::uint8_t, 65536 + 256> backing{};
+    auto* const bytes = reinterpret_cast<std::uint8_t*>((ptr(backing.data()) + 0xffff) & ~Word{0xffff});
+    for (unsigned i = 0; i < 64; ++i) {
+        unsigned value = 0;
+        if (std::sscanf(hex + 2 * i, "%2x", &value) != 1) return 48;
+        bytes[i] = static_cast<std::uint8_t>(value);
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(bytes), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{static_cast<DXGI_FORMAT>(format), D3D12_SRV_DIMENSION_BUFFER, mapping};
+    view.Buffer.NumElements = 4;
+    view.Buffer.Flags = raw ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+    invoke(guest, 18, ptr(placed), ptr(&view), cpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 {
     static std::array<std::uint8_t, 65536 + 256> raw_buf0{};

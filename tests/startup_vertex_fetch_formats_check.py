@@ -244,6 +244,12 @@ DESC_MUTATIONS = (
     ('DST_SEL constant 1 as 0', 'one = U(1.0)', 'one = 0u'),
 )
 # Integer 1 for the constant of an integer format, and the switch cases themselves, are mutated per format below.
+# buffer_load_format_xyzw device cases: (label, format, DST_SEL x, y, z, w). The fourth register is never 0 here.
+XYZW_CASES = (
+    ('xyzw', 'BUF_FMT_32_32_32_32_FLOAT', (4, 5, 6, 7)),
+    ('xyzw with missing z and w', 'BUF_FMT_16_16_FLOAT', (4, 5, 6, 7)),
+    ('xyzw read as w, 1, 0, x', 'BUF_FMT_32_32_32_32_FLOAT', (7, 1, 0, 4)),
+)
 
 
 def mubuf_cases():
@@ -331,7 +337,10 @@ def controls():
     swapped[victim] = 'BUF_FMT_INVALID'
     assert not table_matches(swapped), 'format mutation not caught'
     assert not table_matches({**MTBUF_FORMATS, 1: 'BUF_FMT_8_UNORM'}), 'code 1 must stay the omitted default'
-    for op, count in ((0, 1), (1, 2), (2, 3)):
+    for label, name, selects in XYZW_CASES:
+        words = mubuf_expected(name, 4, selects)
+        assert all(words[v * 4 + 3] for v in range(16)), label  # an xyz translation leaves this register 0
+    for op, count in ((0, 1), (1, 2), (2, 3), (3, 4)):
         source = pipeline_mubuf(4, op).hlsl_vs()
         assert source.count('case ') == len(FORMATS), op
         # An unvalidated FORMAT yields the NaN sentinel in every component, never silent zeros.
@@ -339,13 +348,6 @@ def controls():
         assert 'default: break' not in source, op
         written = {int(n) for n in re.findall(r'^\s*v(\d+) = ', source, re.M) if int(n) >= 4}
         assert written == set(range(4, 4 + count)), (op, written)
-    try:
-        gfx2hlsl.Pipeline(struct.pack('<7I', 0xf4080404, 0xfa000000, 0xe00c2000, 0x80040400, 0xf80008cf, 0x07060504, 0xbf810000),
-                          struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_blob(flags=0))
-    except gfx2hlsl.Unsupported:
-        pass
-    else:
-        raise AssertionError('buffer_load_format_xyzw must stay refused')
     # A shader that rewrites descriptor word 3 (s_mov_b32 s19, 0x50fac) after the load must not be translated
     # with the table word: the formatted load is refused.
     try:
@@ -533,6 +535,20 @@ def check(directory, compiler, consumer, adapter):
         print('%s: descriptor-path mutation %r fails' % (name, label))
     print('%s: %d buffer_load_format descriptor cases, wrong descriptor words and %d mutations fail'
           % (adapter, mubuf_runs, len(MUTATIONS) + len(DESC_MUTATIONS)))
+    # buffer_load_format_xyzw: the fourth register holds what DST_SEL w routes there, and the xyz translation of the
+    # same load (fourth register left 0) must fail each reference.
+    for label, name, selects in XYZW_CASES:
+        word3, words = descriptor_word3(name, selects), mubuf_expected(name, 4, selects)
+        translated = pipeline_mubuf(FORMATS[name][2], 3)
+        result = run(directory, compiler, consumer, adapter, name, translated.hlsl_vs(), words, translated, word3)
+        if result.returncode:
+            raise RuntimeError('descriptor %s: %s%s' % (label, result.stdout, result.stderr))
+        print('descriptor %s: %s' % (label, [l for l in result.stdout.splitlines() if 'mismatches=' in l][0]))
+        xyz = pipeline_mubuf(FORMATS[name][2], 2)
+        bad = run(directory, compiler, consumer, adapter, name, xyz.hlsl_vs(), words, xyz, word3)
+        if bad.returncode != 1 or 'Compute readback differs' not in bad.stderr:
+            raise AssertionError('descriptor %s: the xyz form passed the xyzw reference\n%s' % (label, bad.stderr))
+        print('descriptor %s: the xyz form fails' % label)
     return 0
 
 

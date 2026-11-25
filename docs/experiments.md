@@ -294,10 +294,39 @@ ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|
 
 `BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
 
-`buffer_load_format_x`, `_xy` and `_xyz` (MUBUF) use FORMAT (word 3 bits 12 to 18) and DST_SEL (bits 0 to 11) from the buffer descriptor. The draw snapshots the hardware table descriptor and provides word 3 as `udsrc <n> descword3 <srv>`. It refuses missing hardware descriptor metadata, unsupported FORMAT codes and unresolved buffer ranges before submitting the draw. The shader decodes using the same expressions as the tbuffer path. Selectors 4 to 7 choose x, y, z and w, while selectors 0 and 1 choose constants 0 and 1. For a load after a branch, the vertex or pixel shader must load all four descriptor words in the same basic block as the use. The root table pointer must reach the load or its local pointer copy without any intervening write along the control-flow predecessors. It refuses rewritten descriptor words and the four-component `buffer_load_format_xyzw` form. `startup_vertex_fetch_formats_*` covers twelve formats, component swizzles, integer 1 and mutations that must differ on readback. `startup_mubuf_descriptor_*` draws with the real binding path on WARP and hardware. Missing metadata, unsupported FORMAT and unresolved backing leave the target blue, while valid zero and one draw black and red.
+`buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` (MUBUF) use FORMAT (word 3 bits 12 to 18) and DST_SEL (bits 0 to 11) from the buffer descriptor. The draw snapshots the hardware table descriptor and provides word 3 as `udsrc <n> descword3 <srv>`. It refuses missing hardware descriptor metadata, unsupported FORMAT codes and unresolved buffer ranges before submitting the draw. The shader decodes using the same expressions as the tbuffer path. Selectors 4 to 7 choose x, y, z and w, while selectors 0 and 1 choose constants 0 and 1. For a load after a branch, the vertex or pixel shader must load all four descriptor words in the same basic block as the use. The root table pointer must reach the load or its local pointer copy without any intervening write along the control-flow predecessors. It refuses rewritten descriptor words. `startup_vertex_fetch_formats_*` covers twelve formats, component swizzles, integer 1 and mutations that must differ on readback, plus three `buffer_load_format_xyzw` device cases (identity, a two-channel format whose z and w are the defaults 0 and 1, and the word (w, 1, 0, x)), each of which must also fail through the xyz translation of the same load. `startup_mubuf_descriptor_*` draws with the real binding path on WARP and hardware. Missing metadata, unsupported FORMAT and unresolved backing leave the target blue, while valid zero and one draw black and red.
 `BUF_FMT_8_8_8_8_UINT` (gfx10 format 60, DXGI `R8G8B8A8_UINT` 30) reads four unsigned bytes into X, Y, Z and W in increasing address order. With stride 5 and byte offset 3, the 16-vertex fixture visits all four dword alignments. On WARP, all 64 component words matched the byte reference. Swapping channels in the reference or normalizing the green byte in the generated shader each triggered a mismatch.
 
 `BUF_FMT_16_16_UINT` (gfx10 format 27; LLVM 15 `BUF_DATA_FORMAT_16_16` with `BUF_NUM_FORMAT_UINT`) reads two unsigned 16-bit fields into X and Y, the low half first, with Z = 0 and W = 1. With stride 6 and byte offset 2, the fixture's elements sit at two dword alignments, so half of them cross a dword. On WARP and on an AMD Radeon RX 9070 XT (driver 32.0.32015.7029, Windows 10.0.26300.9974, debug layer enabled), all 64 component words matched the byte reference. The wrong references and three mutated translations each triggered a mismatch: a normalized low half, the high half read from the low half, and a missing W read as 1.0.
+
+A typed buffer view that the title creates through the runtime (`CreateShaderResourceView`, `BUFFER`, no flags, no structure stride) leaves no hardware descriptor in the table. For this case the draw builds word 3 the way the console driver builds it from the view, using `view_word3()` in `src/startup_stubs/buffer_format_word3.h`:
+
+- FORMAT is the code of the DXGI format whose typed read gives the same components. The 14 formats in the switch are covered: `R8_UNORM` 1, `R8_UINT` 5, `R8G8_UNORM` 14, `R32_FLOAT` 22, `R16G16_UNORM` 23, `R16G16_SNORM` 24, `R16G16_UINT` 27, `R16G16_FLOAT` 29, `R8G8B8A8_UNORM` 56, `R8G8B8A8_UINT` 60, `R32G32_FLOAT` 64, `R16G16B16A16_FLOAT` 71, `R32G32B32_FLOAT` 74 and `R32G32B32A32_FLOAT` 77. The codes are the LLVM 15 `llvm-mc -mcpu=gfx1013` encodings of the tbuffer `format:` operand.
+- DST_SEL comes from `Shader4ComponentMapping`: a channel becomes 4 to 7, a forced 0 becomes 0 and a forced 1 becomes 1.
+
+The draw is refused, not read as zeros, whenever a translated formatted load has no resolved word 3:
+
+- no hardware descriptor or typed view behind the entry (a raw or structured view, a texture, an unknown token);
+- an unreadable descriptor entry;
+- a view format or hardware FORMAT the switch has no case for;
+- an invalid component mapping or a reserved DST_SEL (2, 3);
+- a buffer larger than the 16 MiB copy.
+
+Each refusal logs `srv <n>: formatted buffer refused (<reason> <detail>)` for the first 6 occurrences and counts as `formatted-load draws refused` in the `x2w-render totals` line. Because the shader reads the raw copy at `vindex * stride`, the alignment of the upload ring does not constrain 12-byte formats.
+
+`startup_buffer_format_word3_table` checks that the DXGI table equals `DESC_FORMAT_CODES`, agrees with `FETCH_DXGI` and with `formatted_buffer_supported()`; a header that gives `R32G32B32A32_FLOAT` code 74 must fail it. `startup_buffer_format_word3` checks words and refusal reasons, and its `mapping` control, which ignores the view mapping, must fail. `startup_formatted_view_draw_{warp,hardware}` draws one source-built pixel stage through the stand-in: `buffer_load_format_xyzw` with `idxen` of element 1 into an `R32G32B32A32_FLOAT` target, compared as four 32-bit words with distinct sentinels per channel. One translation serves every view:
+
+- `R32G32B32A32_FLOAT` and `R16G16B16A16_FLOAT`;
+- `R16G16_FLOAT`, whose z and w must be the defaults 0 and 1.0;
+- `R16G16_SNORM` with -32768 and 0, which gives -1.0 and 0;
+- `R32G32B32A32_FLOAT` mapped (w, 0, x, 1);
+- `R8G8B8A8_UNORM` mapped (z, 1, 0, w).
+
+An `R32_UINT` view and a raw view must refuse the draw with their reasons, logged once, and leave the clear value. A translation whose W selector reads the Z field must fail.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(buffer_format_word3|formatted_view_draw_(warp|hardware)|vertex_fetch_formats_)' -V
+```
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 

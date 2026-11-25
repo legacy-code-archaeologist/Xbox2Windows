@@ -1807,6 +1807,13 @@ add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_c
 target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
 target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
+# Descriptor word 3 for formatted buffer loads (src/startup_stubs/buffer_format_word3.h); the mutated run must fail.
+add_executable(startup_buffer_format_word3_check tests/startup_buffer_format_word3_check.cpp)
+target_include_directories(startup_buffer_format_word3_check PRIVATE src)
+target_compile_features(startup_buffer_format_word3_check PRIVATE cxx_std_17)
+add_test(NAME startup_buffer_format_word3 COMMAND startup_buffer_format_word3_check)
+add_test(NAME startup_buffer_format_word3_mapping_control COMMAND startup_buffer_format_word3_check --mutate mapping)
+set_tests_properties(startup_buffer_format_word3_mapping_control PROPERTIES WILL_FAIL TRUE)
 foreach(mutation IN ITEMS height exact-fit first-32)
     add_test(NAME startup_memory_srv_buffer_${mutation}_control COMMAND startup_memory_srv_buffer_check --mutate ${mutation})
     set_tests_properties(startup_memory_srv_buffer_${mutation}_control PROPERTIES WILL_FAIL TRUE)
@@ -3084,6 +3091,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # A typed buffer load of BUF_FMT_16_16_16_16_FLOAT reads four halves from one 8-byte element (#1695).
     add_test(NAME startup_gfx2hlsl_tbuffer_16f COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_tbuffer_16f_check.py")
+    # The draw's DXGI -> FORMAT table for typed views read by buffer_load_format_* matches the translation's switch.
+    add_test(NAME startup_buffer_format_word3_table COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_buffer_format_word3_table_check.py")
     # 32-bit scalar complement logic: s_nand_b32, s_nor_b32 and s_xnor_b32 against an integer reference (#1919).
     add_test(NAME startup_gfx2hlsl_sop2_complement COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sop2_complement_check.py")
@@ -3774,6 +3784,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_requests_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_indirect_requests_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_formatted_view_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_formatted_view_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}")
+        set_tests_properties(startup_formatted_view_draw_${backend} PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
         add_test(NAME startup_packed_target_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_packed_target_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${DXC_EXECUTABLE}" "${backend}")

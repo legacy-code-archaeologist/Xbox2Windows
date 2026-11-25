@@ -282,6 +282,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
+            tests/startup_buffer_format_word3_table_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
             tests/startup_stream_interface_check.py \

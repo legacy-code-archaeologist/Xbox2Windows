@@ -204,6 +204,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_root_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
+./out/pe-env/bin/python -B tests/startup_buffer_format_word3_table_check.py
 ./out/pe-env/bin/python -B tests/startup_smem_address_check.py
 ./out/pe-env/bin/python -B tests/startup_stream_fetch_check.py
 ./out/pe-env/bin/python -B tests/startup_stream_interface_check.py

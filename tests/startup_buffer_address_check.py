@@ -18,6 +18,7 @@ verification when FXC is supplied) and checks that mutations and wrong reference
 """
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -219,16 +220,14 @@ def formatted_mubuf_request_controls():
             mnemonic = 'buffer_load_format_' + suffix
             assert G.decode(load) == [(0, 8, mnemonic, f'{mnemonic} {dest}, off, s[32:35], 0')]
             result, name = request(load)
-            if op < 3:
-                # x, xy and xyz take FORMAT and DST_SEL from descriptor word 3 at draw time.
-                assert result == 'ok', result
-                assert 'switch ((ud' in name.with_suffix('.vs.hlsl').read_text()
-                continue
-            reason = name.with_suffix('.fail').read_text().strip()
-            assert reason == f'{mnemonic} requires descriptor FORMAT and DST_SEL', reason
-            assert result == f'unsupported: {reason}', result
-            assert classify_shader_reason(reason) == 'buffer_* instruction', reason
-            assert set(folder.glob(name.name + '.*')) == {name.with_suffix('.fail')}
+            # All four forms take FORMAT and DST_SEL from descriptor word 3 at draw time, one register per component.
+            assert result == 'ok', result
+            source = name.with_suffix('.vs.hlsl').read_text()
+            assert 'switch ((ud' in source
+            written = {int(n) for n in re.findall(r'^\s*v(\d+) = ', source, re.M)} & set(range(6, 10))
+            assert written == set(range(6, 7 + op)), (mnemonic, written)
+        # The old refusal text is still classified for caches written by earlier translators.
+        assert classify_shader_reason('buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL') == 'buffer_* instruction'
 
 
 def controls():
