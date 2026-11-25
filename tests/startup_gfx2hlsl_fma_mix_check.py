@@ -32,6 +32,10 @@ MIX_F32, MIXLO_F16, MIXHI_F16 = 0x20, 0x21, 0x22
 V = 0x100            # VGPR source base
 S5 = 5
 ZERO = 128           # inline integer 0
+ONE = 129            # inline integer 1
+SEVENTEEN = 145      # inline integer 17
+MINUS_ONE = 193      # inline integer -1
+MINUS_HALF_F = 241   # inline float -0.5
 ONE_F = 242          # inline float 1.0
 LITERAL = 255
 
@@ -141,6 +145,15 @@ expect('inline float on a binary32 source',
        encode(MIX_F32, 1, (v2, ONE_F, v4), op_sel_hi=(1, 0, 0)),
        'v_fma_mix_f32 v1, v2, 1.0, v4 op_sel_hi:[1,0,0]',
        'v1 = U(f16tof32(v2) * 1.0 + F(v4));')
+# neg on inline -0.5 prints as `--0.5`; `(--0.5)` would be an HLSL decrement (review on #2055).
+expect('negated negative inline float',
+       encode(MIX_F32, 1, (MINUS_HALF_F, v3, v4), neg=(1, 0, 0)),
+       'v_fma_mix_f32 v1, --0.5, v3, v4',
+       'v1 = U((-(-0.5)) * F(v3) + F(v4));')
+expect('control: an unnegated literal on a binary32 source still translates',
+       encode(MIX_F32, 1, (LITERAL, v3, v4), literal=0x3f800000),
+       'v_fma_mix_f32 v1, 0x3f800000, v3, v4',
+       'v1 = U(F(0x3f800000u) * F(v3) + F(v4));')
 
 # --- the binary16-destination forms keep their packing --------------------------------------------
 expect('mixlo writes the low half',
@@ -171,6 +184,21 @@ expect_refused('inline float on a binary16 source of mixlo',
 expect_refused('literal on a binary16 source',
                encode(MIX_F32, 1, (LITERAL, v3, v4), op_sel_hi=(1, 0, 0), literal=0x3c00),
                'v_fma_mix_f32 v1, 0x3c00, v3, v4 op_sel_hi:[1,0,0]')
+# The decoder prints neg on inline 1..64 or a literal as a negative integer. Read as an integer, the
+# sign-bit flip is lost (neg on inline 1 is 0x80000001, not 0xffffffff), so these stay refused.
+# Inline -1 prints the same text as neg on inline 1, so it is refused too.
+expect_refused('neg on inline 1 (binary32)',
+               encode(MIX_F32, 1, (ONE, v3, v4), neg=(1, 0, 0)),
+               'v_fma_mix_f32 v1, -1, v3, v4')
+expect_refused('inline -1 (same text as neg on inline 1)',
+               encode(MIX_F32, 1, (MINUS_ONE, v3, v4)),
+               'v_fma_mix_f32 v1, -1, v3, v4')
+expect_refused('neg on inline 17 (binary32)',
+               encode(MIX_F32, 1, (SEVENTEEN, v3, v4), neg=(1, 0, 0)),
+               'v_fma_mix_f32 v1, -17, v3, v4')
+expect_refused('neg on a literal (binary32)',
+               encode(MIX_F32, 1, (LITERAL, v3, v4), neg=(1, 0, 0), literal=0x3f800000),
+               'v_fma_mix_f32 v1, -0x3f800000, v3, v4')
 
 if failures:
     print(f'FAILED: {len(failures)} check(s): {", ".join(failures)}')

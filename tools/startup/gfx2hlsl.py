@@ -3026,6 +3026,13 @@ class Stage:
             if not is_half:
                 if is_hi:
                     raise Unsupported('op_sel on a binary32 fma_mix source %s' % tok)
+                if tok.startswith('--') and tok[1:] in FLOATS:
+                    # neg on a negative inline float prints as `--0.5`; `(--0.5)` is an HLSL decrement.
+                    return '(-(%s))' % self.f(tok[1:])
+                if re.fullmatch(r'-(\d+|0x[0-9a-fA-F]+)', tok):
+                    # The decoder prints neg on inline 1..64 or a literal as a negative integer, which f()
+                    # reads without the sign-bit flip. Refuse until the decoder resolves it from the encoding.
+                    raise Unsupported('negated integer or literal fma_mix source %s' % tok)
                 return self.f(tok)
             neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
             if neg:

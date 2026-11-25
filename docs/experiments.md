@@ -13214,9 +13214,11 @@ The shared handler now also:
 - accepts `-` and `|...|` on binary16 register sources;
 - refuses `op_sel` on a binary32 source and any modifier it does not model (previously ignored);
 - refuses an inline float or literal on a binary16 source. Before, `mixlo`/`mixhi` passed the binary32 bits of an inline float such as `1.0` through `f16tof32`, which reads 0;
-- reads a negated inline zero (`-0`) as `-0.0` on any source, so a `-0` product stays `-0`.
+- reads a negated inline zero (`-0`) as `-0.0` on any source, so a `-0` product stays `-0`;
+- emits neg on a negative inline float (printed `--0.5`) as `(-(-0.5))`. Before, `(--0.5)` was an HLSL decrement and did not compile;
+- refuses a binary32 source printed as a negative integer or literal (`-1`, `-17`, `-0x…`). The decoder prints neg on inline 1..64 or on a literal that way, and reading it as an integer loses the sign-bit flip: neg on inline 1 is `0x80000001`, not `0xffffffff`. Inline `-1` prints the same text as neg on inline 1, so it is refused too until the decoder resolves the operand from the encoding, as it does for `v_cndmask_b32_e64` (#1932).
 
-`tests/startup_gfx2hlsl_fma_mix_check.py` (`startup_gfx2hlsl_fma_mix`) builds VOP3P words from the decoder layout. It first checks that its encoder reproduces two `llvm-mc`-assembled words already pinned in `tests/rdna2_tools_check.py`. It then checks the decoded text and pins the translation of ten forms. Two controls check that flipping `op_sel` and `op_sel_hi` changes the output, and four forms must be refused. On the translator before this change the check fails at the first form. This is translation only; no draw or dispatch was run, and the refusal census was not re-measured.
+`tests/startup_gfx2hlsl_fma_mix_check.py` (`startup_gfx2hlsl_fma_mix`) builds VOP3P words from the decoder layout. It first checks that its encoder reproduces two `llvm-mc`-assembled words already pinned in `tests/rdna2_tools_check.py`. It then checks the decoded text and pins the translation of twelve forms. Two controls check that flipping `op_sel` and `op_sel_hi` changes the output, a third checks that an unnegated literal still translates, and eight forms must be refused. On the translator before this change the check fails at the first form. This is translation only; no draw or dispatch was run, and the refusal census was not re-measured.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_fma_mix$' -V
