@@ -4708,6 +4708,59 @@ class Stage:
 
     def op_v_ashrrev_i64(self, ops, mods):
         self.shift64(ops, mods, 'shr64i')
+
+    def mad64(self, ops, mods, signed):
+        """v_mad_u64_u32 / v_mad_i64_i32: D = S0 * S1 + S2 modulo 2^64, two 32-bit factors, 64-bit S2.
+
+        The unsigned form also writes the carry-out of the 64-bit add to a lane mask. The signed carry-out
+        is not established, so the signed form is accepted only with the discarding null destination."""
+        name = 'v_mad_i64_i32' if signed else 'v_mad_u64_u32'
+        if mods:
+            raise Unsupported('%s with %s' % (name, mods))
+        if len(ops) != 5:
+            raise Unsupported('%s with %d operands, expected 5' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] != dst[1] + 1 or dst[2] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        mask = ops[1]
+        mask_reg = reg_range(mask)
+        if signed:
+            if mask != 'null':
+                raise Unsupported('%s carry-out %s: only null is lowered' % (name, mask))
+        elif mask not in ('vcc', 'vcc_lo') and not (
+                mask_reg and mask_reg[0] == 's' and mask_reg[1] == mask_reg[2] and mask_reg[1] <= 105):
+            raise Unsupported('%s carry-out %s' % (name, mask))
+        for tok in ops[2:4]:
+            r = reg_range(tok)
+            if tok in FLOATS or tok in ('exec', 'exec_lo') or (
+                    r and (r[1] != r[2] or (r[0] == 'v' and r[1] > 255) or (r[0] == 's' and r[1] > 105))):
+                raise Unsupported('%s factor %s' % (name, tok))
+        for tok in ops[2:5]:
+            r = reg_range(tok)
+            if tok in ('vcc', 'vcc_lo', 'vcc_hi') or (r and r[0] == 's' and any(
+                    w in self.masks for w in range(r[1], r[2] + 1))):
+                # u() would supply the per-lane 0/1 projection, not the architectural 32-bit mask.
+                raise Unsupported('%s reads the lane mask %s as an integer' % (name, tok))
+        low, high = self.i64_words(ops[4])
+        self.emit('{ uint3 r = %s(%s, %s, %s, %s);' % ('mad64i' if signed else 'mad64u',
+                                                         self.u(ops[2]), self.u(ops[3]), low, high))
+        self.set_v(dst[1], 'r.x')
+        self.set_v(dst[2], 'r.y')
+        if not signed:
+            expr = 'r.z' if self.exec_known else '(exec & r.z)'
+            if mask in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % expr)
+            else:
+                self.set_s(mask_reg[1], expr)
+                self.masks.add(mask_reg[1])
+        self.emit('}')
+
+    def op_v_mad_u64_u32(self, ops, mods):
+        self.mad64(ops, mods, False)
+
+    def op_v_mad_i64_i32(self, ops, mods):
+        self.mad64(ops, mods, True)
+
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
@@ -5489,6 +5542,19 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               # v_mad_u64_u32 / v_mad_i64_i32: a * b + (chi:clo) from 16-bit partial products, so no 64-bit type.
+               # z is the carry of the 64-bit add (the unsigned form's lane-mask carry-out).
+               'uint mulhi32(uint a, uint b) {'
+               ' uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;'
+               ' uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;'
+               ' uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);'
+               ' return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16); }',
+               'uint3 mad64u(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b), pl = a * b, lo = pl + clo, c0 = lo < pl ? 1u : 0u, hs = ph + chi, hi = hs + c0;'
+               ' return uint3(lo, hi, (hs < ph || hi < hs) ? 1u : 0u); }',
+               'uint3 mad64i(uint a, uint b, uint clo, uint chi) {'
+               ' uint ph = mulhi32(a, b) - (asint(a) < 0 ? b : 0u) - (asint(b) < 0 ? a : 0u), pl = a * b, lo = pl + clo;'
+               ' return uint3(lo, ph + chi + (lo < pl ? 1u : 0u), 0u); }',
                'uint2 bfe64(uint lo, uint hi, uint s1, uint sg) { uint w = min((s1 >> 16u) & 127u, 64u - (s1 & 63u)); uint2 e = shr64u(lo, hi, s1);'
                ' e = uint2(e.x & (w >= 32u ? 0xffffffffu : ((1u << (w & 31u)) - 1u)),'
                ' e.y & (w >= 64u ? 0xffffffffu : (w > 32u ? ((1u << ((w - 32u) & 31u)) - 1u) : 0u)));'
