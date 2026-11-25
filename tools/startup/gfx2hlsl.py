@@ -3842,7 +3842,8 @@ class Stage:
         if one:
             expected = {'sample': 1, 'lz': 1, 'l': 2}.get(how)
             if expected is None or len(cs) != expected or not dmask:
-                raise Unsupported('unverified 1D image %s address or modifiers' % how)
+                # Local merge of #1722: image_sample_d keeps main's wording (startup_image_sample_d_check).
+                raise Unsupported('unverified 1D image %s address or modifiers' % ('sample' if how == 'd' else how))
             for m in mods:
                 if not (m.startswith(('dim:', 'dmask:')) or (how != 'sample' and m in ('dlc', 'glc', 'slc'))):
                     raise Unsupported('1D image %s modifier %s' % (how, m))
