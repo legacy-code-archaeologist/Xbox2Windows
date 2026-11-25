@@ -3043,8 +3043,12 @@ class Stage:
             r = reg_range(tok)
             if tok == '0':
                 text = '0.0'
+            elif re.fullmatch(r'0x[0-9a-fA-F]{1,8}', tok):
+                word = (int(tok, 16) >> (16 if is_hi else 0)) & 0xffff
+                text = 'f16tof32(0x%04xu)' % word
+            elif tok == '0.5' and not is_hi:
+                text = '0.5'
             elif r and r[1] == r[2]:
-                # Binary16 literals and inline floats stay refused: their half encoding is unverified.
                 # Only a high-half read needs the upper 16 bits defined.
                 text = 'f16tof32(%s%s)' % (self.u(tok, low16_only=not is_hi), ' >> 16' if is_hi else '')
             else:

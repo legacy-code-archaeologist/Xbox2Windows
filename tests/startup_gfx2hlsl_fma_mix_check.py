@@ -205,9 +205,10 @@ expect_refused('inline float on a binary16 source',
 expect_refused('inline float on a binary16 source of mixlo',
                encode(MIXLO_F16, 1, (v2, ONE_F, v4), op_sel_hi=(0, 1, 0)),
                'v_fma_mixlo_f16 v1, v2, 1.0, v4 op_sel_hi:[0,1,0]')
-expect_refused('literal on a binary16 source',
+expect('literal on a binary16 source',
                encode(MIX_F32, 1, (LITERAL, v3, v4), op_sel_hi=(1, 0, 0), literal=0x3c00),
-               'v_fma_mix_f32 v1, 0x3c00, v3, v4 op_sel_hi:[1,0,0]')
+               'v_fma_mix_f32 v1, 0x3c00, v3, v4 op_sel_hi:[1,0,0]',
+               'v1 = U(f16tof32(0x3c00u) * F(v3) + F(v4));')
 # The decoder prints neg on inline 1..64 or a literal as a negative integer. Read as an integer, the
 # sign-bit flip is lost (neg on inline 1 is 0x80000001, not 0xffffffff), so these stay refused.
 # Inline -1 prints the same text as neg on inline 1, so it is refused too.
@@ -224,6 +225,22 @@ expect_refused('neg on a literal (binary32)',
                encode(MIX_F32, 1, (LITERAL, v3, v4), neg=(1, 0, 0), literal=0x3f800000),
                'v_fma_mix_f32 v1, -0x3f800000, v3, v4')
 
+# Both halves contain normal binary16 numbers: 1.0 in the low word and 2.0 in the high word.
+for high, bits in ((0, 0x3c00), (1, 0x4000)):
+    raw = encode(MIX_F32, 1, (LITERAL, v3, v4), literal=0x40003c00,
+                 op_sel=(high, 0, 0), op_sel_hi=(1, 0, 0))
+    suffix = (' op_sel:[1,0,0]' if high else '') + ' op_sel_hi:[1,0,0]'
+    expect('select literal half %d' % high, raw,
+           'v_fma_mix_f32 v1, 0x40003c00, v3, v4' + suffix,
+           'v1 = U(f16tof32(0x%04xu) * F(v3) + F(v4));' % bits)
+
+expect('inline half on a low binary16 source',
+       encode(MIX_F32, 1, (240, v3, v4), op_sel_hi=(1, 0, 0)),
+       'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel_hi:[1,0,0]',
+       'v1 = U(0.5 * F(v3) + F(v4));')
+expect_refused('unverified high half of inline constant',
+               encode(MIX_F32, 1, (240, v3, v4), op_sel=(1, 0, 0), op_sel_hi=(1, 0, 0)),
+               'v_fma_mix_f32 v1, 0.5, v3, v4 op_sel:[1,0,0] op_sel_hi:[1,0,0]')
 
 
 def compile_translated(fxc):
